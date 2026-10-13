@@ -511,6 +511,200 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         self.assertEqual(pol.rope_theta, 1000000.0)
         self.assertEqual(pol.rotary_dim, 64)
 
+    def test_qwen3_5_hybrid_gdn_mamba_and_full_attention_roundtrip(self) -> None:
+        """Verifies Qwen3.5 hybrid GatedDeltaNet (conv_state, ssm_state) + FullAttention compression."""
+        DeltaCompressionConnector.reset_shared_stores()
+        torch.manual_seed(42)
+
+        hf_cfg = SimpleNamespace(
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            rope_theta=None,
+            rope_local_base_freq=None,
+            rotary_dim=None,
+            head_dim=64,
+            layer_types=["linear_attention", "full_attention"],
+            sliding_window=None,
+        )
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16, enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            model_config=SimpleNamespace(hf_text_config=hf_cfg),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                engine_id="qwen3_5-hybrid-test",
+            ),
+        )
+
+        mamba_grp = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(sliding_window=None, mamba_type="gdn"),
+            layer_names=["model.layers.0.linear_attn"],
+        )
+        attn_grp = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(sliding_window=None),
+            layer_names=["model.layers.1.self_attn.attn"],
+        )
+        kv_cache_cfg = SimpleNamespace(kv_cache_groups=[mamba_grp, attn_grp])
+
+        # Create worker first without kv_cache_config (mirroring vLLM V1 init order),
+        # then scheduler with kv_cache_config, verifying shared layer_to_group_idx.
+        worker_conn = DeltaCompressionConnector(
+            vllm_config=vllm_config,  # type: ignore[arg-type]
+            role=KVConnectorRole.WORKER,
+            kv_cache_config=None,
+        )
+        sched_conn = DeltaCompressionConnector(
+            vllm_config=vllm_config,  # type: ignore[arg-type]
+            role=KVConnectorRole.SCHEDULER,
+            kv_cache_config=kv_cache_cfg,  # type: ignore[arg-type]
+        )
+
+        gdn_pol = worker_conn.store.get_layer_policy("model.layers.0.linear_attn")
+        attn_pol = worker_conn.store.get_layer_policy("model.layers.1.self_attn.attn")
+        self.assertTrue(gdn_pol.is_mamba)
+        self.assertEqual(gdn_pol.rotary_dim, 0)
+        self.assertEqual(gdn_pol.max_sparse_exceptions, 0)
+        self.assertFalse(attn_pol.is_mamba)
+        self.assertEqual(attn_pol.rope_theta, 10000000.0)
+        self.assertEqual(attn_pol.rotary_dim, 16)
+
+        # Allocate paged caches:
+        # Group 0 (GDN): tuple(conv_state [8, 256, 3], ssm_state [8, 4, 32, 32])
+        # Group 1 (Attn): 4D tensor [8, 2, 16, 128] (num_kv_heads=2, head_dim=64)
+        conv_cache = torch.randn(8, 256, 3, dtype=torch.bfloat16)
+        ssm_cache = torch.randn(8, 4, 32, 32, dtype=torch.bfloat16)
+        attn_cache = torch.randn(8, 2, 16, 128, dtype=torch.bfloat16)
+
+        gdn_layer = SimpleNamespace(kv_cache=(conv_cache, ssm_cache))
+        attn_layer = SimpleNamespace(kv_cache=attn_cache)
+        fwd_ctx = SimpleNamespace(
+            no_compile_layers={
+                "model.layers.0.linear_attn": gdn_layer,
+                "model.layers.1.self_attn.attn": attn_layer,
+            },
+            attn_metadata={},
+            virtual_engine=0,
+        )
+
+        # 1. Base request P_A: 2 full blocks (32 tokens) + 4 tail tokens = 36 tokens
+        # Group 0 (Mamba align mode) has [0 (null_block), 2 (boundary block)]
+        # Group 1 (FullAttention) has [1, 2]
+        blk0 = tuple(range(100, 116))
+        blk1 = tuple(range(200, 216))
+        tail = (901, 902, 903, 904)
+        tokens_a = list(blk0 + blk1 + tail)
+
+        sched_out_a = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="req_a",
+                    prompt_token_ids=tokens_a,
+                    block_ids=([0, 2], [1, 2]),
+                )
+            ],
+            scheduled_cached_reqs=None,
+            finished_req_ids=set(),
+        )
+        meta_a = sched_conn.build_connector_meta(sched_out_a)  # type: ignore[arg-type]
+        worker_conn.bind_connector_metadata(meta_a)
+        worker_conn.start_load_kv(fwd_ctx)  # type: ignore[arg-type]
+        worker_conn.save_kv_layer(
+            "model.layers.1.self_attn.attn", attn_cache, SimpleNamespace()  # type: ignore[arg-type]
+        )
+        worker_conn.wait_for_save()
+        worker_conn.clear_connector_metadata()
+
+        # Verify that GDN skipped block 0 (null_block) and stored only block 2 (1 block),
+        # while FullAttention stored both blocks 1 and 2 (2 blocks) -> 3 total blocks stored.
+        self.assertEqual(worker_conn.store.stats.total_blocks_stored, 3)
+
+        # 2. Target request P_B: edited Block 0 + shared Block 1 + 4 tail tokens
+        # Populate physical blocks 4 (GDN boundary) and [3, 4] (FullAttention) with
+        # perturbed states (eta ~ 0.08 -> TIER1_INT2_DELTA).
+        conv_cache[4] = conv_cache[2] + 0.05 * torch.randn_like(conv_cache[2])
+        ssm_cache[4] = ssm_cache[2] + 0.05 * torch.randn_like(ssm_cache[2])
+        attn_cache[3] = attn_cache[1] + 0.05 * torch.randn_like(attn_cache[1])
+        attn_cache[4] = attn_cache[2] + 0.05 * torch.randn_like(attn_cache[2])
+
+        blk0_edited = (999,) + blk0[1:]
+        tokens_b = list(blk0_edited + blk1 + tail)
+        sched_out_b = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="req_b",
+                    prompt_token_ids=tokens_b,
+                    block_ids=([0, 4], [3, 4]),
+                )
+            ],
+            scheduled_cached_reqs=None,
+            finished_req_ids=set(),
+        )
+        meta_b = sched_conn.build_connector_meta(sched_out_b)  # type: ignore[arg-type]
+        worker_conn.bind_connector_metadata(meta_b)
+        worker_conn.start_load_kv(fwd_ctx)  # type: ignore[arg-type]
+        worker_conn.save_kv_layer(
+            "model.layers.1.self_attn.attn", attn_cache, SimpleNamespace()  # type: ignore[arg-type]
+        )
+        worker_conn.wait_for_save()
+        worker_conn.clear_connector_metadata()
+
+        # Verify that P_B's shared Block 1 in GDN was delta-compressed (TIER1_INT2_DELTA)
+        self.assertGreaterEqual(
+            worker_conn.store.stats.tier_counts[CompressionTier.TIER1_INT2_DELTA], 2
+        )
+
+        # 3. Verify get_num_new_matched_tokens and start_load_kv reconstruction for P_B
+        req_b_reload = SimpleNamespace(
+            request_id="req_b_reload",
+            prompt_token_ids=tokens_b,
+        )
+        matched_toks, _ = sched_conn.get_num_new_matched_tokens(
+            req_b_reload,  # type: ignore[arg-type]
+            num_computed_tokens=0,
+        )
+        self.assertEqual(matched_toks, 32)
+
+        sched_conn.update_state_after_alloc(
+            req_b_reload,  # type: ignore[arg-type]
+            SimpleNamespace(),  # type: ignore[arg-type]
+            num_external_tokens=32,
+        )
+        sched_out_reload = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="req_b_reload",
+                    prompt_token_ids=tokens_b,
+                    block_ids=([0, 6], [5, 6]),
+                )
+            ],
+            scheduled_cached_reqs=None,
+            finished_req_ids=set(),
+        )
+        conv_cache[6].zero_()
+        ssm_cache[6].zero_()
+        attn_cache[5].zero_()
+        attn_cache[6].zero_()
+
+        meta_reload = sched_conn.build_connector_meta(sched_out_reload)  # type: ignore[arg-type]
+        worker_conn.bind_connector_metadata(meta_reload)
+        worker_conn.start_load_kv(fwd_ctx)  # type: ignore[arg-type]
+        worker_conn.clear_connector_metadata()
+
+        # Verify both GDN (conv_state[6], ssm_state[6]) and FullAttention (attn_cache[5, 6])
+        # were reconstructed accurately from delta-compressed storage!
+        ssm_err = torch.linalg.norm(
+            (ssm_cache[6] - ssm_cache[4]).to(torch.float32)
+        ) / torch.linalg.norm(ssm_cache[4].to(torch.float32))
+        conv_err = torch.linalg.norm(
+            (conv_cache[6] - conv_cache[4]).to(torch.float32)
+        ) / torch.linalg.norm(conv_cache[4].to(torch.float32))
+        self.assertLess(ssm_err.item(), 0.05)
+        self.assertLess(conv_err.item(), 0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

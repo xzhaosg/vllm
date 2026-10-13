@@ -183,9 +183,15 @@ def quantize_residual_packed(
     orig_dtype = residual.dtype
     res_fp32 = residual.to(torch.float32)
 
-    # Reshape to [num_groups, group_size] where group_size = head_dim
-    head_dim = orig_shape[-1]
-    flat_groups = res_fp32.reshape(-1, head_dim)
+    # Reshape to [num_groups, group_size]. Use orig_shape[-1] when >= 32 (per-head),
+    # or a factor up to 128 when the trailing dimension is small (e.g. Mamba conv_state).
+    total_elems = res_fp32.numel()
+    group_size = orig_shape[-1]
+    if group_size < 32 and total_elems >= 32:
+        group_size = math.gcd(total_elems, 128)
+        if group_size < 16:
+            group_size = math.gcd(total_elems, 64) or orig_shape[-1]
+    flat_groups = res_fp32.reshape(-1, group_size)
     max_abs = flat_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
 
     if bits == 4:
@@ -238,8 +244,8 @@ def quantize_residual_packed(
 def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Tensor:
     """Dequantize a PackedQuantizedTensor back to its original shape and dtype."""
     total_elems = math.prod(packed_tensor.orig_shape)
-    head_dim = packed_tensor.orig_shape[-1]
     scales_fp32 = packed_tensor.scales.to(torch.float32)
+    group_size = total_elems // max(scales_fp32.shape[0], 1)
     packed = packed_tensor.packed_data
 
     if packed_tensor.bits == 4:
@@ -249,7 +255,7 @@ def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Te
             :total_elems
         ]
         levels = unpacked.to(torch.float32) - 7.5
-        flat_groups = levels.reshape(-1, head_dim)
+        flat_groups = levels.reshape(-1, group_size)
         recon = flat_groups * scales_fp32
     elif packed_tensor.bits == 2:
         c0 = packed & 0x03
@@ -259,7 +265,7 @@ def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Te
         unpacked = torch.stack([c0, c1, c2, c3], dim=-1).reshape(-1)[:total_elems]
         # Map {0, 1, 2, 3} -> {-1.5, -0.5, +0.5, +1.5}
         levels = unpacked.to(torch.float32) - 1.5
-        flat_groups = levels.reshape(-1, head_dim)
+        flat_groups = levels.reshape(-1, group_size)
         recon = flat_groups * scales_fp32
     else:
         raise ValueError(f"Unsupported bit-width: {packed_tensor.bits}")
@@ -357,6 +363,7 @@ class LayerCompressionPolicy:
 
     layer_idx: int
     is_sliding_window: bool = False
+    is_mamba: bool = False
     sliding_window_size: int | None = None
     rope_theta: float = 10000.0
     rotary_dim: int | None = None
@@ -398,6 +405,8 @@ class DeltaBlockStore:
 
         # Layer name -> LayerCompressionPolicy
         self.layer_policies: dict[str, LayerCompressionPolicy] = {}
+        # Layer name -> KV cache group index (shared across scheduler & worker roles)
+        self.layer_to_group_idx: dict[str, int] = {}
 
         # Primary index: (layer_name, full_block_hash) -> CompressedKVBlockRecord
         self._records: dict[tuple[str, str], CompressedKVBlockRecord] = {}
@@ -419,6 +428,8 @@ class DeltaBlockStore:
         self._known_prefix_blocks: dict[str, tuple[tuple[int, ...], int]] = {}
         # Token hash registry at scheduler level: token_block_hash -> full_block_hash
         self._known_token_blocks: dict[str, str] = {}
+        # Set of full_block_hashes materialized in Mamba/GDN recurrent state layers
+        self._known_mamba_blocks: set[str] = set()
 
         self.stats = DeltaCompressionStats()
 
@@ -430,6 +441,7 @@ class DeltaBlockStore:
         self._base_by_subchunk.clear()
         self._known_prefix_blocks.clear()
         self._known_token_blocks.clear()
+        self._known_mamba_blocks.clear()
         self.stats = DeltaCompressionStats()
 
     @staticmethod
@@ -458,15 +470,17 @@ class DeltaBlockStore:
         # Infer layer_idx from layer_name (e.g. "model.layers.0.self_attn.attn")
         match = re.search(r"(?:layers|blocks|h)\.(\d+)", layer_name)
         layer_idx = int(match.group(1)) if match else 0
+        is_mamba = "linear_attn" in layer_name or ".mamba" in layer_name
         policy = LayerCompressionPolicy(
             layer_idx=layer_idx,
-            rope_theta=self.default_rope_theta,
-            rotary_dim=self.default_rotary_dim,
+            is_mamba=is_mamba,
+            rope_theta=0.0 if is_mamba else self.default_rope_theta,
+            rotary_dim=0 if is_mamba else self.default_rotary_dim,
             sliding_window_dedup_threshold=self.sliding_window_dedup_threshold,
             tau_zero_bit=self.tau_zero_bit,
             tau_int2=self.tau_int2,
             tau_int4=self.tau_int4,
-            max_sparse_exceptions=self.max_sparse_exceptions,
+            max_sparse_exceptions=0 if is_mamba else self.max_sparse_exceptions,
         )
         self.layer_policies[layer_name] = policy
         return policy
@@ -477,11 +491,22 @@ class DeltaBlockStore:
     def has_token_block(self, token_block_hash: str) -> bool:
         return token_block_hash in self._known_token_blocks
 
+    def has_mamba_block(self, full_block_hash: str) -> bool:
+        return full_block_hash in self._known_mamba_blocks
+
+    @property
+    def has_mamba_layers(self) -> bool:
+        return bool(self._known_mamba_blocks) or any(
+            p.is_mamba for p in self.layer_policies.values()
+        )
+
     def _find_partial_match_base_block(
         self, layer_name: str, token_ids: tuple[int, ...]
     ) -> tuple[CompressedKVBlockRecord | None, list[int]]:
         """Find an UNCOMPRESSED_BASE block in the same layer differing in <= M tokens."""
         policy = self.get_layer_policy(layer_name)
+        if policy.is_mamba or policy.max_sparse_exceptions <= 0:
+            return None, []
         num_slices = policy.max_sparse_exceptions + 1
         seen_hashes: set[str] = set()
         candidates: list[CompressedKVBlockRecord] = []
@@ -530,9 +555,10 @@ class DeltaBlockStore:
             token_ids: Sequence of token IDs inside this block (length == block_size).
             start_position: Starting token position index of this block in the prompt.
             k_block: Key block tensor [block_size, num_kv_heads, head_dim] (or MLA
-                latent [block_size, kv_lora_rank + qk_rope_head_dim]).
+                latent [block_size, kv_lora_rank + qk_rope_head_dim], or Mamba/GDN
+                ssm_state [num_v_heads, head_v_dim, head_k_dim]).
             v_block: Value block tensor [block_size, num_kv_heads, head_dim] (or None
-                for MLA unified latent cache).
+                for MLA unified latent cache, or Mamba/GDN conv_state).
             divergence_distance: Number of contiguous matching tokens separating the
                 start of this block from the most recent prefix divergence point.
 
@@ -546,7 +572,7 @@ class DeltaBlockStore:
         token_tuple = tuple(int(t) for t in token_ids)
         token_hash = compute_token_block_hash(token_tuple)
         policy = self.get_layer_policy(layer_name)
-        is_mla = v_block is None
+        is_mla = v_block is None and not policy.is_mamba
 
         k_cpu = k_block.detach().to(self.device)
         v_cpu = v_block.detach().to(self.device) if v_block is not None else None
@@ -557,14 +583,16 @@ class DeltaBlockStore:
 
         self._known_prefix_blocks[full_block_hash] = (token_tuple, start_position)
         self._known_token_blocks.setdefault(token_hash, full_block_hash)
+        if policy.is_mamba:
+            self._known_mamba_blocks.add(full_block_hash)
 
         # 1. Check for an UNCOMPRESSED_BASE block with the exact same token_block_hash
         base_rec = self._base_by_token_hash.get((layer_name, token_hash))
         if base_rec is not None:
             delta_pos = start_position - base_rec.start_position
 
-            # Case 1A: Layer 0 -> Always Tier 0 Zero-Bit Reuse!
-            if policy.layer_idx == 0:
+            # Case 1A: Layer 0 non-recurrent attention -> Always Tier 0 Zero-Bit Reuse!
+            if policy.layer_idx == 0 and not policy.is_mamba:
                 record = CompressedKVBlockRecord(
                     tier=CompressionTier.TIER0_ZERO_BIT,
                     full_block_hash=full_block_hash,
@@ -597,13 +625,13 @@ class DeltaBlockStore:
                 )
                 return self._commit_record(layer_name, record, raw_bytes)
 
-            # Case 1C: Layer >= 1 exact token block match (Regimes R1a, R1b, R3)
+            # Case 1C: Exact token block match (Regimes R1a, R1b, R3, or Mamba/GDN)
             assert base_rec.raw_k is not None
             k_ref_aligned = apply_relative_rope_rotation(
                 base_rec.raw_k,
                 delta_pos=delta_pos,
                 rope_theta=policy.rope_theta,
-                rotary_dim=policy.rotary_dim,
+                rotary_dim=0 if policy.is_mamba else policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
             )
             delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
@@ -619,10 +647,15 @@ class DeltaBlockStore:
                 eta_max = max(eta_k, eta_v)
             else:
                 delta_v = None
+                eta_v = 0.0
                 eta_max = eta_k
 
-            # Select Tier based on residual magnitude eta_max:
-            if policy.is_sliding_window and eta_max <= policy.tau_zero_bit:
+            # Select Tier based on residual magnitude:
+            if (
+                policy.is_sliding_window and eta_max <= policy.tau_zero_bit
+            ) or (
+                policy.is_mamba and eta_max <= min(policy.tau_zero_bit, 0.01)
+            ):
                 record = CompressedKVBlockRecord(
                     tier=CompressionTier.TIER0_ZERO_BIT,
                     full_block_hash=full_block_hash,
@@ -636,10 +669,18 @@ class DeltaBlockStore:
                 )
                 return self._commit_record(layer_name, record, raw_bytes)
 
-            if eta_max <= policy.tau_int2:
+            tier1_eligible = (
+                (eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4)
+                if policy.is_mamba
+                else (eta_max <= policy.tau_int2)
+            )
+            if tier1_eligible:
                 q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=2)
+                # For Mamba/GDN, conv_state (v_cpu) is only ~6.5% of the block bytes
+                # and holds the 3-token boundary window, so use 4-bit quantization on it.
+                v_bits = 4 if policy.is_mamba else 2
                 q_dv = (
-                    quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=2)
+                    quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=v_bits)
                     if (delta_v is not None and v_cpu is not None)
                     else None
                 )
@@ -751,11 +792,12 @@ class DeltaBlockStore:
         )
         self._base_by_token_hash.setdefault((layer_name, token_hash), base_record)
         self._base_blocks_by_layer.setdefault(layer_name, []).append(base_record)
-        num_slices = policy.max_sparse_exceptions + 1
-        for s_idx, sub_tuple in self._get_pigeonhole_slices(token_tuple, num_slices):
-            self._base_by_subchunk.setdefault(
-                (layer_name, s_idx, sub_tuple), []
-            ).append(base_record)
+        if not policy.is_mamba and policy.max_sparse_exceptions > 0:
+            num_slices = policy.max_sparse_exceptions + 1
+            for s_idx, sub_tuple in self._get_pigeonhole_slices(token_tuple, num_slices):
+                self._base_by_subchunk.setdefault(
+                    (layer_name, s_idx, sub_tuple), []
+                ).append(base_record)
         return self._commit_record(layer_name, base_record, raw_bytes)
 
     def _commit_record(
@@ -967,8 +1009,16 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             )
         self.store: DeltaBlockStore = self._shared_stores[engine_id]
         self._requests_need_load: dict[str, tuple["Request", int]] = {}
-        self._registered_kv_caches: dict[str, torch.Tensor] = {}
-        self._layer_to_group_idx: dict[str, int] = {}
+        self._inflight_req_state: dict[
+            str, tuple[list[int], list[list[int]], int]
+        ] = {}
+        self._registered_kv_caches: dict[
+            str, torch.Tensor | tuple[torch.Tensor, ...]
+        ] = {}
+        self._layer_to_group_idx: dict[str, int] = self.store.layer_to_group_idx
+        self._active_no_compile_layers: dict[str, Any] = {}
+        self._active_virtual_engine: int = 0
+        self._layers_saved_in_step: set[str] = set()
         self._auto_configure_layers(vllm_config, kv_cache_config)
 
     def _auto_configure_layers(
@@ -976,7 +1026,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         vllm_config: VllmConfig,
         kv_cache_config: "KVCacheConfig | None",
     ) -> None:
-        """Auto-populate layer-to-group mapping and RoPE/SWA policies from config."""
+        """Auto-populate layer-to-group mapping and RoPE/SWA/Mamba policies from config."""
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = (
             getattr(model_config, "hf_text_config", None)
@@ -1049,35 +1099,68 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if kv_cache_config is not None and hasattr(kv_cache_config, "kv_cache_groups"):
             for group_idx, group_spec in enumerate(kv_cache_config.kv_cache_groups):
                 spec = getattr(group_spec, "kv_cache_spec", None)
-                spec_sw = getattr(spec, "sliding_window", None)
+                inner_specs = (
+                    getattr(spec, "kv_cache_specs", None)
+                    if spec is not None
+                    else None
+                )
                 for layer_name in getattr(group_spec, "layer_names", []):
                     self._layer_to_group_idx[layer_name] = group_idx
                     if layer_name in self.store.layer_policies:
                         continue
+                    layer_spec = (
+                        inner_specs.get(layer_name, spec)
+                        if isinstance(inner_specs, dict)
+                        else spec
+                    )
+                    spec_sw = getattr(layer_spec, "sliding_window", None)
                     match = re.search(r"(?:layers|blocks|h)\.(\d+)", layer_name)
                     layer_idx = int(match.group(1)) if match else 0
-                    is_sw = spec_sw is not None
+                    is_mamba = (
+                        (
+                            layer_spec is not None
+                            and (
+                                layer_spec.__class__.__name__ == "MambaSpec"
+                                or getattr(layer_spec, "mamba_type", None) is not None
+                            )
+                        )
+                        or (
+                            isinstance(layer_types, (list, tuple))
+                            and layer_idx < len(layer_types)
+                            and layer_types[layer_idx] in ("linear_attention", "mamba")
+                        )
+                        or ("linear_attn" in layer_name or ".mamba" in layer_name)
+                    )
+                    is_sw = False if is_mamba else (spec_sw is not None)
                     if (
-                        not is_sw
+                        not is_mamba
+                        and not is_sw
                         and isinstance(layer_types, (list, tuple))
                         and layer_idx < len(layer_types)
                     ):
                         is_sw = layer_types[layer_idx] == "sliding_attention"
-                    sw_size = spec_sw if spec_sw is not None else (default_sw if is_sw else None)
+                    sw_size = (
+                        spec_sw
+                        if spec_sw is not None
+                        else (default_sw if is_sw else None)
+                    )
                     theta = local_theta if is_sw else global_theta
                     self.store.register_layer_policy(
                         layer_name,
                         LayerCompressionPolicy(
                             layer_idx=layer_idx,
                             is_sliding_window=is_sw,
+                            is_mamba=is_mamba,
                             sliding_window_size=sw_size,
-                            rope_theta=theta,
-                            rotary_dim=rotary_dim,
+                            rope_theta=0.0 if is_mamba else theta,
+                            rotary_dim=0 if is_mamba else rotary_dim,
                             sliding_window_dedup_threshold=self.store.sliding_window_dedup_threshold,
                             tau_zero_bit=self.store.tau_zero_bit,
                             tau_int2=self.store.tau_int2,
                             tau_int4=self.store.tau_int4,
-                            max_sparse_exceptions=self.store.max_sparse_exceptions,
+                            max_sparse_exceptions=0
+                            if is_mamba
+                            else self.store.max_sparse_exceptions,
                         ),
                     )
 
@@ -1085,8 +1168,16 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
     def reset_shared_stores(cls) -> None:
         cls._shared_stores.clear()
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]]
+    ) -> None:
         self._registered_kv_caches = kv_caches
+        for layer_name, kv_obj in kv_caches.items():
+            if isinstance(kv_obj, tuple):
+                policy = self.store.get_layer_policy(layer_name)
+                policy.is_mamba = True
+                policy.rotary_dim = 0
+                policy.max_sparse_exceptions = 0
 
     # ==============================
     # Scheduler-side methods
@@ -1098,7 +1189,12 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int] | tuple[int, ...],
         all_group_block_ids: tuple[list[int], ...] | None = None,
     ) -> list[DeltaBlockTransferSpec]:
-        num_full_blocks = min(len(token_ids) // self._block_size, len(block_ids))
+        max_avail_blocks = (
+            max((len(g) for g in all_group_block_ids), default=len(block_ids))
+            if all_group_block_ids
+            else len(block_ids)
+        )
+        num_full_blocks = min(len(token_ids) // self._block_size, max_avail_blocks)
         specs: list[DeltaBlockTransferSpec] = []
         parent_hash = "ROOT"
         divergence_distance: int | None = 0
@@ -1133,12 +1229,17 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     for g_blks in all_group_block_ids
                 )
 
+            phys_id = (
+                int(block_ids[b_idx])
+                if b_idx < len(block_ids) and block_ids[b_idx] is not None
+                else 0
+            )
             specs.append(
                 DeltaBlockTransferSpec(
                     full_block_hash=full_hash,
                     token_ids=blk_tokens,
                     start_position=start_pos,
-                    physical_block_id=int(block_ids[b_idx]),
+                    physical_block_id=phys_id,
                     divergence_distance=divergence_distance,
                     group_block_ids=grp_ids,
                 )
@@ -1159,16 +1260,23 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
 
         parent_hash = "ROOT"
-        matched_tokens = 0
+        matched_positions: list[tuple[int, str]] = []
         for start_pos in range(0, num_tokens_to_check, self._block_size):
             blk_tokens = tuple(token_ids[start_pos : start_pos + self._block_size])
             full_hash = compute_full_prefix_block_hash(parent_hash, blk_tokens)
             if self.store.has_full_block(full_hash):
-                matched_tokens = start_pos + self._block_size
+                matched_positions.append((start_pos + self._block_size, full_hash))
                 parent_hash = full_hash
             else:
                 break
 
+        if self.store.has_mamba_layers:
+            while matched_positions and not self.store.has_mamba_block(
+                matched_positions[-1][1]
+            ):
+                matched_positions.pop()
+
+        matched_tokens = matched_positions[-1][0] if matched_positions else 0
         new_matched = max(0, matched_tokens - num_computed_tokens)
         return new_matched, False
 
@@ -1190,13 +1298,27 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> KVConnectorMetadata:
         meta = DeltaConnectorMetadata()
 
+        for fin_id in getattr(scheduler_output, "finished_req_ids", ()) or ():
+            self._inflight_req_state.pop(fin_id, None)
+
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = list(new_req.prompt_token_ids or [])
             block_ids = list(new_req.block_ids[0]) if new_req.block_ids else []
-            all_group_block_ids = tuple(new_req.block_ids) if new_req.block_ids else None
+            all_group_block_ids = (
+                tuple(list(g) for g in new_req.block_ids)
+                if new_req.block_ids
+                else None
+            )
             specs = self._build_block_specs_for_tokens(
                 token_ids, block_ids, all_group_block_ids=all_group_block_ids
             )
+            total_prompt_full_blocks = len(token_ids) // self._block_size
+            if all_group_block_ids and len(specs) < total_prompt_full_blocks:
+                self._inflight_req_state[new_req.req_id] = (
+                    token_ids,
+                    [list(g) for g in all_group_block_ids],
+                    len(specs),
+                )
             if not specs:
                 continue
 
@@ -1231,6 +1353,50 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                 )
 
+        # Handle multi-step prefill continuations (e.g. Mamba block-aligned splits)
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached_reqs is not None and self._inflight_req_state:
+            c_req_ids = getattr(cached_reqs, "req_ids", []) or []
+            c_new_block_ids = getattr(cached_reqs, "new_block_ids", []) or []
+            c_resumed = getattr(cached_reqs, "resumed_req_ids", set()) or set()
+            for idx, req_id in enumerate(c_req_ids):
+                if req_id not in self._inflight_req_state:
+                    continue
+                token_ids, group_lists, prev_stored = self._inflight_req_state[req_id]
+                new_blk_tuple = (
+                    c_new_block_ids[idx] if idx < len(c_new_block_ids) else None
+                )
+                if new_blk_tuple is not None:
+                    if req_id in c_resumed:
+                        group_lists = [list(g) for g in new_blk_tuple]
+                    else:
+                        for g_idx, g_new in enumerate(new_blk_tuple):
+                            if g_idx < len(group_lists) and g_new:
+                                group_lists[g_idx].extend(g_new)
+                specs = self._build_block_specs_for_tokens(
+                    token_ids,
+                    group_lists[0] if group_lists else [],
+                    all_group_block_ids=tuple(group_lists),
+                )
+                new_store_specs = specs[prev_stored:]
+                if new_store_specs:
+                    meta.requests.append(
+                        DeltaRequestMeta(
+                            req_id=req_id,
+                            is_store=True,
+                            blocks=new_store_specs,
+                        )
+                    )
+                total_prompt_full_blocks = len(token_ids) // self._block_size
+                if len(specs) >= total_prompt_full_blocks:
+                    self._inflight_req_state.pop(req_id, None)
+                else:
+                    self._inflight_req_state[req_id] = (
+                        token_ids,
+                        group_lists,
+                        len(specs),
+                    )
+
         self._requests_need_load.clear()
         return meta
 
@@ -1239,6 +1405,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        self._inflight_req_state.pop(request.request_id, None)
         return False, None
 
     def request_finished_all_groups(
@@ -1246,6 +1413,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        self._inflight_req_state.pop(request.request_id, None)
         return False, None
 
     # ==============================
@@ -1263,12 +1431,60 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         return blk_spec.physical_block_id
 
     @staticmethod
+    def _get_kv_layer_num_blocks(
+        kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
+    ) -> int:
+        if isinstance(kv_layer, tuple):
+            return kv_layer[0].shape[0] if kv_layer else 0
+        return kv_layer.shape[0]
+
+    def _get_layer_kv_cache(
+        self,
+        layer_name: str,
+        layer: Any = None,
+        virtual_engine: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
+        if layer is not None:
+            kv_cache_layer = getattr(layer, "kv_cache", None)
+            if isinstance(kv_cache_layer, list) and kv_cache_layer:
+                kv_cache_layer = kv_cache_layer[
+                    min(virtual_engine, len(kv_cache_layer) - 1)
+                ]
+            if isinstance(kv_cache_layer, tuple) and kv_cache_layer:
+                if (
+                    isinstance(kv_cache_layer[0], torch.Tensor)
+                    and kv_cache_layer[0].numel() > 0
+                ):
+                    return kv_cache_layer
+            elif (
+                isinstance(kv_cache_layer, torch.Tensor)
+                and kv_cache_layer.numel() > 0
+            ):
+                return kv_cache_layer
+        reg = self._registered_kv_caches.get(layer_name)
+        if isinstance(reg, tuple) and reg and reg[0].numel() > 0:
+            return reg
+        if isinstance(reg, torch.Tensor) and reg.numel() > 0:
+            return reg
+        return None
+
+    @staticmethod
     def _extract_block_kv(
-        kv_layer: torch.Tensor,
+        kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
         physical_block_id: int,
         is_mla: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Extract (K_block, V_block) of shape [block_size, num_kv_heads, head_dim]."""
+        """Extract (K_block, V_block) or Mamba/GDN (ssm_state, conv_state)."""
+        if isinstance(kv_layer, tuple):
+            if len(kv_layer) == 2:
+                conv_cache, ssm_cache = kv_layer
+                return (
+                    ssm_cache[physical_block_id].contiguous(),
+                    conv_cache[physical_block_id].contiguous(),
+                )
+            if len(kv_layer) == 1:
+                return kv_layer[0][physical_block_id].contiguous(), None
+            raise ValueError(f"Unsupported Mamba state tuple length: {len(kv_layer)}")
         if is_mla:
             # MLA shape: [num_pages, 1, page_size, head_dim] or [num_pages, page_size, head_dim]
             if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
@@ -1289,13 +1505,30 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
 
     @staticmethod
     def _inject_block_kv(
-        kv_layer: torch.Tensor,
+        kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
         physical_block_id: int,
         k_block: torch.Tensor,
         v_block: torch.Tensor | None,
         is_mla: bool,
     ) -> None:
-        """Write reconstructed (K_block, V_block) into a paged KV cache tensor."""
+        """Write reconstructed (K_block, V_block) or Mamba/GDN (ssm_state, conv_state) into cache."""
+        if isinstance(kv_layer, tuple):
+            if len(kv_layer) == 2:
+                conv_cache, ssm_cache = kv_layer
+                ssm_cache[physical_block_id].copy_(
+                    k_block.to(device=ssm_cache.device, non_blocking=True)
+                )
+                if v_block is not None:
+                    conv_cache[physical_block_id].copy_(
+                        v_block.to(device=conv_cache.device, non_blocking=True)
+                    )
+                return
+            if len(kv_layer) == 1:
+                kv_layer[0][physical_block_id].copy_(
+                    k_block.to(device=kv_layer[0].device, non_blocking=True)
+                )
+                return
+            raise ValueError(f"Unsupported Mamba state tuple length: {len(kv_layer)}")
         target_device = kv_layer.device
         if is_mla or v_block is None:
             if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
@@ -1331,26 +1564,44 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError(f"Unsupported kv_layer shape: {tuple(kv_layer.shape)}")
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+        self._active_no_compile_layers = (
+            getattr(forward_context, "no_compile_layers", {})
+            if forward_context is not None
+            else {}
+        ) or {}
+        self._active_virtual_engine = (
+            getattr(forward_context, "virtual_engine", 0)
+            if forward_context is not None
+            else 0
+        )
+        self._layers_saved_in_step.clear()
+
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, DeltaConnectorMetadata):
             return
 
         attn_metadata = getattr(forward_context, "attn_metadata", None)
-        no_compile_layers = getattr(forward_context, "no_compile_layers", {})
+        all_layer_names = list(self._active_no_compile_layers.keys())
+        for reg_name in self._registered_kv_caches:
+            if reg_name not in self._active_no_compile_layers:
+                all_layer_names.append(reg_name)
 
         for req_meta in metadata.requests:
             if req_meta.is_store:
                 continue
-            for layer_name, layer in no_compile_layers.items():
-                kv_cache_layer = getattr(layer, "kv_cache", None)
-                if kv_cache_layer is None:
+            for layer_name in all_layer_names:
+                layer = self._active_no_compile_layers.get(layer_name)
+                kv_tensor = self._get_layer_kv_cache(
+                    layer_name, layer, self._active_virtual_engine
+                )
+                if kv_tensor is None:
                     continue
-                if isinstance(kv_cache_layer, list):
-                    kv_tensor = kv_cache_layer[
-                        getattr(forward_context, "virtual_engine", 0)
-                    ]
-                else:
-                    kv_tensor = kv_cache_layer
+
+                policy = self.store.get_layer_policy(layer_name)
+                if isinstance(kv_tensor, tuple) and not policy.is_mamba:
+                    policy.is_mamba = True
+                    policy.rotary_dim = 0
+                    policy.max_sparse_exceptions = 0
 
                 layer_attn_meta = (
                     attn_metadata.get(layer_name)
@@ -1358,10 +1609,13 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     else attn_metadata
                 )
                 is_mla = isinstance(layer_attn_meta, MLACommonMetadata)
+                num_blocks = self._get_kv_layer_num_blocks(kv_tensor)
 
                 for blk_spec in req_meta.blocks:
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
-                    if phys_blk_id is None or phys_blk_id >= kv_tensor.shape[0]:
+                    if phys_blk_id is None or phys_blk_id >= num_blocks:
+                        continue
+                    if (isinstance(kv_tensor, tuple) or policy.is_mamba) and phys_blk_id <= 0:
                         continue
                     try:
                         k_recon, v_recon = self.store.reconstruct_block(
@@ -1386,21 +1640,31 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
     def save_kv_layer(
         self,
         layer_name: str,
-        kv_layer: torch.Tensor,
+        kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
         attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
+        self._layers_saved_in_step.add(layer_name)
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, DeltaConnectorMetadata):
             return
 
+        policy = self.store.get_layer_policy(layer_name)
+        if isinstance(kv_layer, tuple) and not policy.is_mamba:
+            policy.is_mamba = True
+            policy.rotary_dim = 0
+            policy.max_sparse_exceptions = 0
+
         is_mla = isinstance(attn_metadata, MLACommonMetadata)
+        num_blocks = self._get_kv_layer_num_blocks(kv_layer)
         for req_meta in metadata.requests:
             if not req_meta.is_store:
                 continue
             for blk_spec in req_meta.blocks:
                 phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
-                if phys_blk_id is None or phys_blk_id >= kv_layer.shape[0]:
+                if phys_blk_id is None or phys_blk_id >= num_blocks:
+                    continue
+                if (isinstance(kv_layer, tuple) or policy.is_mamba) and phys_blk_id <= 0:
                     continue
                 k_blk, v_blk = self._extract_block_kv(
                     kv_layer, phys_blk_id, is_mla=is_mla
@@ -1416,4 +1680,60 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
     def wait_for_save(self) -> None:
-        return
+        """Save any Mamba/GDN recurrent state layers not visited by @maybe_transfer_kv_layer."""
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, DeltaConnectorMetadata):
+            self._layers_saved_in_step.clear()
+            return
+
+        store_reqs = [r for r in metadata.requests if r.is_store]
+        if not store_reqs:
+            self._layers_saved_in_step.clear()
+            return
+
+        all_layer_names = list(self._active_no_compile_layers.keys())
+        for reg_name in self._registered_kv_caches:
+            if reg_name not in self._active_no_compile_layers:
+                all_layer_names.append(reg_name)
+
+        for layer_name in all_layer_names:
+            if layer_name in self._layers_saved_in_step:
+                continue
+            layer = self._active_no_compile_layers.get(layer_name)
+            kv_tensor = self._get_layer_kv_cache(
+                layer_name, layer, self._active_virtual_engine
+            )
+            if kv_tensor is None:
+                continue
+            policy = self.store.get_layer_policy(layer_name)
+            if not isinstance(kv_tensor, tuple) and not policy.is_mamba:
+                continue
+            if isinstance(kv_tensor, tuple) and not policy.is_mamba:
+                policy.is_mamba = True
+                policy.rotary_dim = 0
+                policy.max_sparse_exceptions = 0
+
+            num_blocks = self._get_kv_layer_num_blocks(kv_tensor)
+            for req_meta in store_reqs:
+                for blk_spec in req_meta.blocks:
+                    phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
+                    if (
+                        phys_blk_id is None
+                        or phys_blk_id <= 0
+                        or phys_blk_id >= num_blocks
+                    ):
+                        continue
+                    k_blk, v_blk = self._extract_block_kv(
+                        kv_tensor, phys_blk_id, is_mla=False
+                    )
+                    self.store.store_block(
+                        layer_name=layer_name,
+                        full_block_hash=blk_spec.full_block_hash,
+                        token_ids=blk_spec.token_ids,
+                        start_position=blk_spec.start_position,
+                        k_block=k_blk,
+                        v_block=v_blk,
+                        divergence_distance=blk_spec.divergence_distance,
+                    )
+
+        self._layers_saved_in_step.clear()
