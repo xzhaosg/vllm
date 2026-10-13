@@ -435,6 +435,27 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         self.assertGreater(sqnr_l2, 35.0)
 
+    def test_standardized_4d_kv_layout_and_gpu_roundtrip(self) -> None:
+        """Verifies 4D [num_blocks, num_kv_heads, block_size, 2*head_dim] extract/inject."""
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        num_blocks, num_kv_heads, block_size, head_dim = 8, 1, 16, 256
+        kv_4d = torch.randn(
+            num_blocks, num_kv_heads, block_size, 2 * head_dim,
+            dtype=torch.bfloat16, device=device
+        )
+        k_blk, v_blk = DeltaCompressionConnector._extract_block_kv(
+            kv_4d, physical_block_id=3, is_mla=False
+        )
+        assert v_blk is not None
+        self.assertEqual(tuple(k_blk.shape), (block_size, num_kv_heads, head_dim))
+        self.assertEqual(tuple(v_blk.shape), (block_size, num_kv_heads, head_dim))
+
+        kv_4d[5].zero_()
+        DeltaCompressionConnector._inject_block_kv(
+            kv_4d, physical_block_id=5, k_block=k_blk, v_block=v_blk, is_mla=False
+        )
+        self.assertTrue(torch.equal(kv_4d[3], kv_4d[5]))
+
 
 if __name__ == "__main__":
     unittest.main()
