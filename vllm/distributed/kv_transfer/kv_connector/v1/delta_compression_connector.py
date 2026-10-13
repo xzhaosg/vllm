@@ -420,6 +420,16 @@ class DeltaBlockStore:
 
         self.stats = DeltaCompressionStats()
 
+    def clear(self) -> None:
+        """Clear all stored KV block records and reset telemetry while preserving layer policies."""
+        self._records.clear()
+        self._base_by_token_hash.clear()
+        self._base_blocks_by_layer.clear()
+        self._base_by_subchunk.clear()
+        self._known_prefix_blocks.clear()
+        self._known_token_blocks.clear()
+        self.stats = DeltaCompressionStats()
+
     @staticmethod
     def _get_pigeonhole_slices(
         token_ids: tuple[int, ...], num_slices: int = 5

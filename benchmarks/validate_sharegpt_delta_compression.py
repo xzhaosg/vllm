@@ -27,10 +27,18 @@ import time
 from collections import defaultdict
 from typing import Any
 
+# Ensure V1 engine runs in-process so scheduler & worker share DeltaBlockStore in memory
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
 import torch
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector import (
+    DeltaBlockStore,
+    DeltaCompressionConnector,
+)
 from vllm.inputs import TokensPrompt
 
 
@@ -134,14 +142,19 @@ def build_regime_pair(
         raise ValueError(f"Unknown regime: {regime}")
 
 
-def get_connector_from_llm(llm: LLM) -> Any:
-    """Retrieve the worker-side DeltaCompressionConnector instance (in-proc V1 engine)."""
+def get_shared_store() -> DeltaBlockStore:
+    """Retrieve the shared DeltaBlockStore instance from the in-process V1 engine."""
     try:
-        engine_core = llm.llm_engine.engine_core.engine_core
-        worker = engine_core.model_executor.driver_worker.worker
-        return worker.model_runner.connector
-    except AttributeError:
-        return None
+        conn = get_kv_transfer_group()
+        if hasattr(conn, "store"):
+            return conn.store
+    except Exception:
+        pass
+    if DeltaCompressionConnector._shared_stores:
+        return next(iter(DeltaCompressionConnector._shared_stores.values()))
+    raise RuntimeError(
+        "Could not access shared DeltaBlockStore; ensure VLLM_ENABLE_V1_MULTIPROCESSING=0"
+    )
 
 
 def main() -> None:
@@ -202,11 +215,7 @@ def main() -> None:
         ),
     )
 
-    connector = get_connector_from_llm(llm)
-    if connector is None:
-        raise RuntimeError(
-            "Could not access worker-side DeltaCompressionConnector; ensure VLLM_ENABLE_V1_MULTIPROCESSING=0"
-        )
+    store = get_shared_store()
 
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -252,7 +261,7 @@ def main() -> None:
             )
 
             # Step 1: Exact uncompressed ground-truth reference for target_ids
-            connector.store.clear()
+            store.clear()
             llm.reset_prefix_cache()
             ref_out = llm.generate(
                 [TokensPrompt(prompt_token_ids=target_ids)],
@@ -266,7 +275,7 @@ def main() -> None:
             ref_top5_set = set(ref_first_logprobs.keys())
 
             # Step 2: Populate base prompt P_A, then run target prompt P_B to delta-compress
-            connector.store.clear()
+            store.clear()
             llm.reset_prefix_cache()
 
             _ = llm.generate(
@@ -274,20 +283,18 @@ def main() -> None:
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
                 use_tqdm=False,
             )
-            stats_after_base = connector.get_compression_stats()
-            base_uncomp = stats_after_base["total_uncompressed_bytes"]
-            base_comp = stats_after_base["total_compressed_bytes"]
-            base_tiers = dict(stats_after_base["tier_counts"])
+            base_uncomp = store.stats.raw_bytes_equivalent
+            base_comp = store.stats.compressed_bytes_stored
+            base_tiers = {k.name: v for k, v in store.stats.tier_counts.items()}
 
             _ = llm.generate(
                 [TokensPrompt(prompt_token_ids=target_ids)],
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
                 use_tqdm=False,
             )
-            stats_after_target = connector.get_compression_stats()
-            total_uncomp = stats_after_target["total_uncompressed_bytes"]
-            total_comp = stats_after_target["total_compressed_bytes"]
-            total_tiers = dict(stats_after_target["tier_counts"])
+            total_uncomp = store.stats.raw_bytes_equivalent
+            total_comp = store.stats.compressed_bytes_stored
+            total_tiers = {k.name: v for k, v in store.stats.tier_counts.items()}
 
             # Record incremental target compression stats
             inc_uncomp = total_uncomp - base_uncomp
