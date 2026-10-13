@@ -10,6 +10,19 @@ from unittest import mock
 
 import torch
 
+try:
+    from vllm.g3_integration import cns_bridge, patchers
+
+    cns_bridge.activate_cns_bridge()
+    patchers.inject_wildcard_mocks()
+    patchers.patch_metadata_versions()
+    patchers.patch_online_serving_dependencies()
+    patchers.redirect_caches_to_tmp()
+    patchers.disable_usage_stats()
+    patchers.apply_single_process_patches()
+except ImportError:
+    pass
+
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -459,32 +472,40 @@ class TestDeltaCompressionConnector(unittest.TestCase):
     def test_qwen3_rope_parameters_and_partial_rotary_auto_config(self) -> None:
         """Verifies rope_parameters['rope_theta'] (Qwen3) and partial_rotary_factor (Qwen3.5)."""
         DeltaCompressionConnector.reset_shared_stores()
-        vllm_config = self._make_mock_vllm_config(
-            block_size=16, engine_id="qwen3-cfg-test"
+        hf_cfg = SimpleNamespace(
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            rope_theta=None,
+            rope_local_base_freq=None,
+            rotary_dim=None,
+            head_dim=256,
+            layer_types=None,
+            sliding_window=None,
         )
-        hf_cfg = mock.MagicMock()
-        hf_cfg.rope_parameters = {
-            "rope_type": "default",
-            "rope_theta": 1000000.0,
-            "partial_rotary_factor": 0.25,
-        }
-        hf_cfg.rope_theta = None
-        hf_cfg.rope_local_base_freq = None
-        hf_cfg.rotary_dim = None
-        hf_cfg.head_dim = 256
-        hf_cfg.layer_types = None
-        hf_cfg.sliding_window = None
-        vllm_config.model_config = mock.MagicMock(hf_text_config=hf_cfg)
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16, enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            model_config=SimpleNamespace(hf_text_config=hf_cfg),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                engine_id="qwen3-cfg-test",
+            ),
+        )
 
-        grp = mock.MagicMock()
-        grp.kv_cache_spec = mock.MagicMock(sliding_window=None)
-        grp.layer_names = ["model.layers.0.self_attn.attn"]
-        kv_cache_cfg = mock.MagicMock(kv_cache_groups=[grp])
+        grp = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(sliding_window=None),
+            layer_names=["model.layers.0.self_attn.attn"],
+        )
+        kv_cache_cfg = SimpleNamespace(kv_cache_groups=[grp])
 
         conn = DeltaCompressionConnector(
-            vllm_config=vllm_config,
+            vllm_config=vllm_config,  # type: ignore[arg-type]
             role=KVConnectorRole.WORKER,
-            kv_cache_config=kv_cache_cfg,
+            kv_cache_config=kv_cache_cfg,  # type: ignore[arg-type]
         )
         pol = conn.store.get_layer_policy("model.layers.0.self_attn.attn")
         self.assertEqual(pol.rope_theta, 1000000.0)
