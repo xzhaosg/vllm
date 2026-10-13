@@ -129,11 +129,12 @@ def build_regime_pair(
         return base, target
 
     elif regime == "S3_intraturn_edit_dp0":
-        # Edit 2 tokens inside Block 2 (tokens 36 and 41) representing an intra-turn edit
+        # Edit 2 tokens inside an interior block representing an intra-turn edit
         base = list(conv_tokens)
         target = list(conv_tokens)
-        idx1 = 2 * block_size + 4
-        idx2 = 2 * block_size + 9
+        edit_blk = 1 if block_size >= 128 else 2
+        idx1 = edit_blk * block_size + 4
+        idx2 = edit_blk * block_size + 9
         target[idx1] = t_b if base[idx1] != t_b else t_a
         target[idx2] = t_b if base[idx2] != t_b else t_a
         return base, target
@@ -172,7 +173,10 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=50)
     parser.add_argument("--min-tokens", type=int, default=256)
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--gen-tokens", type=int, default=16)
+    parser.add_argument("--mamba-ssm-cache-dtype", type=str, default="auto")
+    parser.add_argument("--disable-mm", action="store_true")
     parser.add_argument(
         "--output-json",
         type=str,
@@ -186,33 +190,45 @@ def main() -> None:
     print(f"Loading tokenizer from {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    print(f"Loading ShareGPT conversations from {args.dataset}...")
+    print("Initializing vLLM V1 with DeltaCompressionConnector on NVIDIA L4 GPU...")
+    llm_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "block_size": 16,
+        "enable_prefix_caching": True,
+        "gpu_memory_utilization": 0.6,
+        "max_model_len": args.max_model_len,
+        "enforce_eager": True,
+        "kv_transfer_config": KVTransferConfig(
+            kv_connector="DeltaCompressionConnector",
+            kv_role="kv_both",
+        ),
+    }
+    if args.mamba_ssm_cache_dtype != "auto":
+        llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
+    if args.disable_mm:
+        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+
+    llm = LLM(**llm_kwargs)
+    resolved_block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
+    min_tokens = max(args.min_tokens, 3 * resolved_block_size)
+    max_tokens = max(args.max_tokens, 5 * resolved_block_size)
+
+    print(
+        f"Loading ShareGPT conversations from {args.dataset} "
+        f"(resolved block_size={resolved_block_size}, min_tokens={min_tokens}, max_tokens={max_tokens})..."
+    )
     conversations = load_sharegpt_conversations(
         args.dataset,
         tokenizer,
         num_samples=args.num_samples,
-        min_tokens=args.min_tokens,
-        max_tokens=args.max_tokens,
-        block_size=16,
+        min_tokens=min_tokens,
+        max_tokens=max_tokens,
+        block_size=resolved_block_size,
     )
     print(
         f"Selected {len(conversations)} multi-turn ShareGPT conversations "
         f"(avg tokens: {sum(len(c['token_ids']) for c in conversations) / len(conversations):.1f}, "
         f"avg full blocks: {sum(c['num_full_blocks'] for c in conversations) / len(conversations):.1f})."
-    )
-
-    print("Initializing vLLM V1 with DeltaCompressionConnector on NVIDIA L4 GPU...")
-    llm = LLM(
-        model=args.model,
-        block_size=16,
-        enable_prefix_caching=True,
-        gpu_memory_utilization=0.6,
-        max_model_len=2048,
-        enforce_eager=True,
-        kv_transfer_config=KVTransferConfig(
-            kv_connector="DeltaCompressionConnector",
-            kv_role="kv_both",
-        ),
     )
 
     store = get_shared_store()
@@ -232,6 +248,7 @@ def main() -> None:
     all_results: dict[str, Any] = {
         "model": args.model,
         "device": torch.cuda.get_device_name(0),
+        "block_size": resolved_block_size,
         "num_conversations": len(conversations),
         "gen_tokens": args.gen_tokens,
         "regimes": {},
@@ -257,7 +274,7 @@ def main() -> None:
 
         for idx, conv in enumerate(conversations):
             base_ids, target_ids = build_regime_pair(
-                conv["token_ids"], regime=regime, block_size=16
+                conv["token_ids"], regime=regime, block_size=resolved_block_size
             )
 
             # Step 1: Exact uncompressed ground-truth reference for target_ids
