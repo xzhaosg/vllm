@@ -407,6 +407,11 @@ class DeltaBlockStore:
         # Secondary list of UNCOMPRESSED_BASE blocks per layer for R2 partial-edit matching:
         # layer_name -> list[CompressedKVBlockRecord]
         self._base_blocks_by_layer: dict[str, list[CompressedKVBlockRecord]] = {}
+        # O(1) Pigeonhole sub-chunk index for R2 partial-edit matching (<= 4 edits in 16 tokens):
+        # (layer_name, slice_idx, token_subtuple) -> list[CompressedKVBlockRecord]
+        self._base_by_subchunk: dict[
+            tuple[str, int, tuple[int, ...]], list[CompressedKVBlockRecord]
+        ] = {}
 
         # Prefix hash registry at scheduler level: full_block_hash -> (token_ids, start_pos)
         self._known_prefix_blocks: dict[str, tuple[tuple[int, ...], int]] = {}
@@ -414,6 +419,21 @@ class DeltaBlockStore:
         self._known_token_blocks: dict[str, str] = {}
 
         self.stats = DeltaCompressionStats()
+
+    @staticmethod
+    def _get_pigeonhole_slices(
+        token_ids: tuple[int, ...], num_slices: int = 5
+    ) -> list[tuple[int, tuple[int, ...]]]:
+        """Partition token_ids into num_slices disjoint sub-tuples for O(1) candidate lookup."""
+        n = len(token_ids)
+        if n < num_slices:
+            return [(0, token_ids)]
+        out: list[tuple[int, tuple[int, ...]]] = []
+        for s_idx in range(num_slices):
+            start = (s_idx * n) // num_slices
+            end = ((s_idx + 1) * n) // num_slices
+            out.append((s_idx, token_ids[start:end]))
+        return out
 
     def register_layer_policy(
         self, layer_name: str, policy: LayerCompressionPolicy
@@ -449,7 +469,17 @@ class DeltaBlockStore:
     ) -> tuple[CompressedKVBlockRecord | None, list[int]]:
         """Find an UNCOMPRESSED_BASE block in the same layer differing in <= M tokens."""
         policy = self.get_layer_policy(layer_name)
-        candidates = self._base_blocks_by_layer.get(layer_name, [])
+        num_slices = policy.max_sparse_exceptions + 1
+        seen_hashes: set[str] = set()
+        candidates: list[CompressedKVBlockRecord] = []
+        for s_idx, sub_tuple in self._get_pigeonhole_slices(token_ids, num_slices):
+            bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
+            if bucket:
+                for rec in bucket[-8:]:
+                    if rec.full_block_hash not in seen_hashes:
+                        seen_hashes.add(rec.full_block_hash)
+                        candidates.append(rec)
+
         best_base: CompressedKVBlockRecord | None = None
         best_diff_indices: list[int] = []
 
@@ -708,6 +738,11 @@ class DeltaBlockStore:
         )
         self._base_by_token_hash.setdefault((layer_name, token_hash), base_record)
         self._base_blocks_by_layer.setdefault(layer_name, []).append(base_record)
+        num_slices = policy.max_sparse_exceptions + 1
+        for s_idx, sub_tuple in self._get_pigeonhole_slices(token_tuple, num_slices):
+            self._base_by_subchunk.setdefault(
+                (layer_name, s_idx, sub_tuple), []
+            ).append(base_record)
         return self._commit_record(layer_name, base_record, raw_bytes)
 
     def _commit_record(
