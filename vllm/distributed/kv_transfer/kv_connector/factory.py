@@ -247,3 +247,9 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",
     "HF3FSKVConnector",
 )
+KVConnectorFactory.register_connector(
+    "DeltaCompressionConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector",
+    "DeltaCompressionConnector",
+)
+
