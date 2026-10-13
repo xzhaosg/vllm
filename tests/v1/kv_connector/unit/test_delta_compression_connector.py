@@ -456,6 +456,40 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         self.assertTrue(torch.equal(kv_4d[3], kv_4d[5]))
 
+    def test_qwen3_rope_parameters_and_partial_rotary_auto_config(self) -> None:
+        """Verifies rope_parameters['rope_theta'] (Qwen3) and partial_rotary_factor (Qwen3.5)."""
+        DeltaCompressionConnector.reset_shared_stores()
+        vllm_config = self._make_mock_vllm_config(
+            block_size=16, engine_id="qwen3-cfg-test"
+        )
+        hf_cfg = mock.MagicMock()
+        hf_cfg.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": 1000000.0,
+            "partial_rotary_factor": 0.25,
+        }
+        hf_cfg.rope_theta = None
+        hf_cfg.rope_local_base_freq = None
+        hf_cfg.rotary_dim = None
+        hf_cfg.head_dim = 256
+        hf_cfg.layer_types = None
+        hf_cfg.sliding_window = None
+        vllm_config.model_config = mock.MagicMock(hf_text_config=hf_cfg)
+
+        grp = mock.MagicMock()
+        grp.kv_cache_spec = mock.MagicMock(sliding_window=None)
+        grp.layer_names = ["model.layers.0.self_attn.attn"]
+        kv_cache_cfg = mock.MagicMock(kv_cache_groups=[grp])
+
+        conn = DeltaCompressionConnector(
+            vllm_config=vllm_config,
+            role=KVConnectorRole.WORKER,
+            kv_cache_config=kv_cache_cfg,
+        )
+        pol = conn.store.get_layer_policy("model.layers.0.self_attn.attn")
+        self.assertEqual(pol.rope_theta, 1000000.0)
+        self.assertEqual(pol.rotary_dim, 64)
+
 
 if __name__ == "__main__":
     unittest.main()

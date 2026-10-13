@@ -378,6 +378,7 @@ class DeltaBlockStore:
         self,
         block_size: int = 16,
         default_rope_theta: float = 10000.0,
+        default_rotary_dim: int | None = None,
         sliding_window_dedup_threshold: int = 64,
         tau_zero_bit: float = 0.06,
         tau_int2: float = 0.12,
@@ -387,6 +388,7 @@ class DeltaBlockStore:
     ):
         self.block_size = block_size
         self.default_rope_theta = default_rope_theta
+        self.default_rotary_dim = default_rotary_dim
         self.sliding_window_dedup_threshold = sliding_window_dedup_threshold
         self.tau_zero_bit = tau_zero_bit
         self.tau_int2 = tau_int2
@@ -459,6 +461,7 @@ class DeltaBlockStore:
         policy = LayerCompressionPolicy(
             layer_idx=layer_idx,
             rope_theta=self.default_rope_theta,
+            rotary_dim=self.default_rotary_dim,
             sliding_window_dedup_threshold=self.sliding_window_dedup_threshold,
             tau_zero_bit=self.tau_zero_bit,
             tau_int2=self.tau_int2,
@@ -980,16 +983,60 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if model_config is not None
             else None
         )
-        global_theta = float(
-            getattr(hf_config, "rope_theta", self.store.default_rope_theta)
+        rope_params = (
+            getattr(hf_config, "rope_parameters", None)
+            or getattr(hf_config, "rope_scaling", None)
             if hf_config is not None
-            else self.store.default_rope_theta
+            else None
         )
-        local_theta = float(
-            getattr(hf_config, "rope_local_base_freq", 10000.0)
+        if not isinstance(rope_params, dict):
+            rope_params = None
+
+        raw_theta = (
+            rope_params.get("rope_theta")
+            if rope_params is not None and rope_params.get("rope_theta") is not None
+            else (getattr(hf_config, "rope_theta", None) if hf_config is not None else None)
+        )
+        global_theta = (
+            float(raw_theta) if raw_theta is not None else self.store.default_rope_theta
+        )
+        raw_local_theta = (
+            getattr(hf_config, "rope_local_base_freq", None)
             if hf_config is not None
-            else 10000.0
+            else None
         )
+        if raw_local_theta is None and rope_params is not None:
+            raw_local_theta = rope_params.get("rope_local_base_freq")
+        local_theta = float(raw_local_theta) if raw_local_theta is not None else 10000.0
+
+        # Resolve partial rotary factor / rotary_dim (e.g. Qwen3.5 / Qwen3-Next)
+        rotary_dim: int | None = (
+            getattr(hf_config, "rotary_dim", None) if hf_config is not None else None
+        )
+        if rotary_dim is None and hf_config is not None:
+            partial_factor = (
+                rope_params.get("partial_rotary_factor")
+                if rope_params is not None
+                and rope_params.get("partial_rotary_factor") is not None
+                else getattr(hf_config, "partial_rotary_factor", None)
+            )
+            head_dim = getattr(hf_config, "head_dim", None)
+            if head_dim is None:
+                hidden_size = getattr(hf_config, "hidden_size", 0)
+                num_heads = getattr(hf_config, "num_attention_heads", 0)
+                if hidden_size and num_heads:
+                    head_dim = hidden_size // num_heads
+            if (
+                partial_factor is not None
+                and head_dim is not None
+                and float(partial_factor) < 1.0
+            ):
+                rotary_dim = int(head_dim * float(partial_factor))
+
+        if hf_config is not None:
+            self.store.default_rope_theta = global_theta
+            self.store.default_rotary_dim = rotary_dim
+
         layer_types = (
             getattr(hf_config, "layer_types", None) if hf_config is not None else None
         )
@@ -1025,6 +1072,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                             is_sliding_window=is_sw,
                             sliding_window_size=sw_size,
                             rope_theta=theta,
+                            rotary_dim=rotary_dim,
                             sliding_window_dedup_threshold=self.store.sliding_window_dedup_threshold,
                             tau_zero_bit=self.store.tau_zero_bit,
                             tau_int2=self.store.tau_int2,

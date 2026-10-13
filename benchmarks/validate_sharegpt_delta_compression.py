@@ -230,7 +230,7 @@ def main() -> None:
     ]
 
     all_results: dict[str, Any] = {
-        "model": "google/gemma-3-1b-it",
+        "model": args.model,
         "device": torch.cuda.get_device_name(0),
         "num_conversations": len(conversations),
         "gen_tokens": args.gen_tokens,
