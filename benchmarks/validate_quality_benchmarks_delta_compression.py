@@ -142,34 +142,6 @@ def score_coqa_against_golds(pred: str, golds: list[str]) -> tuple[float, float]
 # ==============================================================================
 
 
-def align_prefix_tokens_to_block_size(
-    prefix_ids: list[int],
-    suffix_ids: list[int],
-    pad_token_id: int,
-    block_size: int,
-    min_blocks: int = 3,
-) -> list[int]:
-    """Ensure `prefix_ids` has length == K * block_size (K >= min_blocks) without truncating suffix."""
-    target_blocks = max(min_blocks, (len(prefix_ids) + block_size - 1) // block_size)
-    target_prefix_len = target_blocks * block_size
-    if len(prefix_ids) < target_prefix_len:
-        pad_len = target_prefix_len - len(prefix_ids)
-        # Insert padding right after the first 16 tokens so Block 0 header + all examples stay intact
-        aligned_prefix = (
-            prefix_ids[:16] + [pad_token_id] * pad_len + prefix_ids[16:]
-        )
-    else:
-        aligned_prefix = prefix_ids[:target_prefix_len]
-
-    # Ensure suffix has at least 4 trailing tokens and is never an exact multiple of block_size
-    # so that len(full_ids) // block_size == (len(full_ids) - 1) // block_size always holds.
-    if len(suffix_ids) < 4:
-        suffix_ids = [pad_token_id] * (4 - len(suffix_ids)) + suffix_ids
-    if len(suffix_ids) % block_size == 0:
-        suffix_ids = [pad_token_id] + suffix_ids
-    return aligned_prefix + suffix_ids
-
-
 def build_gsm8k_samples(
     train_path: str,
     test_path: str,
@@ -183,41 +155,64 @@ def build_gsm8k_samples(
         test_data = [json.loads(line) for line in f if line.strip()]
 
     newline_id = tokenizer.encode("\n", add_special_tokens=False)[0]
-    min_prefix_tokens = max(512, 3 * block_size)
+    # Use 3 full blocks for the few-shot prefix (e.g. 816 tokens for B=272, or 512 tokens for B=16)
+    target_prefix_blocks = max(3, 512 // block_size)
+    target_prefix_len = target_prefix_blocks * block_size
 
     samples: list[dict[str, Any]] = []
     for i in range(min(num_samples, len(test_data))):
-        # Build a distinct few-shot prefix per sample so batched requests do not collide in block_pool
         header = (
             f"System Session ID: {10000 + i} | Mode: Math Reasoning Benchmark\n"
             f"Solve each math word problem step by step and end with #### <number>.\n\n"
         )
-        shots_text = header
-        shot_idx = (i * 3) % (len(train_data) - 20)
-        while len(tokenizer.encode(shots_text, add_special_tokens=False)) < min_prefix_tokens:
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+
+        demos_text = ""
+        shot_idx = (i * 3) % (len(train_data) - 30)
+        while (
+            len(header_ids)
+            + len(tokenizer.encode(demos_text, add_special_tokens=False))
+            < target_prefix_len + 128
+        ):
             ex = train_data[shot_idx]
-            shots_text += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
+            demos_text += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
             shot_idx += 1
 
-        prefix_ids = tokenizer.encode(shots_text, add_special_tokens=False)
-        q_text = f"Question: {test_data[i]['question']}\nAnswer:"
-        suffix_ids = tokenizer.encode(q_text, add_special_tokens=False)
+        demo_ids = tokenizer.encode(demos_text, add_special_tokens=False)
+        needed_demo_len = target_prefix_len - len(header_ids)
+        aligned_prefix = header_ids + demo_ids[-needed_demo_len:]
+        assert len(aligned_prefix) == target_prefix_len
 
-        full_ids = align_prefix_tokens_to_block_size(
-            prefix_ids=prefix_ids,
-            suffix_ids=suffix_ids,
-            pad_token_id=newline_id,
-            block_size=block_size,
-            min_blocks=3,
-        )
+        q_text = f"\n\nQuestion: {test_data[i]['question']}\nAnswer:"
+        suffix_ids = tokenizer.encode(q_text, add_special_tokens=False)
+        if len(suffix_ids) < 4:
+            suffix_ids = [newline_id] * (4 - len(suffix_ids)) + suffix_ids
+        if len(suffix_ids) % block_size == 0:
+            suffix_ids = [newline_id] + suffix_ids
+
+        full_ids = aligned_prefix + suffix_ids
         gold_val = extract_gsm8k_answer(test_data[i]["answer"])
         if gold_val == INVALID_NUM:
             continue
+
+        # Natural-English 1-block prepended context for S2 and natural digit token IDs for edits
+        ctx_str = (
+            f"[Context Note {i}: Read each problem carefully, verify intermediate steps, "
+            f"and provide the final numerical answer after ####.]\n"
+            * 24
+        )
+        ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
+        edit_toks = [
+            tokenizer.encode(str(d), add_special_tokens=False)[-1]
+            for d in range(1, 10)
+        ]
 
         samples.append(
             {
                 "id": f"gsm8k_{i}",
                 "token_ids": full_ids,
+                "prepend_block": ctx_ids,
+                "edit_toks": edit_toks,
                 "gold_answer": gold_val,
                 "question": test_data[i]["question"],
             }
@@ -245,28 +240,30 @@ def build_coqa_samples(
         if len(story_obj.get("questions", [])) < 4:
             continue
 
-        # Target story + first 3 conversational turns (Q1/A1, Q2/A2, Q3/A3)
-        target_history = f"Passage:\n{story_obj['story'].strip()}\n\n"
+        # Target story + first 3 conversational turns (Q1/A1, Q2/A2, Q3/A3) — never truncated!
+        target_history = f"\n\nPassage:\n{story_obj['story'].strip()}\n\n"
         for t_idx in range(3):
             q_str = story_obj["questions"][t_idx]["input_text"].strip()
             a_str = story_obj["answers"][t_idx]["input_text"].strip()
             target_history += f"Q: {q_str}\nA: {a_str}\n"
+        target_history_ids = tokenizer.encode(
+            target_history, add_special_tokens=False
+        )
 
-        # Prepend enough concise CoQA demonstration stories so total prefix >= min_prefix_tokens
         header = (
             f"System Session ID: {20000 + len(samples)} | Task: Concise Reading Comprehension\n"
             f"Answer each question about the passage with a short, direct phrase.\n\n"
         )
-        demos_text = header
-        d_idx = (len(samples) * 2) % (len(demo_pool) - 10)
-        while (
-            len(
-                tokenizer.encode(
-                    demos_text + target_history, add_special_tokens=False
-                )
-            )
-            < min_prefix_tokens
-        ):
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+
+        raw_needed = max(min_prefix_tokens, len(header_ids) + len(target_history_ids) + 64)
+        target_blocks = (raw_needed + block_size - 1) // block_size
+        target_prefix_len = target_blocks * block_size
+        needed_demo_len = target_prefix_len - len(header_ids) - len(target_history_ids)
+
+        demos_text = ""
+        d_idx = (len(samples) * 2) % (len(demo_pool) - 15)
+        while len(tokenizer.encode(demos_text, add_special_tokens=False)) < needed_demo_len + 128:
             d_story = demo_pool[d_idx]
             demos_text += f"Passage:\n{d_story['story'].strip()}\n\n"
             for t_idx in range(4):
@@ -276,30 +273,44 @@ def build_coqa_samples(
             demos_text += "\n"
             d_idx += 1
 
-        prefix_ids = tokenizer.encode(
-            demos_text + target_history, add_special_tokens=False
+        demo_ids = tokenizer.encode(demos_text, add_special_tokens=False)
+        aligned_prefix = (
+            header_ids + demo_ids[-needed_demo_len:] + target_history_ids
         )
+        assert len(aligned_prefix) == target_prefix_len
+
         q4_str = story_obj["questions"][3]["input_text"].strip()
         suffix_text = f"Q: {q4_str}\nA:"
         suffix_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
+        if len(suffix_ids) < 4:
+            suffix_ids = [newline_id] * (4 - len(suffix_ids)) + suffix_ids
+        if len(suffix_ids) % block_size == 0:
+            suffix_ids = [newline_id] + suffix_ids
 
-        full_ids = align_prefix_tokens_to_block_size(
-            prefix_ids=prefix_ids,
-            suffix_ids=suffix_ids,
-            pad_token_id=newline_id,
-            block_size=block_size,
-            min_blocks=3,
-        )
+        full_ids = aligned_prefix + suffix_ids
 
         golds = [story_obj["answers"][3]["input_text"].strip()]
         for add_list in story_obj.get("additional_answers", {}).values():
             if len(add_list) > 3:
                 golds.append(add_list[3]["input_text"].strip())
 
+        ctx_str = (
+            f"[Context Note {len(samples)}: Answer the question concisely using only facts "
+            f"stated in the passage above.]\n"
+            * 24
+        )
+        ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
+        edit_toks = [
+            tokenizer.encode(str(d), add_special_tokens=False)[-1]
+            for d in range(1, 10)
+        ]
+
         samples.append(
             {
                 "id": story_obj.get("id", f"coqa_{len(samples)}"),
                 "token_ids": full_ids,
+                "prepend_block": ctx_ids,
+                "edit_toks": edit_toks,
                 "gold_answers": golds,
                 "question_4": q4_str,
             }
@@ -311,36 +322,35 @@ def build_coqa_samples(
 
 
 def build_regime_turns(
-    prompt_tokens: list[int],
+    sample: dict[str, Any],
     regime: str,
     num_turns: int,
     block_size: int,
-    sample_idx: int = 0,
 ) -> list[list[int]]:
     """Construct [turn_1_tokens, ..., turn_N_tokens] for a given prefix-divergence regime."""
+    prompt_tokens = sample["token_ids"]
+    edit_toks = sample["edit_toks"]
     turns: list[list[int]] = [list(prompt_tokens)]
     for t in range(1, num_turns):
-        t_a = 1050 + 2 * t
-        t_b = 1051 + 2 * t
+        t_a = edit_toks[(2 * t - 2) % len(edit_toks)]
+        t_b = edit_toks[(2 * t - 1) % len(edit_toks)]
         if regime == "S1_dynamic_header_dp0":
             target = list(prompt_tokens)
-            target[4] = t_b if prompt_tokens[4] != t_b else t_a
-            target[9] = t_a if prompt_tokens[9] != t_a else t_b
+            target[4] = t_b if prompt_tokens[4] != t_b else edit_toks[0]
+            target[9] = t_a if prompt_tokens[9] != t_a else edit_toks[-1]
             turns.append(target)
         elif regime == "S2_prepend_context_dp16":
-            # Make prepended block unique per sample_idx so batched requests do not share Block 0
-            prefix_block = [
-                1000 + 20 * t + ((i + sample_idx * 7) % 19)
-                for i in range(block_size)
-            ]
+            prefix_block = list(sample["prepend_block"])
+            prefix_block[3] = t_a
+            prefix_block[7] = t_b
             turns.append(prefix_block + list(prompt_tokens))
         elif regime == "S3_intraturn_edit_dp0":
             target = list(prompt_tokens)
             edit_blk = 1 if block_size >= 128 else 2
             idx1 = edit_blk * block_size + 4
             idx2 = edit_blk * block_size + 9
-            target[idx1] = t_b if prompt_tokens[idx1] != t_b else t_a
-            target[idx2] = t_a if prompt_tokens[idx2] != t_a else t_b
+            target[idx1] = t_b if prompt_tokens[idx1] != t_b else edit_toks[0]
+            target[idx2] = t_a if prompt_tokens[idx2] != t_a else edit_toks[-1]
             turns.append(target)
         else:
             raise ValueError(f"Unknown regime: {regime}")
@@ -409,13 +419,12 @@ def run_task_evaluation(
             batch = samples[b_start : b_start + batch_size]
             batch_turns = [
                 build_regime_turns(
-                    s["token_ids"],
+                    s,
                     regime=regime,
                     num_turns=num_turns,
                     block_size=block_size,
-                    sample_idx=b_start + j,
                 )
-                for j, s in enumerate(batch)
+                for s in batch
             ]
             final_prompts = [
                 TokensPrompt(prompt_token_ids=t[-1]) for t in batch_turns
