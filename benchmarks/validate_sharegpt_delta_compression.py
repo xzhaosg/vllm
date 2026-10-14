@@ -172,6 +172,7 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--gen-tokens", type=int, default=16)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--mamba-ssm-cache-dtype", type=str, default="auto")
     parser.add_argument("--disable-mm", action="store_true")
     parser.add_argument(
@@ -193,7 +194,7 @@ def main() -> None:
         "block_size": 16,
         "enable_prefix_caching": True,
         "async_scheduling": False,
-        "gpu_memory_utilization": 0.6,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
         "max_model_len": args.max_model_len,
         "enforce_eager": True,
         "kv_transfer_config": KVTransferConfig(
