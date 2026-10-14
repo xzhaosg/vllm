@@ -727,6 +727,64 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             self.assertLess(ssm_err.item(), 0.05)
             self.assertLess(conv_err.item(), 0.05)
 
+    def test_qwen3_5_moe_partial_edit_mamba_delta_compression(self) -> None:
+        """Verifies Mamba/GDN partial-edit delta compression for Qwen3.5-MoE (e.g. 35B-A3B)."""
+        store = DeltaBlockStore(max_sparse_exceptions=4)
+        store.register_layer_policy(
+            "model.language_model.layers.0.linear_attn",
+            LayerCompressionPolicy(
+                layer_idx=0,
+                is_mamba=True,
+                rope_theta=0.0,
+                rotary_dim=0,
+                max_sparse_exceptions=0,
+            ),
+        )
+        torch.manual_seed(123)
+        base_tokens = tuple(range(1000, 1064))
+        ssm_base = torch.randn(4096, 1, dtype=torch.bfloat16)
+        conv_base = torch.randn(512, 1, dtype=torch.bfloat16)
+
+        rec_base = store.store_block(
+            layer_name="model.language_model.layers.0.linear_attn",
+            full_block_hash="mamba_base_h",
+            token_ids=base_tokens,
+            start_position=0,
+            k_block=ssm_base,
+            v_block=conv_base,
+        )
+        self.assertEqual(rec_base.tier, CompressionTier.UNCOMPRESSED_BASE)
+
+        # Edit 2 tokens inside the block (<= max_sparse_exceptions=4) with small state perturbation
+        edited_tokens = (9991, 9992) + base_tokens[2:]
+        ssm_target = ssm_base + 0.04 * torch.randn_like(ssm_base)
+        conv_target = conv_base.clone()
+
+        rec_target = store.store_block(
+            layer_name="model.language_model.layers.0.linear_attn",
+            full_block_hash="mamba_target_h",
+            token_ids=edited_tokens,
+            start_position=0,
+            k_block=ssm_target,
+            v_block=conv_target,
+        )
+        self.assertEqual(rec_target.tier, CompressionTier.TIER1_INT2_DELTA)
+        self.assertEqual(rec_target.ref_base_hash, "mamba_base_h")
+
+        ssm_recon, conv_recon = store.reconstruct_block(
+            layer_name="model.language_model.layers.0.linear_attn",
+            full_block_hash="mamba_target_h",
+            token_ids=edited_tokens,
+            target_start_position=0,
+        )
+        assert conv_recon is not None
+        rel_err = (
+            torch.linalg.norm((ssm_recon - ssm_target).to(torch.float32))
+            / torch.linalg.norm(ssm_target.to(torch.float32))
+        ).item()
+        self.assertLess(rel_err, 0.03)
+        self.assertTrue(torch.equal(conv_recon, conv_target))
+
 
 if __name__ == "__main__":
     unittest.main()

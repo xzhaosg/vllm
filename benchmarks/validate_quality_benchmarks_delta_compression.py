@@ -188,9 +188,10 @@ def build_gsm8k_samples(
     ctx_str = (
         "[Context Note: Read each problem carefully, verify intermediate steps, "
         "and provide the final numerical answer after ####.]\n"
-        * 24
+        * max(24, (block_size // 10) + 8)
     )
     ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
+    assert len(ctx_ids) == block_size
 
     samples: list[dict[str, Any]] = []
     for i in range(min(num_samples, len(test_data))):
@@ -240,9 +241,10 @@ def build_coqa_samples(
     ctx_str = (
         "[Context Note: Answer the question concisely using only facts "
         "stated in the passage above.]\n"
-        * 24
+        * max(24, (block_size // 10) + 8)
     )
     ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
+    assert len(ctx_ids) == block_size
 
     samples: list[dict[str, Any]] = []
     for i, story_obj in enumerate(raw_coqa):
@@ -625,13 +627,19 @@ def main() -> None:
     print(f"Loading tokenizer from {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
+    effective_max_model_len = args.max_model_len
+    if (
+        "35b" in args.model.lower() or "moe" in args.model.lower()
+    ) and effective_max_model_len < 3584:
+        effective_max_model_len = 3584
+
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
         "block_size": 16,
         "enable_prefix_caching": True,
         "async_scheduling": False,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "max_model_len": args.max_model_len,
+        "max_model_len": effective_max_model_len,
         "enforce_eager": True,
         "kv_transfer_config": KVTransferConfig(
             kv_connector="DeltaCompressionConnector",

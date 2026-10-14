@@ -505,9 +505,14 @@ class DeltaBlockStore:
     ) -> tuple[CompressedKVBlockRecord | None, list[int]]:
         """Find an UNCOMPRESSED_BASE block in the same layer differing in <= M tokens."""
         policy = self.get_layer_policy(layer_name)
-        if policy.is_mamba or policy.max_sparse_exceptions <= 0:
+        max_exceptions = (
+            self.max_sparse_exceptions
+            if policy.is_mamba
+            else policy.max_sparse_exceptions
+        )
+        if max_exceptions <= 0:
             return None, []
-        num_slices = policy.max_sparse_exceptions + 1
+        num_slices = max_exceptions + 1
         seen_hashes: set[str] = set()
         candidates: list[CompressedKVBlockRecord] = []
         for s_idx, sub_tuple in self._get_pigeonhole_slices(token_ids, num_slices):
@@ -529,7 +534,7 @@ class DeltaBlockStore:
                 for i, (t_a, t_b) in enumerate(zip(token_ids, base_rec.token_ids))
                 if t_a != t_b
             ]
-            if 0 < len(diff_idx) <= policy.max_sparse_exceptions:
+            if 0 < len(diff_idx) <= max_exceptions:
                 if best_base is None or len(diff_idx) < len(best_diff_indices):
                     best_base = base_rec
                     best_diff_indices = diff_idx
@@ -728,55 +733,136 @@ class DeltaBlockStore:
         if partial_base is not None and diff_indices:
             assert partial_base.raw_k is not None
             delta_pos = start_position - partial_base.start_position
-            k_ref_aligned = apply_relative_rope_rotation(
-                partial_base.raw_k,
-                delta_pos=delta_pos,
-                rope_theta=policy.rope_theta,
-                rotary_dim=policy.rotary_dim,
-                is_neox_style=policy.is_neox_style,
-            )
-            idx_tensor = torch.tensor(diff_indices, dtype=torch.long, device=self.device)
-            sparse_k = k_cpu[idx_tensor].clone()
-            sparse_v = v_cpu[idx_tensor].clone() if v_cpu is not None else None
+            if policy.is_mamba:
+                delta_k = k_cpu.to(torch.float32) - partial_base.raw_k.to(torch.float32)
+                k_norm = torch.linalg.norm(k_cpu.to(torch.float32)).item()
+                dk_norm = torch.linalg.norm(delta_k).item()
+                eta_k = dk_norm / max(k_norm, 1e-8)
 
-            # Zero out the edited rows in the residual so their large outliers do not
-            # pollute the per-head INT4 quantization scale of the remaining rows!
-            delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
-            delta_k[idx_tensor] = 0.0
-            q_dk = (
-                quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
-                if policy.layer_idx > 0
-                else None
-            )
+                if v_cpu is not None and partial_base.raw_v is not None:
+                    delta_v = v_cpu.to(torch.float32) - partial_base.raw_v.to(
+                        torch.float32
+                    )
+                    v_norm = torch.linalg.norm(v_cpu.to(torch.float32)).item()
+                    dv_norm = torch.linalg.norm(delta_v).item()
+                    eta_v = dv_norm / max(v_norm, 1e-8)
+                    eta_max = max(eta_k, eta_v)
+                else:
+                    delta_v = None
+                    eta_v = 0.0
+                    eta_max = eta_k
 
-            if v_cpu is not None and partial_base.raw_v is not None:
-                delta_v = v_cpu.to(torch.float32) - partial_base.raw_v.to(torch.float32)
-                delta_v[idx_tensor] = 0.0
-                q_dv = (
-                    quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                if eta_max <= min(policy.tau_zero_bit, 0.01):
+                    record = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER0_ZERO_BIT,
+                        full_block_hash=full_block_hash,
+                        token_block_hash=token_hash,
+                        token_ids=token_tuple,
+                        start_position=start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=is_mla,
+                        ref_base_hash=partial_base.full_block_hash,
+                        delta_pos=delta_pos,
+                    )
+                    return self._commit_record(layer_name, record, raw_bytes)
+
+                if eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4:
+                    q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=2)
+                    q_dv = (
+                        quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                        if (delta_v is not None and v_cpu is not None)
+                        else None
+                    )
+                    record = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER1_INT2_DELTA,
+                        full_block_hash=full_block_hash,
+                        token_block_hash=token_hash,
+                        token_ids=token_tuple,
+                        start_position=start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=is_mla,
+                        ref_base_hash=partial_base.full_block_hash,
+                        delta_pos=delta_pos,
+                        quant_delta_k=q_dk,
+                        quant_delta_v=q_dv,
+                    )
+                    return self._commit_record(layer_name, record, raw_bytes)
+
+                if eta_max <= policy.tau_int4:
+                    q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
+                    q_dv = (
+                        quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                        if (delta_v is not None and v_cpu is not None)
+                        else None
+                    )
+                    record = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER2_INT4_DELTA,
+                        full_block_hash=full_block_hash,
+                        token_block_hash=token_hash,
+                        token_ids=token_tuple,
+                        start_position=start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=is_mla,
+                        ref_base_hash=partial_base.full_block_hash,
+                        delta_pos=delta_pos,
+                        quant_delta_k=q_dk,
+                        quant_delta_v=q_dv,
+                    )
+                    return self._commit_record(layer_name, record, raw_bytes)
+            else:
+                k_ref_aligned = apply_relative_rope_rotation(
+                    partial_base.raw_k,
+                    delta_pos=delta_pos,
+                    rope_theta=policy.rope_theta,
+                    rotary_dim=policy.rotary_dim,
+                    is_neox_style=policy.is_neox_style,
+                )
+                idx_tensor = torch.tensor(
+                    diff_indices, dtype=torch.long, device=self.device
+                )
+                sparse_k = k_cpu[idx_tensor].clone()
+                sparse_v = v_cpu[idx_tensor].clone() if v_cpu is not None else None
+
+                # Zero out the edited rows in the residual so their large outliers do not
+                # pollute the per-head INT4 quantization scale of the remaining rows!
+                delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
+                delta_k[idx_tensor] = 0.0
+                q_dk = (
+                    quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
                     if policy.layer_idx > 0
                     else None
                 )
-            else:
-                q_dv = None
 
-            record = CompressedKVBlockRecord(
-                tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
-                full_block_hash=full_block_hash,
-                token_block_hash=token_hash,
-                token_ids=token_tuple,
-                start_position=start_position,
-                layer_idx=policy.layer_idx,
-                is_mla=is_mla,
-                ref_base_hash=partial_base.full_block_hash,
-                delta_pos=delta_pos,
-                quant_delta_k=q_dk,
-                quant_delta_v=q_dv,
-                sparse_token_indices=idx_tensor.to(torch.uint8),
-                sparse_k_bf16=sparse_k,
-                sparse_v_bf16=sparse_v,
-            )
-            return self._commit_record(layer_name, record, raw_bytes)
+                if v_cpu is not None and partial_base.raw_v is not None:
+                    delta_v = v_cpu.to(torch.float32) - partial_base.raw_v.to(
+                        torch.float32
+                    )
+                    delta_v[idx_tensor] = 0.0
+                    q_dv = (
+                        quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                        if policy.layer_idx > 0
+                        else None
+                    )
+                else:
+                    q_dv = None
+
+                record = CompressedKVBlockRecord(
+                    tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                    full_block_hash=full_block_hash,
+                    token_block_hash=token_hash,
+                    token_ids=token_tuple,
+                    start_position=start_position,
+                    layer_idx=policy.layer_idx,
+                    is_mla=is_mla,
+                    ref_base_hash=partial_base.full_block_hash,
+                    delta_pos=delta_pos,
+                    quant_delta_k=q_dk,
+                    quant_delta_v=q_dv,
+                    sparse_token_indices=idx_tensor.to(torch.uint8),
+                    sparse_k_bf16=sparse_k,
+                    sparse_v_bf16=sparse_v,
+                )
+                return self._commit_record(layer_name, record, raw_bytes)
 
         # 3. Default: Store as UNCOMPRESSED_BASE and index for single-hop reference
         base_record = CompressedKVBlockRecord(
@@ -792,8 +878,13 @@ class DeltaBlockStore:
         )
         self._base_by_token_hash.setdefault((layer_name, token_hash), base_record)
         self._base_blocks_by_layer.setdefault(layer_name, []).append(base_record)
-        if not policy.is_mamba and policy.max_sparse_exceptions > 0:
-            num_slices = policy.max_sparse_exceptions + 1
+        max_exceptions = (
+            self.max_sparse_exceptions
+            if policy.is_mamba
+            else policy.max_sparse_exceptions
+        )
+        if max_exceptions > 0:
+            num_slices = max_exceptions + 1
             for s_idx, sub_tuple in self._get_pigeonhole_slices(token_tuple, num_slices):
                 self._base_by_subchunk.setdefault(
                     (layer_name, s_idx, sub_tuple), []

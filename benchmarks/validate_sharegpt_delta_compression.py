@@ -188,14 +188,20 @@ def main() -> None:
     print(f"Loading tokenizer from {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    print("Initializing vLLM V1 with DeltaCompressionConnector on NVIDIA L4 GPU...")
+    print("Initializing vLLM V1 with DeltaCompressionConnector on GPU...")
+    effective_max_model_len = args.max_model_len
+    if (
+        "35b" in args.model.lower() or "moe" in args.model.lower()
+    ) and effective_max_model_len < 3584:
+        effective_max_model_len = 3584
+
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
         "block_size": 16,
         "enable_prefix_caching": True,
         "async_scheduling": False,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "max_model_len": args.max_model_len,
+        "max_model_len": effective_max_model_len,
         "enforce_eager": True,
         "kv_transfer_config": KVTransferConfig(
             kv_connector="DeltaCompressionConnector",
@@ -209,8 +215,15 @@ def main() -> None:
 
     llm = LLM(**llm_kwargs)
     resolved_block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
-    min_tokens = max(args.min_tokens, 3 * resolved_block_size)
-    max_tokens = max(args.max_tokens, 5 * resolved_block_size)
+    max_usable_blocks = max(
+        3,
+        (effective_max_model_len - 4 - args.gen_tokens) // resolved_block_size,
+    )
+    max_tokens = min(
+        max(args.max_tokens, 5 * resolved_block_size),
+        max_usable_blocks * resolved_block_size,
+    )
+    min_tokens = min(max(args.min_tokens, 3 * resolved_block_size), max_tokens)
 
     print(
         f"Loading ShareGPT conversations from {args.dataset} "
