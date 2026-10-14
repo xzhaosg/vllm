@@ -469,6 +469,24 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         self.assertTrue(torch.equal(kv_4d[3], kv_4d[5]))
 
+        # Also test virtual kernel-block splitting when manager block_size=32, kernel_block_size=16
+        k_blk32, v_blk32 = DeltaCompressionConnector._extract_block_kv(
+            kv_4d, physical_block_id=1, is_mla=False, block_size=32
+        )
+        assert v_blk32 is not None
+        self.assertEqual(tuple(k_blk32.shape), (32, num_kv_heads, head_dim))
+        self.assertEqual(tuple(v_blk32.shape), (32, num_kv_heads, head_dim))
+        kv_4d[4:6].zero_()
+        DeltaCompressionConnector._inject_block_kv(
+            kv_4d,
+            physical_block_id=2,
+            k_block=k_blk32,
+            v_block=v_blk32,
+            is_mla=False,
+            block_size=32,
+        )
+        self.assertTrue(torch.equal(kv_4d[2:4], kv_4d[4:6]))
+
     def test_qwen3_rope_parameters_and_partial_rotary_auto_config(self) -> None:
         """Verifies rope_parameters['rope_theta'] (Qwen3) and partial_rotary_factor (Qwen3.5)."""
         DeltaCompressionConnector.reset_shared_stores()
@@ -678,14 +696,17 @@ class TestDeltaCompressionConnector(unittest.TestCase):
                 SimpleNamespace(
                     req_id="req_b_reload",
                     prompt_token_ids=tokens_b,
-                    block_ids=([0, 6], [5, 6]),
+                    block_ids=([0, 6, 7], [5, 6, 7]),
                 )
             ],
+            num_scheduled_tokens={"req_b_reload": 4},
             scheduled_cached_reqs=None,
             finished_req_ids=set(),
         )
         conv_cache[6].zero_()
         ssm_cache[6].zero_()
+        conv_cache[7].zero_()
+        ssm_cache[7].zero_()
         attn_cache[5].zero_()
         attn_cache[6].zero_()
 
@@ -694,16 +715,17 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         worker_conn.start_load_kv(fwd_ctx)  # type: ignore[arg-type]
         worker_conn.clear_connector_metadata()
 
-        # Verify both GDN (conv_state[6], ssm_state[6]) and FullAttention (attn_cache[5, 6])
-        # were reconstructed accurately from delta-compressed storage!
-        ssm_err = torch.linalg.norm(
-            (ssm_cache[6] - ssm_cache[4]).to(torch.float32)
-        ) / torch.linalg.norm(ssm_cache[4].to(torch.float32))
-        conv_err = torch.linalg.norm(
-            (conv_cache[6] - conv_cache[4]).to(torch.float32)
-        ) / torch.linalg.norm(conv_cache[4].to(torch.float32))
-        self.assertLess(ssm_err.item(), 0.05)
-        self.assertLess(conv_err.item(), 0.05)
+        # Verify both GDN boundary block 6 AND running block 7 (post-preprocess_mamba),
+        # plus FullAttention (attn_cache[5, 6]) were reconstructed accurately!
+        for gdn_blk in (6, 7):
+            ssm_err = torch.linalg.norm(
+                (ssm_cache[gdn_blk] - ssm_cache[4]).to(torch.float32)
+            ) / torch.linalg.norm(ssm_cache[4].to(torch.float32))
+            conv_err = torch.linalg.norm(
+                (conv_cache[gdn_blk] - conv_cache[4]).to(torch.float32)
+            ) / torch.linalg.norm(conv_cache[4].to(torch.float32))
+            self.assertLess(ssm_err.item(), 0.05)
+            self.assertLess(conv_err.item(), 0.05)
 
 
 if __name__ == "__main__":

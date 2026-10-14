@@ -195,6 +195,7 @@ def main() -> None:
         "model": args.model,
         "block_size": 16,
         "enable_prefix_caching": True,
+        "async_scheduling": False,
         "gpu_memory_utilization": 0.6,
         "max_model_len": args.max_model_len,
         "enforce_eager": True,
@@ -304,6 +305,7 @@ def main() -> None:
             base_comp = store.stats.compressed_bytes_stored
             base_tiers = {k.name: v for k, v in store.stats.tier_counts.items()}
 
+            llm.reset_prefix_cache()
             _ = llm.generate(
                 [TokensPrompt(prompt_token_ids=target_ids)],
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=1),

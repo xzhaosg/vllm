@@ -940,6 +940,7 @@ class DeltaBlockTransferSpec:
     physical_block_id: int
     divergence_distance: int | None = None
     group_block_ids: tuple[int | None, ...] = ()
+    group_running_block_ids: tuple[int | None, ...] = ()
 
 
 @dataclass
@@ -1327,6 +1328,32 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 num_ext_blocks = num_ext // self._block_size
                 load_specs = specs[:num_ext_blocks]
                 if load_specs:
+                    if all_group_block_ids:
+                        num_sched_map = (
+                            getattr(scheduler_output, "num_scheduled_tokens", None)
+                            or {}
+                        )
+                        sched_toks = (
+                            num_sched_map.get(new_req.req_id, 0)
+                            if isinstance(num_sched_map, dict)
+                            else 0
+                        )
+                        running_ids: list[int | None] = []
+                        for g_blks in all_group_block_ids:
+                            curr_idx = (
+                                (num_ext + sched_toks - 1) // self._block_size
+                                if sched_toks > 0
+                                else len(g_blks) - 1
+                            )
+                            if (
+                                curr_idx >= num_ext_blocks
+                                and curr_idx < len(g_blks)
+                                and g_blks[curr_idx] is not None
+                            ):
+                                running_ids.append(int(g_blks[curr_idx]))
+                            else:
+                                running_ids.append(None)
+                        load_specs[-1].group_running_block_ids = tuple(running_ids)
                     meta.requests.append(
                         DeltaRequestMeta(
                             req_id=new_req.req_id,
@@ -1430,13 +1457,55 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             return blk_spec.group_block_ids[group_idx]
         return blk_spec.physical_block_id
 
+    def _resolve_running_block_id(
+        self, layer_name: str, blk_spec: DeltaBlockTransferSpec
+    ) -> int | None:
+        if not blk_spec.group_running_block_ids:
+            return None
+        group_idx = self._layer_to_group_idx.get(layer_name, 0)
+        if group_idx < len(blk_spec.group_running_block_ids):
+            return blk_spec.group_running_block_ids[group_idx]
+        return None
+
+    @staticmethod
+    def _get_kernel_block_ratio(
+        kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
+        is_mla: bool = False,
+        block_size: int | None = None,
+    ) -> int:
+        if isinstance(kv_layer, tuple) or block_size is None or block_size <= 0:
+            return 1
+        if is_mla:
+            kbs = (
+                kv_layer.shape[2]
+                if (kv_layer.ndim == 4 and kv_layer.shape[1] == 1)
+                else kv_layer.shape[1]
+            )
+        elif kv_layer.ndim in (4, 5):
+            kbs = kv_layer.shape[2]
+        else:
+            return 1
+        if kbs > 0 and block_size > kbs and block_size % kbs == 0:
+            return block_size // kbs
+        return 1
+
     @staticmethod
     def _get_kv_layer_num_blocks(
         kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
+        is_mla: bool = False,
+        block_size: int | None = None,
     ) -> int:
         if isinstance(kv_layer, tuple):
             return kv_layer[0].shape[0] if kv_layer else 0
-        return kv_layer.shape[0]
+        raw_blocks = (
+            kv_layer.shape[1]
+            if (not is_mla and kv_layer.ndim == 5 and kv_layer.shape[0] == 2)
+            else kv_layer.shape[0]
+        )
+        ratio = DeltaCompressionConnector._get_kernel_block_ratio(
+            kv_layer, is_mla=is_mla, block_size=block_size
+        )
+        return raw_blocks // ratio
 
     def _get_layer_kv_cache(
         self,
@@ -1473,6 +1542,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
         physical_block_id: int,
         is_mla: bool,
+        block_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Extract (K_block, V_block) or Mamba/GDN (ssm_state, conv_state)."""
         if isinstance(kv_layer, tuple):
@@ -1485,20 +1555,53 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if len(kv_layer) == 1:
                 return kv_layer[0][physical_block_id].contiguous(), None
             raise ValueError(f"Unsupported Mamba state tuple length: {len(kv_layer)}")
+
+        ratio = DeltaCompressionConnector._get_kernel_block_ratio(
+            kv_layer, is_mla=is_mla, block_size=block_size
+        )
+        start_blk = physical_block_id * ratio
+        end_blk = start_blk + ratio
+
         if is_mla:
             # MLA shape: [num_pages, 1, page_size, head_dim] or [num_pages, page_size, head_dim]
+            if ratio == 1:
+                if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
+                    return kv_layer[physical_block_id, 0], None
+                return kv_layer[physical_block_id], None
             if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
-                return kv_layer[physical_block_id, 0], None
-            return kv_layer[physical_block_id], None
+                sub = kv_layer[start_blk:end_blk, 0]
+            else:
+                sub = kv_layer[start_blk:end_blk]
+            return sub.reshape(-1, *sub.shape[2:]).contiguous(), None
         if kv_layer.ndim == 5 and kv_layer.shape[0] == 2:
             # Shape: [2, num_pages, page_size, num_kv_heads, head_dim]
-            return kv_layer[0, physical_block_id], kv_layer[1, physical_block_id]
+            if ratio == 1:
+                return kv_layer[0, physical_block_id], kv_layer[1, physical_block_id]
+            k_sub = kv_layer[0, start_blk:end_blk]
+            v_sub = kv_layer[1, start_blk:end_blk]
+            return (
+                k_sub.reshape(-1, *k_sub.shape[2:]).contiguous(),
+                v_sub.reshape(-1, *v_sub.shape[2:]).contiguous(),
+            )
         if kv_layer.ndim == 5 and kv_layer.shape[1] == 2:
             # Shape: [num_pages, 2, page_size, num_kv_heads, head_dim]
-            return kv_layer[physical_block_id, 0], kv_layer[physical_block_id, 1]
+            if ratio == 1:
+                return kv_layer[physical_block_id, 0], kv_layer[physical_block_id, 1]
+            k_sub = kv_layer[start_blk:end_blk, 0]
+            v_sub = kv_layer[start_blk:end_blk, 1]
+            return (
+                k_sub.reshape(-1, *k_sub.shape[2:]).contiguous(),
+                v_sub.reshape(-1, *v_sub.shape[2:]).contiguous(),
+            )
         if kv_layer.ndim == 4:
-            # Standardized vLLM V1 4D layout: [num_blocks, num_kv_heads, block_size, 2 * head_dim]
-            blk = kv_layer[physical_block_id].transpose(0, 1)
+            # Standardized vLLM V1 4D layout: [num_blocks, num_kv_heads, kernel_block_size, 2 * head_dim]
+            if ratio == 1:
+                blk = kv_layer[physical_block_id].transpose(0, 1)
+            else:
+                sub = kv_layer[start_blk:end_blk]
+                blk = sub.permute(0, 2, 1, 3).reshape(
+                    ratio * sub.shape[2], sub.shape[1], sub.shape[3]
+                )
             k_blk, v_blk = blk.chunk(2, dim=-1)
             return k_blk.contiguous(), v_blk.contiguous()
         raise ValueError(f"Unsupported kv_layer shape: {tuple(kv_layer.shape)}")
@@ -1510,6 +1613,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         k_block: torch.Tensor,
         v_block: torch.Tensor | None,
         is_mla: bool,
+        block_size: int | None = None,
     ) -> None:
         """Write reconstructed (K_block, V_block) or Mamba/GDN (ssm_state, conv_state) into cache."""
         if isinstance(kv_layer, tuple):
@@ -1529,37 +1633,80 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 return
             raise ValueError(f"Unsupported Mamba state tuple length: {len(kv_layer)}")
+
+        effective_block_size = (
+            block_size if block_size is not None else int(k_block.shape[0])
+        )
+        ratio = DeltaCompressionConnector._get_kernel_block_ratio(
+            kv_layer, is_mla=is_mla, block_size=effective_block_size
+        )
+        start_blk = physical_block_id * ratio
+        end_blk = start_blk + ratio
         target_device = kv_layer.device
         if is_mla or v_block is None:
-            if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
-                kv_layer[physical_block_id, 0].copy_(
-                    k_block.to(device=target_device, non_blocking=True)
-                )
+            k_dev = k_block.to(device=target_device, non_blocking=True)
+            if ratio == 1:
+                if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
+                    kv_layer[physical_block_id, 0].copy_(k_dev)
+                else:
+                    kv_layer[physical_block_id].copy_(k_dev)
             else:
-                kv_layer[physical_block_id].copy_(
-                    k_block.to(device=target_device, non_blocking=True)
-                )
+                if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
+                    kbs = kv_layer.shape[2]
+                    kv_layer[start_blk:end_blk, 0].copy_(
+                        k_dev.reshape(ratio, kbs, *k_dev.shape[1:])
+                    )
+                else:
+                    kbs = kv_layer.shape[1]
+                    kv_layer[start_blk:end_blk].copy_(
+                        k_dev.reshape(ratio, kbs, *k_dev.shape[1:])
+                    )
             return
         if kv_layer.ndim == 5 and kv_layer.shape[0] == 2:
-            kv_layer[0, physical_block_id].copy_(
-                k_block.to(device=target_device, non_blocking=True)
-            )
-            kv_layer[1, physical_block_id].copy_(
-                v_block.to(device=target_device, non_blocking=True)
-            )
+            k_dev = k_block.to(device=target_device, non_blocking=True)
+            v_dev = v_block.to(device=target_device, non_blocking=True)
+            if ratio == 1:
+                kv_layer[0, physical_block_id].copy_(k_dev)
+                kv_layer[1, physical_block_id].copy_(v_dev)
+            else:
+                kbs = kv_layer.shape[2]
+                kv_layer[0, start_blk:end_blk].copy_(
+                    k_dev.reshape(ratio, kbs, *k_dev.shape[1:])
+                )
+                kv_layer[1, start_blk:end_blk].copy_(
+                    v_dev.reshape(ratio, kbs, *v_dev.shape[1:])
+                )
         elif kv_layer.ndim == 5 and kv_layer.shape[1] == 2:
-            kv_layer[physical_block_id, 0].copy_(
-                k_block.to(device=target_device, non_blocking=True)
-            )
-            kv_layer[physical_block_id, 1].copy_(
-                v_block.to(device=target_device, non_blocking=True)
-            )
+            k_dev = k_block.to(device=target_device, non_blocking=True)
+            v_dev = v_block.to(device=target_device, non_blocking=True)
+            if ratio == 1:
+                kv_layer[physical_block_id, 0].copy_(k_dev)
+                kv_layer[physical_block_id, 1].copy_(v_dev)
+            else:
+                kbs = kv_layer.shape[2]
+                kv_layer[start_blk:end_blk, 0].copy_(
+                    k_dev.reshape(ratio, kbs, *k_dev.shape[1:])
+                )
+                kv_layer[start_blk:end_blk, 1].copy_(
+                    v_dev.reshape(ratio, kbs, *v_dev.shape[1:])
+                )
         elif kv_layer.ndim == 4:
-            # Standardized vLLM V1 4D layout: [num_blocks, num_kv_heads, block_size, 2 * head_dim]
-            kv_combined = torch.cat([k_block, v_block], dim=-1).transpose(0, 1)
-            kv_layer[physical_block_id].copy_(
-                kv_combined.to(device=target_device, non_blocking=True)
-            )
+            # Standardized vLLM V1 4D layout: [num_blocks, num_kv_heads, kernel_block_size, 2 * head_dim]
+            if ratio == 1:
+                kv_combined = torch.cat([k_block, v_block], dim=-1).transpose(0, 1)
+                kv_layer[physical_block_id].copy_(
+                    kv_combined.to(device=target_device, non_blocking=True)
+                )
+            else:
+                kbs = kv_layer.shape[2]
+                kv_combined = (
+                    torch.cat([k_block, v_block], dim=-1)
+                    .reshape(ratio, kbs, kv_layer.shape[1], kv_layer.shape[3])
+                    .permute(0, 2, 1, 3)
+                )
+                kv_layer[start_blk:end_blk].copy_(
+                    kv_combined.to(device=target_device, non_blocking=True)
+                )
         else:
             raise ValueError(f"Unsupported kv_layer shape: {tuple(kv_layer.shape)}")
 
@@ -1609,7 +1756,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     else attn_metadata
                 )
                 is_mla = isinstance(layer_attn_meta, MLACommonMetadata)
-                num_blocks = self._get_kv_layer_num_blocks(kv_tensor)
+                num_blocks = self._get_kv_layer_num_blocks(
+                    kv_tensor, is_mla=is_mla, block_size=self._block_size
+                )
 
                 for blk_spec in req_meta.blocks:
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
@@ -1632,7 +1781,25 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         k_recon,
                         v_recon,
                         is_mla=is_mla,
+                        block_size=self._block_size,
                     )
+                    if isinstance(kv_tensor, tuple) or policy.is_mamba:
+                        running_blk_id = self._resolve_running_block_id(
+                            layer_name, blk_spec
+                        )
+                        if (
+                            running_blk_id is not None
+                            and 0 < running_blk_id < num_blocks
+                            and running_blk_id != phys_blk_id
+                        ):
+                            self._inject_block_kv(
+                                kv_tensor,
+                                running_blk_id,
+                                k_recon,
+                                v_recon,
+                                is_mla=is_mla,
+                                block_size=self._block_size,
+                            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
@@ -1656,7 +1823,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             policy.max_sparse_exceptions = 0
 
         is_mla = isinstance(attn_metadata, MLACommonMetadata)
-        num_blocks = self._get_kv_layer_num_blocks(kv_layer)
+        num_blocks = self._get_kv_layer_num_blocks(
+            kv_layer, is_mla=is_mla, block_size=self._block_size
+        )
         for req_meta in metadata.requests:
             if not req_meta.is_store:
                 continue
@@ -1667,7 +1836,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 if (isinstance(kv_layer, tuple) or policy.is_mamba) and phys_blk_id <= 0:
                     continue
                 k_blk, v_blk = self._extract_block_kv(
-                    kv_layer, phys_blk_id, is_mla=is_mla
+                    kv_layer,
+                    phys_blk_id,
+                    is_mla=is_mla,
+                    block_size=self._block_size,
                 )
                 self.store.store_block(
                     layer_name=layer_name,
@@ -1713,7 +1885,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 policy.rotary_dim = 0
                 policy.max_sparse_exceptions = 0
 
-            num_blocks = self._get_kv_layer_num_blocks(kv_tensor)
+            num_blocks = self._get_kv_layer_num_blocks(
+                kv_tensor, is_mla=False, block_size=self._block_size
+            )
             for req_meta in store_reqs:
                 for blk_spec in req_meta.blocks:
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
@@ -1724,7 +1898,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     ):
                         continue
                     k_blk, v_blk = self._extract_block_kv(
-                        kv_tensor, phys_blk_id, is_mla=False
+                        kv_tensor,
+                        phys_blk_id,
+                        is_mla=False,
+                        block_size=self._block_size,
                     )
                     self.store.store_block(
                         layer_name=layer_name,
