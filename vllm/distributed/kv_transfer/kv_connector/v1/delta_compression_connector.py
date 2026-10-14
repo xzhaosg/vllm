@@ -299,7 +299,7 @@ class CompressedKVBlockRecord:
     quant_delta_v: PackedQuantizedTensor | None = None
 
     # For TIER3 (Sparse BF16 exception rows for intra-block token edits):
-    sparse_token_indices: torch.Tensor | None = None  # uint8 [num_edited_rows]
+    sparse_token_indices: torch.Tensor | None = None  # int16 [num_edited_rows]
     sparse_k_bf16: torch.Tensor | None = None  # [num_edited_rows, ...]
     sparse_v_bf16: torch.Tensor | None = None  # [num_edited_rows, ...]
 
@@ -477,8 +477,8 @@ class DeltaBlockStore:
             rope_theta=0.0 if is_mamba else self.default_rope_theta,
             rotary_dim=0 if is_mamba else self.default_rotary_dim,
             sliding_window_dedup_threshold=self.sliding_window_dedup_threshold,
-            tau_zero_bit=self.tau_zero_bit,
-            tau_int2=self.tau_int2,
+            tau_zero_bit=0.0 if is_mamba else self.tau_zero_bit,
+            tau_int2=0.0 if is_mamba else self.tau_int2,
             tau_int4=self.tau_int4,
             max_sparse_exceptions=0 if is_mamba else self.max_sparse_exceptions,
         )
@@ -858,7 +858,7 @@ class DeltaBlockStore:
                     delta_pos=delta_pos,
                     quant_delta_k=q_dk,
                     quant_delta_v=q_dv,
-                    sparse_token_indices=idx_tensor.to(torch.uint8),
+                    sparse_token_indices=idx_tensor.to(torch.int16),
                     sparse_k_bf16=sparse_k,
                     sparse_v_bf16=sparse_v,
                 )
@@ -1247,8 +1247,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                             rope_theta=0.0 if is_mamba else theta,
                             rotary_dim=0 if is_mamba else rotary_dim,
                             sliding_window_dedup_threshold=self.store.sliding_window_dedup_threshold,
-                            tau_zero_bit=self.store.tau_zero_bit,
-                            tau_int2=self.store.tau_int2,
+                            tau_zero_bit=0.0
+                            if is_mamba
+                            else self.store.tau_zero_bit,
+                            tau_int2=0.0 if is_mamba else self.store.tau_int2,
                             tau_int4=self.store.tau_int4,
                             max_sparse_exceptions=0
                             if is_mamba
@@ -1269,6 +1271,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 policy = self.store.get_layer_policy(layer_name)
                 policy.is_mamba = True
                 policy.rotary_dim = 0
+                policy.tau_zero_bit = 0.0
+                policy.tau_int2 = 0.0
                 policy.max_sparse_exceptions = 0
 
     # ==============================
@@ -1839,6 +1843,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 if isinstance(kv_tensor, tuple) and not policy.is_mamba:
                     policy.is_mamba = True
                     policy.rotary_dim = 0
+                    policy.tau_zero_bit = 0.0
+                    policy.tau_int2 = 0.0
                     policy.max_sparse_exceptions = 0
 
                 layer_attn_meta = (
@@ -1911,6 +1917,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if isinstance(kv_layer, tuple) and not policy.is_mamba:
             policy.is_mamba = True
             policy.rotary_dim = 0
+            policy.tau_zero_bit = 0.0
+            policy.tau_int2 = 0.0
             policy.max_sparse_exceptions = 0
 
         is_mla = isinstance(attn_metadata, MLACommonMetadata)
@@ -1974,6 +1982,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if isinstance(kv_tensor, tuple) and not policy.is_mamba:
                 policy.is_mamba = True
                 policy.rotary_dim = 0
+                policy.tau_zero_bit = 0.0
+                policy.tau_int2 = 0.0
                 policy.max_sparse_exceptions = 0
 
             num_blocks = self._get_kv_layer_num_blocks(

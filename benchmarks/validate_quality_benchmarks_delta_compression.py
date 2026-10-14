@@ -678,7 +678,7 @@ def main() -> None:
 
     gsm8k_params = SamplingParams(
         temperature=0.0,
-        max_tokens=192,
+        max_tokens=256,
         stop=["Question:", "\nQuestion", "<|im_end|>", "<end_of_turn>"],
     )
     coqa_params = SamplingParams(

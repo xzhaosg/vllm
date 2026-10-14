@@ -670,9 +670,12 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         worker_conn.wait_for_save()
         worker_conn.clear_connector_metadata()
 
-        # Verify that P_B's shared Block 1 in GDN was delta-compressed (TIER1_INT2_DELTA)
+        # Verify that P_B's shared Block 1 in GDN was delta-compressed (TIER2_INT4_DELTA)
+        # and FullAttention was delta-compressed (TIER1_INT2_DELTA)
         self.assertGreaterEqual(
-            worker_conn.store.stats.tier_counts[CompressionTier.TIER1_INT2_DELTA], 2
+            worker_conn.store.stats.tier_counts[CompressionTier.TIER1_INT2_DELTA]
+            + worker_conn.store.stats.tier_counts[CompressionTier.TIER2_INT4_DELTA],
+            2,
         )
 
         # 3. Verify get_num_new_matched_tokens and start_load_kv reconstruction for P_B
@@ -730,16 +733,10 @@ class TestDeltaCompressionConnector(unittest.TestCase):
     def test_qwen3_5_moe_partial_edit_mamba_delta_compression(self) -> None:
         """Verifies Mamba/GDN partial-edit delta compression for Qwen3.5-MoE (e.g. 35B-A3B)."""
         store = DeltaBlockStore(max_sparse_exceptions=4)
-        store.register_layer_policy(
-            "model.language_model.layers.0.linear_attn",
-            LayerCompressionPolicy(
-                layer_idx=0,
-                is_mamba=True,
-                rope_theta=0.0,
-                rotary_dim=0,
-                max_sparse_exceptions=0,
-            ),
-        )
+        pol = store.get_layer_policy("model.language_model.layers.0.linear_attn")
+        self.assertTrue(pol.is_mamba)
+        self.assertEqual(pol.tau_zero_bit, 0.0)
+        self.assertEqual(pol.tau_int2, 0.0)
         torch.manual_seed(123)
         base_tokens = tuple(range(1000, 1064))
         ssm_base = torch.randn(4096, 1, dtype=torch.bfloat16)
@@ -768,7 +765,7 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             k_block=ssm_target,
             v_block=conv_target,
         )
-        self.assertEqual(rec_target.tier, CompressionTier.TIER1_INT2_DELTA)
+        self.assertEqual(rec_target.tier, CompressionTier.TIER2_INT4_DELTA)
         self.assertEqual(rec_target.ref_base_hash, "mamba_base_h")
 
         ssm_recon, conv_recon = store.reconstruct_block(
@@ -782,7 +779,7 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             torch.linalg.norm((ssm_recon - ssm_target).to(torch.float32))
             / torch.linalg.norm(ssm_target.to(torch.float32))
         ).item()
-        self.assertLess(rel_err, 0.03)
+        self.assertLess(rel_err, 0.015)
         self.assertTrue(torch.equal(conv_recon, conv_target))
 
 
