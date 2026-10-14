@@ -104,43 +104,39 @@ def load_sharegpt_conversations(
     return selected
 
 
-def build_regime_pair(
+def build_regime_turns(
     conv_tokens: list[int],
     regime: str,
+    num_turns: int = 2,
     block_size: int = 16,
-    vocab_ids: tuple[int, int] = (1050, 1051),
-) -> tuple[list[int], list[int]]:
-    """Construct (base_tokens, target_tokens) for a given ShareGPT regime."""
-    t_a, t_b = vocab_ids
-    if regime == "S1_dynamic_header_dp0":
-        # Block 0 has a 2-token session/timestamp metadata edit (d_H = 2, delta_p = 0)
-        base = list(conv_tokens)
-        target = list(conv_tokens)
-        target[4] = t_b if base[4] != t_b else t_a
-        target[9] = t_b if base[9] != t_b else t_a
-        return base, target
-
-    elif regime == "S2_prepend_context_dp16":
-        # Prepend a 16-token (1 full block) system/RAG context block before the conversation
-        # shifting all subsequent blocks by delta_p = +16 tokens.
-        prefix_block = [1000 + (i % 15) for i in range(block_size)]
-        base = list(conv_tokens)
-        target = prefix_block + list(conv_tokens)
-        return base, target
-
-    elif regime == "S3_intraturn_edit_dp0":
-        # Edit 2 tokens inside an interior block representing an intra-turn edit
-        base = list(conv_tokens)
-        target = list(conv_tokens)
-        edit_blk = 1 if block_size >= 128 else 2
-        idx1 = edit_blk * block_size + 4
-        idx2 = edit_blk * block_size + 9
-        target[idx1] = t_b if base[idx1] != t_b else t_a
-        target[idx2] = t_b if base[idx2] != t_b else t_a
-        return base, target
-
-    else:
-        raise ValueError(f"Unknown regime: {regime}")
+) -> list[list[int]]:
+    """Construct [turn_1_tokens, ..., turn_N_tokens] for a given ShareGPT regime."""
+    turns: list[list[int]] = [list(conv_tokens)]
+    for t in range(1, num_turns):
+        t_a = 1050 + 2 * t
+        t_b = 1051 + 2 * t
+        if regime == "S1_dynamic_header_dp0":
+            # Block 0 has a 2-token session/timestamp metadata edit per turn (d_H = 2, delta_p = 0)
+            target = list(conv_tokens)
+            target[4] = t_b if conv_tokens[4] != t_b else t_a
+            target[9] = t_a if conv_tokens[9] != t_a else t_b
+            turns.append(target)
+        elif regime == "S2_prepend_context_dp16":
+            # Prepend a distinct 1-block system/RAG context block per turn before the conversation
+            prefix_block = [1000 + 20 * t + (i % 15) for i in range(block_size)]
+            turns.append(prefix_block + list(conv_tokens))
+        elif regime == "S3_intraturn_edit_dp0":
+            # Edit 2 tokens inside an interior block per turn representing an intra-turn edit
+            target = list(conv_tokens)
+            edit_blk = 1 if block_size >= 128 else 2
+            idx1 = edit_blk * block_size + 4
+            idx2 = edit_blk * block_size + 9
+            target[idx1] = t_b if conv_tokens[idx1] != t_b else t_a
+            target[idx2] = t_a if conv_tokens[idx2] != t_a else t_b
+            turns.append(target)
+        else:
+            raise ValueError(f"Unknown regime: {regime}")
+    return turns
 
 
 def get_shared_store() -> DeltaBlockStore:
@@ -171,6 +167,7 @@ def main() -> None:
         default="/home/xzhaos/ShareGPT_V3_unfiltered_cleaned_split.json",
     )
     parser.add_argument("--num-samples", type=int, default=50)
+    parser.add_argument("--num-turns", type=int, default=2)
     parser.add_argument("--min-tokens", type=int, default=256)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--max-model-len", type=int, default=2048)
@@ -251,13 +248,17 @@ def main() -> None:
         "device": torch.cuda.get_device_name(0),
         "block_size": resolved_block_size,
         "num_conversations": len(conversations),
+        "num_turns": args.num_turns,
         "gen_tokens": args.gen_tokens,
         "regimes": {},
     }
 
     for regime in regimes:
         print(f"\n{'=' * 72}")
-        print(f"Evaluating Regime: {regime} ({len(conversations)} conversations)")
+        print(
+            f"Evaluating Regime: {regime} "
+            f"({len(conversations)} conversations x {args.num_turns} turns)"
+        )
         print(f"{'=' * 72}")
 
         top1_matches = 0
@@ -274,15 +275,20 @@ def main() -> None:
         recon_times_ms: list[float] = []
 
         for idx, conv in enumerate(conversations):
-            base_ids, target_ids = build_regime_pair(
-                conv["token_ids"], regime=regime, block_size=resolved_block_size
+            turns = build_regime_turns(
+                conv["token_ids"],
+                regime=regime,
+                num_turns=args.num_turns,
+                block_size=resolved_block_size,
             )
+            base_ids = turns[0]
+            final_target_ids = turns[-1]
 
-            # Step 1: Exact uncompressed ground-truth reference for target_ids
+            # Step 1: Exact uncompressed ground-truth reference for final_target_ids
             store.clear()
             llm.reset_prefix_cache()
             ref_out = llm.generate(
-                [TokensPrompt(prompt_token_ids=target_ids)],
+                [TokensPrompt(prompt_token_ids=final_target_ids)],
                 sampling_params=sampling_params,
                 use_tqdm=False,
             )[0].outputs[0]
@@ -292,7 +298,7 @@ def main() -> None:
             ref_top1_lp = ref_first_logprobs[ref_top1_id].logprob
             ref_top5_set = set(ref_first_logprobs.keys())
 
-            # Step 2: Populate base prompt P_A, then run target prompt P_B to delta-compress
+            # Step 2: Populate Turn 1 (P_1), then run Turns 2..N to delta-compress
             store.clear()
             llm.reset_prefix_cache()
 
@@ -305,17 +311,18 @@ def main() -> None:
             base_comp = store.stats.compressed_bytes_stored
             base_tiers = {k.name: v for k, v in store.stats.tier_counts.items()}
 
-            llm.reset_prefix_cache()
-            _ = llm.generate(
-                [TokensPrompt(prompt_token_ids=target_ids)],
-                sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
-                use_tqdm=False,
-            )
+            for turn_ids in turns[1:]:
+                llm.reset_prefix_cache()
+                _ = llm.generate(
+                    [TokensPrompt(prompt_token_ids=turn_ids)],
+                    sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
+                    use_tqdm=False,
+                )
             total_uncomp = store.stats.raw_bytes_equivalent
             total_comp = store.stats.compressed_bytes_stored
             total_tiers = {k.name: v for k, v in store.stats.tier_counts.items()}
 
-            # Record incremental target compression stats
+            # Record incremental target compression stats across Turns 2..N
             inc_uncomp = total_uncomp - base_uncomp
             inc_comp = total_comp - base_comp
             base_uncompressed_bytes_total += base_uncomp
@@ -328,12 +335,12 @@ def main() -> None:
                 agg_tier_counts[t_name] += inc_cnt
 
             # Step 3: Evict GPU HBM prefix cache to force full KV reconstruction from
-            # DeltaCompressionConnector into GPU HBM on the next target_ids run!
+            # DeltaCompressionConnector into GPU HBM on final_target_ids!
             llm.reset_prefix_cache()
 
             t0 = time.perf_counter()
             recon_out = llm.generate(
-                [TokensPrompt(prompt_token_ids=target_ids)],
+                [TokensPrompt(prompt_token_ids=final_target_ids)],
                 sampling_params=sampling_params,
                 use_tqdm=False,
             )[0].outputs[0]
@@ -387,7 +394,18 @@ def main() -> None:
 
         regime_summary = {
             "num_conversations": len(conversations),
+            "num_turns": args.num_turns,
             "incremental_layer_blocks": total_inc_blocks,
+            "total_uncompressed_mb": round(
+                (base_uncompressed_bytes_total + target_uncompressed_bytes_total)
+                / (1024 * 1024),
+                2,
+            ),
+            "total_compressed_mb": round(
+                (base_compressed_bytes_total + target_compressed_bytes_total)
+                / (1024 * 1024),
+                2,
+            ),
             "target_uncompressed_mb": round(
                 target_uncompressed_bytes_total / (1024 * 1024), 2
             ),
@@ -395,6 +413,16 @@ def main() -> None:
                 target_compressed_bytes_total / (1024 * 1024), 2
             ),
             "incremental_compression_ratio": round(incremental_delta_ratio, 2),
+            "overall_multiturn_store_ratio": round(overall_store_ratio, 2),
+            "effective_multiturn_vs_raw_ratio": round(
+                (
+                    args.num_turns * base_uncompressed_bytes_total
+                    if regime != "S2_prepend_context_dp16"
+                    else base_uncompressed_bytes_total + target_uncompressed_bytes_total
+                )
+                / max(base_compressed_bytes_total + target_compressed_bytes_total, 1),
+                2,
+            ),
             "overall_two_turn_store_ratio": round(overall_store_ratio, 2),
             "incremental_tier_counts": dict(agg_tier_counts),
             "incremental_tier_percentages": tier_pcts,
