@@ -782,6 +782,92 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         self.assertLess(rel_err, 0.015)
         self.assertTrue(torch.equal(conv_recon, conv_target))
 
+    def test_gpt_oss_yarn_rope_and_sliding_window_null_block_handling(self) -> None:
+        """Verifies openai/gpt-oss-20b YaRN RoPE scaling and 1:1 sliding+full attention."""
+        DeltaCompressionConnector.reset_shared_stores()
+        yarn_params = {
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "factor": 32.0,
+            "original_max_position_embeddings": 4096,
+            "rope_type": "yarn",
+            "truncate": False,
+            "rope_theta": 150000,
+        }
+        hf_cfg = SimpleNamespace(
+            model_type="gpt_oss",
+            rope_parameters=yarn_params,
+            rope_scaling=yarn_params,
+            rope_theta=None,
+            rope_local_base_freq=None,
+            rotary_dim=None,
+            head_dim=64,
+            layer_types=["sliding_attention", "full_attention", "sliding_attention"],
+            sliding_window=128,
+        )
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16, enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            model_config=SimpleNamespace(hf_text_config=hf_cfg),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                engine_id="gpt-oss-test",
+            ),
+        )
+        sw_grp = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(sliding_window=128),
+            layer_names=["model.layers.0.attn.attn", "model.layers.2.attn.attn"],
+        )
+        full_grp = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(sliding_window=None),
+            layer_names=["model.layers.1.attn.attn"],
+        )
+        kv_cache_cfg = SimpleNamespace(kv_cache_groups=[sw_grp, full_grp])
+
+        conn = DeltaCompressionConnector(
+            vllm_config=vllm_config,  # type: ignore[arg-type]
+            role=KVConnectorRole.SCHEDULER,
+            kv_cache_config=kv_cache_cfg,  # type: ignore[arg-type]
+        )
+        pol0 = conn.store.get_layer_policy("model.layers.0.attn.attn")
+        pol1 = conn.store.get_layer_policy("model.layers.1.attn.attn")
+        pol2 = conn.store.get_layer_policy("model.layers.2.attn.attn")
+
+        # Both sliding_attention and full_attention layers in gpt-oss use YaRN theta=150000
+        self.assertEqual(pol0.rope_theta, 150000.0)
+        self.assertEqual(pol1.rope_theta, 150000.0)
+        self.assertEqual(pol2.rope_theta, 150000.0)
+        self.assertIsNotNone(pol0.rope_scaling)
+        self.assertIsNotNone(pol1.rope_scaling)
+        self.assertIsNotNone(pol2.rope_scaling)
+        # Layer 2 follows a full_attention layer (Layer 1), so unconditional d_div 0-bit is disabled
+        self.assertGreaterEqual(pol2.sliding_window_dedup_threshold, 1_000_000)
+
+        # Verify YaRN relative rotation composition: R_yarn(p + dp) == R_yarn(dp) * R_yarn(p)
+        k_raw = torch.randn(16, 8, 64, dtype=torch.float32)
+        pos_a = torch.arange(32, 48)
+        pos_b = torch.arange(48, 64)  # delta_pos = +16
+        k_a = apply_relative_rope_rotation(
+            k_raw,
+            delta_pos=pos_a,
+            rope_theta=150000.0,
+            rope_scaling=yarn_params,
+        )
+        k_b_direct = apply_relative_rope_rotation(
+            k_raw,
+            delta_pos=pos_b,
+            rope_theta=150000.0,
+            rope_scaling=yarn_params,
+        )
+        k_b_from_a = apply_relative_rope_rotation(
+            k_a,
+            delta_pos=16,
+            rope_theta=150000.0,
+            rope_scaling=yarn_params,
+        )
+        self.assertTrue(torch.allclose(k_b_direct, k_b_from_a, atol=1e-5))
+
 
 if __name__ == "__main__":
     unittest.main()

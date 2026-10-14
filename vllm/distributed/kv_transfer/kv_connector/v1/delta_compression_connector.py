@@ -74,6 +74,7 @@ def apply_relative_rope_rotation(
     rope_theta: float = 10000.0,
     rotary_dim: int | None = None,
     is_neox_style: bool = True,
+    rope_scaling: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Apply exact relative RoPE phase rotation R(delta_pos) to post-RoPE keys.
 
@@ -90,6 +91,7 @@ def apply_relative_rope_rotation(
             for NoPE layers or < head_dim for partial RoPE).
         is_neox_style: True for half-split NeoX RoPE (Gemma, Llama, Qwen); False for
             interleaved RoPE (DeepSeek, GLM).
+        rope_scaling: Optional RoPE scaling dictionary (e.g. YaRN or linear scaling).
 
     Returns:
         Rotated key tensor of the same shape and dtype as k_tensor.
@@ -111,7 +113,41 @@ def apply_relative_rope_rotation(
 
     half_dim = r_dim // 2
     freq_seq = torch.arange(0, half_dim, dtype=torch.float32, device=k_tensor.device)
-    inv_freq = 1.0 / (rope_theta ** (freq_seq / float(half_dim)))
+    pos_freqs = rope_theta ** (freq_seq / float(half_dim))
+    inv_freq = 1.0 / pos_freqs
+
+    if isinstance(rope_scaling, dict):
+        r_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+        factor = float(rope_scaling.get("factor", 1.0))
+        if r_type in ("yarn", "deepseek_yarn") and factor > 1.0:
+            orig_max_pos = int(
+                rope_scaling.get("original_max_position_embeddings", 4096)
+            )
+            beta_fast = float(rope_scaling.get("beta_fast", 32.0))
+            beta_slow = float(rope_scaling.get("beta_slow", 1.0))
+            truncate = bool(rope_scaling.get("truncate", True))
+
+            def _yarn_corr_dim(num_rot: float) -> float:
+                return (
+                    r_dim * math.log(orig_max_pos / (num_rot * 2.0 * math.pi))
+                ) / (2.0 * math.log(rope_theta))
+
+            low = _yarn_corr_dim(beta_fast)
+            high = _yarn_corr_dim(beta_slow)
+            if truncate:
+                low = float(math.floor(low))
+                high = float(math.ceil(high))
+            low = max(low, 0.0)
+            high = min(high, float(r_dim - 1))
+            denom = (high - low) if high != low else 0.001
+            ramp = torch.clamp((freq_seq - low) / denom, 0.0, 1.0)
+            inv_freq_mask = 1.0 - ramp
+            inv_freq_interp = 1.0 / (factor * pos_freqs)
+            inv_freq = (
+                inv_freq_interp * (1.0 - inv_freq_mask) + inv_freq * inv_freq_mask
+            )
+        elif r_type == "linear" and factor > 0.0:
+            inv_freq = inv_freq / factor
 
     if isinstance(delta_pos, int):
         pos_tensor = torch.tensor(
@@ -368,6 +404,7 @@ class LayerCompressionPolicy:
     rope_theta: float = 10000.0
     rotary_dim: int | None = None
     is_neox_style: bool = True
+    rope_scaling: dict[str, Any] | None = None
     # Distance from prefix divergence (in tokens) after which LOCAL_SLIDING layers
     # use Tier 0 (0-bit deduplication).
     sliding_window_dedup_threshold: int = 64
@@ -386,6 +423,7 @@ class DeltaBlockStore:
         block_size: int = 16,
         default_rope_theta: float = 10000.0,
         default_rotary_dim: int | None = None,
+        default_rope_scaling: dict[str, Any] | None = None,
         sliding_window_dedup_threshold: int = 64,
         tau_zero_bit: float = 0.06,
         tau_int2: float = 0.12,
@@ -396,6 +434,7 @@ class DeltaBlockStore:
         self.block_size = block_size
         self.default_rope_theta = default_rope_theta
         self.default_rotary_dim = default_rotary_dim
+        self.default_rope_scaling = default_rope_scaling
         self.sliding_window_dedup_threshold = sliding_window_dedup_threshold
         self.tau_zero_bit = tau_zero_bit
         self.tau_int2 = tau_int2
@@ -476,6 +515,7 @@ class DeltaBlockStore:
             is_mamba=is_mamba,
             rope_theta=0.0 if is_mamba else self.default_rope_theta,
             rotary_dim=0 if is_mamba else self.default_rotary_dim,
+            rope_scaling=None if is_mamba else self.default_rope_scaling,
             sliding_window_dedup_threshold=self.sliding_window_dedup_threshold,
             tau_zero_bit=0.0 if is_mamba else self.tau_zero_bit,
             tau_int2=0.0 if is_mamba else self.tau_int2,
@@ -638,6 +678,7 @@ class DeltaBlockStore:
                 rope_theta=policy.rope_theta,
                 rotary_dim=0 if policy.is_mamba else policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
+                rope_scaling=policy.rope_scaling,
             )
             delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
             k_norm = torch.linalg.norm(k_cpu.to(torch.float32)).item()
@@ -816,6 +857,7 @@ class DeltaBlockStore:
                     rope_theta=policy.rope_theta,
                     rotary_dim=policy.rotary_dim,
                     is_neox_style=policy.is_neox_style,
+                    rope_scaling=policy.rope_scaling,
                 )
                 idx_tensor = torch.tensor(
                     diff_indices, dtype=torch.long, device=self.device
@@ -939,6 +981,7 @@ class DeltaBlockStore:
                     rope_theta=policy.rope_theta,
                     rotary_dim=policy.rotary_dim,
                     is_neox_style=policy.is_neox_style,
+                    rope_scaling=policy.rope_scaling,
                 )
                 v_recon = base_rec.raw_v.clone() if base_rec.raw_v is not None else None
                 self.stats.total_blocks_loaded += 1
@@ -970,6 +1013,7 @@ class DeltaBlockStore:
             rope_theta=policy.rope_theta,
             rotary_dim=policy.rotary_dim,
             is_neox_style=policy.is_neox_style,
+            rope_scaling=policy.rope_scaling,
         )
         v_base = base_rec.raw_v.clone() if base_rec.raw_v is not None else None
 
@@ -1142,6 +1186,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         global_theta = (
             float(raw_theta) if raw_theta is not None else self.store.default_rope_theta
         )
+        model_type = (
+            getattr(hf_config, "model_type", None) if hf_config is not None else None
+        )
         raw_local_theta = (
             getattr(hf_config, "rope_local_base_freq", None)
             if hf_config is not None
@@ -1149,7 +1196,15 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if raw_local_theta is None and rope_params is not None:
             raw_local_theta = rope_params.get("rope_local_base_freq")
-        local_theta = float(raw_local_theta) if raw_local_theta is not None else 10000.0
+        has_separate_local_rope = raw_local_theta is not None or model_type in (
+            "gemma3",
+            "gemma3_text",
+        )
+        local_theta = (
+            float(raw_local_theta)
+            if raw_local_theta is not None
+            else (10000.0 if has_separate_local_rope else global_theta)
+        )
 
         # Resolve partial rotary factor / rotary_dim (e.g. Qwen3.5 / Qwen3-Next)
         rotary_dim: int | None = (
@@ -1178,6 +1233,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if hf_config is not None:
             self.store.default_rope_theta = global_theta
             self.store.default_rotary_dim = rotary_dim
+            self.store.default_rope_scaling = rope_params
 
         layer_types = (
             getattr(hf_config, "layer_types", None) if hf_config is not None else None
@@ -1237,6 +1293,23 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         else (default_sw if is_sw else None)
                     )
                     theta = local_theta if is_sw else global_theta
+                    layer_rope_scaling = (
+                        None
+                        if (is_mamba or (is_sw and has_separate_local_rope))
+                        else rope_params
+                    )
+                    follows_global_layer = (
+                        is_sw
+                        and layer_idx > 0
+                        and isinstance(layer_types, (list, tuple))
+                        and layer_idx < len(layer_types)
+                        and layer_types[layer_idx - 1] == "full_attention"
+                    )
+                    sw_dedup_thresh = (
+                        max(self.store.sliding_window_dedup_threshold, 1_000_000)
+                        if follows_global_layer
+                        else self.store.sliding_window_dedup_threshold
+                    )
                     self.store.register_layer_policy(
                         layer_name,
                         LayerCompressionPolicy(
@@ -1246,7 +1319,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                             sliding_window_size=sw_size,
                             rope_theta=0.0 if is_mamba else theta,
                             rotary_dim=0 if is_mamba else rotary_dim,
-                            sliding_window_dedup_threshold=self.store.sliding_window_dedup_threshold,
+                            rope_scaling=layer_rope_scaling,
+                            sliding_window_dedup_threshold=sw_dedup_thresh,
                             tau_zero_bit=0.0
                             if is_mamba
                             else self.store.tau_zero_bit,
@@ -1861,7 +1935,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                     if phys_blk_id is None or phys_blk_id >= num_blocks:
                         continue
-                    if (isinstance(kv_tensor, tuple) or policy.is_mamba) and phys_blk_id <= 0:
+                    if (
+                        isinstance(kv_tensor, tuple)
+                        or policy.is_mamba
+                        or len(blk_spec.group_block_ids) > 1
+                    ) and phys_blk_id <= 0:
                         continue
                     try:
                         k_recon, v_recon = self.store.reconstruct_block(
@@ -1932,7 +2010,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                 if phys_blk_id is None or phys_blk_id >= num_blocks:
                     continue
-                if (isinstance(kv_layer, tuple) or policy.is_mamba) and phys_blk_id <= 0:
+                if (
+                    isinstance(kv_layer, tuple)
+                    or policy.is_mamba
+                    or len(blk_spec.group_block_ids) > 1
+                ) and phys_blk_id <= 0:
                     continue
                 k_blk, v_blk = self._extract_block_kv(
                     kv_layer,
