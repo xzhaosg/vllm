@@ -870,6 +870,83 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(k_b_direct, k_b_from_a, atol=1e-5))
 
+        # Verify hybrid local prefix hit + external connector load offset:
+        # Blocks 0 and 1 (32 tokens) hit in local GPU prefix cache;
+        # Blocks 2 and 3 (32 tokens) hit in external DeltaBlockStore;
+        # Block 4 (16 tokens) + tail (4 tokens) are newly computed.
+        blk0 = tuple(range(10, 26))
+        blk1 = tuple(range(26, 42))
+        blk2 = tuple(range(42, 58))
+        blk3 = tuple(range(58, 74))
+        blk4 = tuple(range(74, 90))
+        tail = (91, 92, 93, 94)
+        all_tokens = list(blk0 + blk1 + blk2 + blk3 + blk4 + tail)
+
+        # Populate external store with blocks 0..3
+        parent_h = "ROOT"
+        for idx, b_toks in enumerate((blk0, blk1, blk2, blk3)):
+            full_h = compute_full_prefix_block_hash(parent_h, b_toks)
+            for l_name in (
+                "model.layers.0.attn.attn",
+                "model.layers.1.attn.attn",
+                "model.layers.2.attn.attn",
+            ):
+                conn.store.store_block(
+                    layer_name=l_name,
+                    full_block_hash=full_h,
+                    token_ids=b_toks,
+                    start_position=idx * 16,
+                    k_block=torch.ones(16, 2, 64, dtype=torch.bfloat16) * (idx + 1),
+                    v_block=torch.ones(16, 2, 64, dtype=torch.bfloat16) * (idx + 1),
+                )
+            parent_h = full_h
+
+        req_hybrid = SimpleNamespace(
+            request_id="req_hybrid_local_ext",
+            prompt_token_ids=all_tokens,
+        )
+        # Local prefix cache matched 32 tokens (blocks 0 and 1); external store has up to 64 tokens (blocks 0..3)
+        ext_toks, _ = conn.get_num_new_matched_tokens(
+            req_hybrid,  # type: ignore[arg-type]
+            num_computed_tokens=32,
+        )
+        self.assertEqual(ext_toks, 32)
+        conn.update_state_after_alloc(
+            req_hybrid,  # type: ignore[arg-type]
+            SimpleNamespace(),  # type: ignore[arg-type]
+            num_external_tokens=32,
+        )
+        sched_out_hybrid = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="req_hybrid_local_ext",
+                    prompt_token_ids=all_tokens,
+                    block_ids=([10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]),
+                )
+            ],
+            num_scheduled_tokens={"req_hybrid_local_ext": 20},
+            scheduled_cached_reqs=None,
+            finished_req_ids=set(),
+        )
+        meta_hybrid = conn.build_connector_meta(sched_out_hybrid)  # type: ignore[arg-type]
+        self.assertEqual(len(meta_hybrid.requests), 2)
+        load_req_meta = meta_hybrid.requests[0]
+        store_req_meta = meta_hybrid.requests[1]
+        self.assertFalse(load_req_meta.is_store)
+        self.assertTrue(store_req_meta.is_store)
+        # Load specs must be blocks [2, 3] (start_position 32 and 48), NOT blocks [0, 1]
+        self.assertEqual([b.start_position for b in load_req_meta.blocks], [32, 48])
+        self.assertEqual(
+            [b.group_block_ids for b in load_req_meta.blocks],
+            [(12, 22), (13, 23)],
+        )
+        # Store specs must be block [4] (start_position 64)
+        self.assertEqual([b.start_position for b in store_req_meta.blocks], [64])
+        self.assertEqual(
+            [b.group_block_ids for b in store_req_meta.blocks],
+            [(14, 24)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

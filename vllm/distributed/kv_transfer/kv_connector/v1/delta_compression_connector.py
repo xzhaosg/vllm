@@ -1144,7 +1144,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 max_sparse_exceptions=max_sparse_exceptions,
             )
         self.store: DeltaBlockStore = self._shared_stores[engine_id]
-        self._requests_need_load: dict[str, tuple["Request", int]] = {}
+        self._requests_need_load: dict[str, tuple["Request", int, int]] = {}
+        self._req_local_computed_tokens: dict[str, int] = {}
         self._inflight_req_state: dict[
             str, tuple[list[int], list[list[int]], int]
         ] = {}
@@ -1427,6 +1428,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        self._req_local_computed_tokens[request.request_id] = num_computed_tokens
         token_ids = list(request.prompt_token_ids or [])
         num_tokens_to_check = (
             (len(token_ids) - 1) // self._block_size
@@ -1461,9 +1463,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
+        local_tokens = self._req_local_computed_tokens.get(request.request_id, 0)
         if num_external_tokens > 0:
             self._requests_need_load[request.request_id] = (
                 request,
+                local_tokens,
                 num_external_tokens,
             )
 
@@ -1475,6 +1479,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
 
         for fin_id in getattr(scheduler_output, "finished_req_ids", ()) or ():
             self._inflight_req_state.pop(fin_id, None)
+            self._req_local_computed_tokens.pop(fin_id, None)
 
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = list(new_req.prompt_token_ids or [])
@@ -1495,12 +1500,16 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     len(specs),
                 )
             if not specs:
+                self._req_local_computed_tokens.pop(new_req.req_id, None)
                 continue
 
             if new_req.req_id in self._requests_need_load:
-                _, num_ext = self._requests_need_load.pop(new_req.req_id)
+                _, local_toks, num_ext = self._requests_need_load.pop(new_req.req_id)
+                self._req_local_computed_tokens.pop(new_req.req_id, None)
+                num_local_blocks = local_toks // self._block_size
                 num_ext_blocks = num_ext // self._block_size
-                load_specs = specs[:num_ext_blocks]
+                end_load_block = num_local_blocks + num_ext_blocks
+                load_specs = specs[num_local_blocks:end_load_block]
                 if load_specs:
                     if all_group_block_ids:
                         num_sched_map = (
@@ -1515,12 +1524,13 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         running_ids: list[int | None] = []
                         for g_blks in all_group_block_ids:
                             curr_idx = (
-                                (num_ext + sched_toks - 1) // self._block_size
+                                (local_toks + num_ext + sched_toks - 1)
+                                // self._block_size
                                 if sched_toks > 0
                                 else len(g_blks) - 1
                             )
                             if (
-                                curr_idx >= num_ext_blocks
+                                curr_idx >= end_load_block
                                 and curr_idx < len(g_blks)
                                 and g_blks[curr_idx] is not None
                             ):
@@ -1536,7 +1546,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                     )
                 # If there are remaining uncached blocks in the prompt, store them
-                store_specs = specs[num_ext_blocks:]
+                store_specs = specs[end_load_block:]
                 if store_specs:
                     meta.requests.append(
                         DeltaRequestMeta(
@@ -1546,13 +1556,17 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                     )
             else:
-                meta.requests.append(
-                    DeltaRequestMeta(
-                        req_id=new_req.req_id,
-                        is_store=True,
-                        blocks=specs,
+                local_toks = self._req_local_computed_tokens.pop(new_req.req_id, 0)
+                num_local_blocks = local_toks // self._block_size
+                store_specs = specs[num_local_blocks:]
+                if store_specs:
+                    meta.requests.append(
+                        DeltaRequestMeta(
+                            req_id=new_req.req_id,
+                            is_store=True,
+                            blocks=store_specs,
+                        )
                     )
-                )
 
         # Handle multi-step prefill continuations (e.g. Mamba block-aligned splits)
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)

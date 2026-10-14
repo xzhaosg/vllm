@@ -700,7 +700,7 @@ def main() -> None:
 
     gsm8k_params = SamplingParams(
         temperature=0.0,
-        max_tokens=256,
+        max_tokens=384,
         stop=[
             "Question:",
             "\nQuestion",
