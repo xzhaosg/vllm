@@ -1310,6 +1310,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         if follows_global_layer
                         else self.store.sliding_window_dedup_threshold
                     )
+                    sw_tau_zero = (
+                        min(self.store.tau_zero_bit, 0.01)
+                        if follows_global_layer
+                        else self.store.tau_zero_bit
+                    )
                     self.store.register_layer_policy(
                         layer_name,
                         LayerCompressionPolicy(
@@ -1323,7 +1328,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                             sliding_window_dedup_threshold=sw_dedup_thresh,
                             tau_zero_bit=0.0
                             if is_mamba
-                            else self.store.tau_zero_bit,
+                            else sw_tau_zero,
                             tau_int2=0.0 if is_mamba else self.store.tau_int2,
                             tau_int4=self.store.tau_int4,
                             max_sparse_exceptions=0

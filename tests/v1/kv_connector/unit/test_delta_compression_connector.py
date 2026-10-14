@@ -842,7 +842,9 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         self.assertIsNotNone(pol1.rope_scaling)
         self.assertIsNotNone(pol2.rope_scaling)
         # Layer 2 follows a full_attention layer (Layer 1), so unconditional d_div 0-bit is disabled
+        # and tau_zero_bit is tightened to 0.01
         self.assertGreaterEqual(pol2.sliding_window_dedup_threshold, 1_000_000)
+        self.assertAlmostEqual(pol2.tau_zero_bit, 0.01)
 
         # Verify YaRN relative rotation composition: R_yarn(p + dp) == R_yarn(dp) * R_yarn(p)
         k_raw = torch.randn(16, 8, 64, dtype=torch.float32)

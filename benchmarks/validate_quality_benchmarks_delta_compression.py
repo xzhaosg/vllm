@@ -193,9 +193,19 @@ def build_gsm8k_samples(
     ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
     assert len(ctx_ids) == block_size
 
+    is_harmony = (
+        hasattr(tokenizer, "get_vocab") and "<|channel|>" in tokenizer.get_vocab()
+    )
     samples: list[dict[str, Any]] = []
     for i in range(min(num_samples, len(test_data))):
-        q_text = f"Question: {test_data[i]['question']}\nAnswer:"
+        if is_harmony:
+            q_text = (
+                f"Question: {test_data[i]['question']}\n"
+                "Solve ONLY this final question step by step and end with #### <number>."
+                "<|end|><|start|>assistant<|channel|>final<|message|>"
+            )
+        else:
+            q_text = f"Question: {test_data[i]['question']}\nAnswer:"
         suffix_ids = tokenizer.encode(q_text, add_special_tokens=False)
         if len(suffix_ids) < 4:
             suffix_ids = [newline_id] * (4 - len(suffix_ids)) + suffix_ids
@@ -298,7 +308,19 @@ def build_coqa_samples(
         assert len(aligned_prefix) == target_prefix_len
 
         q4_str = story_obj["questions"][3]["input_text"].strip()
-        suffix_text = f"Q: {q4_str}\nA:"
+        is_harmony = (
+            hasattr(tokenizer, "get_vocab")
+            and "<|channel|>" in tokenizer.get_vocab()
+        )
+        if is_harmony:
+            suffix_text = (
+                f"Q: {q4_str}\n"
+                "Reply with ONLY the short direct answer phrase to this final question "
+                "(no heading or explanation)."
+                "<|end|><|start|>assistant<|channel|>final<|message|>"
+            )
+        else:
+            suffix_text = f"Q: {q4_str}\nA:"
         suffix_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
         if len(suffix_ids) < 4:
             suffix_ids = [newline_id] * (4 - len(suffix_ids)) + suffix_ids
@@ -679,12 +701,27 @@ def main() -> None:
     gsm8k_params = SamplingParams(
         temperature=0.0,
         max_tokens=256,
-        stop=["Question:", "\nQuestion", "<|im_end|>", "<end_of_turn>"],
+        stop=[
+            "Question:",
+            "\nQuestion",
+            "<|im_end|>",
+            "<end_of_turn>",
+            "<|end|>",
+            "<|return|>",
+        ],
     )
     coqa_params = SamplingParams(
         temperature=0.0,
         max_tokens=24,
-        stop=["\n", "Q:", "Passage:", "<|im_end|>", "<end_of_turn>"],
+        stop=[
+            "\n",
+            "Q:",
+            "Passage:",
+            "<|im_end|>",
+            "<end_of_turn>",
+            "<|end|>",
+            "<|return|>",
+        ],
     )
 
     all_out = {
