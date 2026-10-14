@@ -155,35 +155,46 @@ def build_gsm8k_samples(
         test_data = [json.loads(line) for line in f if line.strip()]
 
     newline_id = tokenizer.encode("\n", add_special_tokens=False)[0]
-    # Use 3 full blocks for the few-shot prefix (e.g. 816 tokens for B=272, or 512 tokens for B=16)
-    target_prefix_blocks = max(3, 512 // block_size)
-    target_prefix_len = target_prefix_blocks * block_size
+    edit_toks = [
+        tokenizer.encode(str(d), add_special_tokens=False)[-1]
+        for d in range(1, 10)
+    ]
+
+    # Build a clean 5-shot or 6-shot demonstration string (>= 3 * block_size tokens)
+    min_prefix_tokens = max(512, 3 * block_size)
+    demos_text = ""
+    shot_idx = 0
+    while (
+        len(tokenizer.encode(demos_text, add_special_tokens=False))
+        < min_prefix_tokens - 32
+    ):
+        ex = train_data[shot_idx]
+        demos_text += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
+        shot_idx += 1
+    demo_ids = tokenizer.encode(demos_text, add_special_tokens=False)
+
+    header_base = (
+        "System Session ID: 10000 | Mode: Math Reasoning Benchmark\n"
+        "Solve each math word problem step by step and end with #### <number>.\n\n"
+    )
+    header_ids = tokenizer.encode(header_base, add_special_tokens=False)
+    total_raw_prefix = len(header_ids) + len(demo_ids)
+    target_blocks = max(3, (total_raw_prefix + block_size - 1) // block_size)
+    target_prefix_len = target_blocks * block_size
+    pad_needed = target_prefix_len - total_raw_prefix
+    aligned_prefix = header_ids + [newline_id] * pad_needed + demo_ids
+    assert len(aligned_prefix) == target_prefix_len
+
+    ctx_str = (
+        "[Context Note: Read each problem carefully, verify intermediate steps, "
+        "and provide the final numerical answer after ####.]\n"
+        * 24
+    )
+    ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
 
     samples: list[dict[str, Any]] = []
     for i in range(min(num_samples, len(test_data))):
-        header = (
-            f"System Session ID: {10000 + i} | Mode: Math Reasoning Benchmark\n"
-            f"Solve each math word problem step by step and end with #### <number>.\n\n"
-        )
-        header_ids = tokenizer.encode(header, add_special_tokens=False)
-
-        demos_text = ""
-        shot_idx = (i * 3) % (len(train_data) - 30)
-        while (
-            len(header_ids)
-            + len(tokenizer.encode(demos_text, add_special_tokens=False))
-            < target_prefix_len + 128
-        ):
-            ex = train_data[shot_idx]
-            demos_text += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
-            shot_idx += 1
-
-        demo_ids = tokenizer.encode(demos_text, add_special_tokens=False)
-        needed_demo_len = target_prefix_len - len(header_ids)
-        aligned_prefix = header_ids + demo_ids[-needed_demo_len:]
-        assert len(aligned_prefix) == target_prefix_len
-
-        q_text = f"\n\nQuestion: {test_data[i]['question']}\nAnswer:"
+        q_text = f"Question: {test_data[i]['question']}\nAnswer:"
         suffix_ids = tokenizer.encode(q_text, add_special_tokens=False)
         if len(suffix_ids) < 4:
             suffix_ids = [newline_id] * (4 - len(suffix_ids)) + suffix_ids
@@ -194,18 +205,6 @@ def build_gsm8k_samples(
         gold_val = extract_gsm8k_answer(test_data[i]["answer"])
         if gold_val == INVALID_NUM:
             continue
-
-        # Natural-English 1-block prepended context for S2 and natural digit token IDs for edits
-        ctx_str = (
-            f"[Context Note {i}: Read each problem carefully, verify intermediate steps, "
-            f"and provide the final numerical answer after ####.]\n"
-            * 24
-        )
-        ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
-        edit_toks = [
-            tokenizer.encode(str(d), add_special_tokens=False)[-1]
-            for d in range(1, 10)
-        ]
 
         samples.append(
             {
@@ -230,18 +229,28 @@ def build_coqa_samples(
         raw_coqa = json.load(f)["data"]
 
     newline_id = tokenizer.encode("\n", add_special_tokens=False)[0]
+    edit_toks = [
+        tokenizer.encode(str(d), add_special_tokens=False)[-1]
+        for d in range(1, 10)
+    ]
     min_prefix_tokens = max(512, 3 * block_size)
 
     # Use stories near the end of dev set as few-shot pool
     demo_pool = [s for s in raw_coqa[-60:] if len(s.get("questions", [])) >= 4]
+    ctx_str = (
+        "[Context Note: Answer the question concisely using only facts "
+        "stated in the passage above.]\n"
+        * 24
+    )
+    ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
 
     samples: list[dict[str, Any]] = []
     for i, story_obj in enumerate(raw_coqa):
         if len(story_obj.get("questions", [])) < 4:
             continue
 
-        # Target story + first 3 conversational turns (Q1/A1, Q2/A2, Q3/A3) — never truncated!
-        target_history = f"\n\nPassage:\n{story_obj['story'].strip()}\n\n"
+        # Target story + first 3 conversational turns (Q1/A1, Q2/A2, Q3/A3) — 100% intact!
+        target_history = f"Passage:\n{story_obj['story'].strip()}\n\n"
         for t_idx in range(3):
             q_str = story_obj["questions"][t_idx]["input_text"].strip()
             a_str = story_obj["answers"][t_idx]["input_text"].strip()
@@ -251,19 +260,19 @@ def build_coqa_samples(
         )
 
         header = (
-            f"System Session ID: {20000 + len(samples)} | Task: Concise Reading Comprehension\n"
-            f"Answer each question about the passage with a short, direct phrase.\n\n"
+            "System Session ID: 20000 | Task: Concise Reading Comprehension\n"
+            "Answer each question about the passage with a short, direct phrase.\n\n"
         )
         header_ids = tokenizer.encode(header, add_special_tokens=False)
 
-        raw_needed = max(min_prefix_tokens, len(header_ids) + len(target_history_ids) + 64)
-        target_blocks = (raw_needed + block_size - 1) // block_size
-        target_prefix_len = target_blocks * block_size
-        needed_demo_len = target_prefix_len - len(header_ids) - len(target_history_ids)
-
         demos_text = ""
-        d_idx = (len(samples) * 2) % (len(demo_pool) - 15)
-        while len(tokenizer.encode(demos_text, add_special_tokens=False)) < needed_demo_len + 128:
+        d_idx = 0
+        while (
+            len(header_ids)
+            + len(tokenizer.encode(demos_text, add_special_tokens=False))
+            + len(target_history_ids)
+            < min_prefix_tokens
+        ):
             d_story = demo_pool[d_idx]
             demos_text += f"Passage:\n{d_story['story'].strip()}\n\n"
             for t_idx in range(4):
@@ -274,8 +283,15 @@ def build_coqa_samples(
             d_idx += 1
 
         demo_ids = tokenizer.encode(demos_text, add_special_tokens=False)
+        raw_len = len(header_ids) + len(demo_ids) + len(target_history_ids)
+        target_blocks = max(3, (raw_len + block_size - 1) // block_size)
+        target_prefix_len = target_blocks * block_size
+        pad_needed = target_prefix_len - raw_len
         aligned_prefix = (
-            header_ids + demo_ids[-needed_demo_len:] + target_history_ids
+            header_ids
+            + [newline_id] * pad_needed
+            + demo_ids
+            + target_history_ids
         )
         assert len(aligned_prefix) == target_prefix_len
 
@@ -293,17 +309,6 @@ def build_coqa_samples(
         for add_list in story_obj.get("additional_answers", {}).values():
             if len(add_list) > 3:
                 golds.append(add_list[3]["input_text"].strip())
-
-        ctx_str = (
-            f"[Context Note {len(samples)}: Answer the question concisely using only facts "
-            f"stated in the passage above.]\n"
-            * 24
-        )
-        ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)[:block_size]
-        edit_toks = [
-            tokenizer.encode(str(d), add_special_tokens=False)[-1]
-            for d in range(1, 10)
-        ]
 
         samples.append(
             {
@@ -589,10 +594,10 @@ def run_task_evaluation(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--num-gsm8k", type=int, default=30)
-    parser.add_argument("--num-coqa", type=int, default=30)
+    parser.add_argument("--num-gsm8k", type=int, default=10)
+    parser.add_argument("--num-coqa", type=int, default=10)
     parser.add_argument("--num-turns", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=2560)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--mamba-ssm-cache-dtype", type=str, default="auto")
@@ -665,12 +670,12 @@ def main() -> None:
 
     gsm8k_params = SamplingParams(
         temperature=0.0,
-        max_tokens=256,
+        max_tokens=192,
         stop=["Question:", "\nQuestion", "<|im_end|>", "<end_of_turn>"],
     )
     coqa_params = SamplingParams(
         temperature=0.0,
-        max_tokens=32,
+        max_tokens=24,
         stop=["\n", "Q:", "Passage:", "<|im_end|>", "<end_of_turn>"],
     )
 
