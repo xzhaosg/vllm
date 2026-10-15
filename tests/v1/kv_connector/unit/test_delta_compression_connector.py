@@ -1167,9 +1167,9 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         edited_tokens = list(base_tokens)
         edited_tokens[4] = 7777
         edited_tuple = tuple(edited_tokens)
-        # Non-edited rows have large perturbation (eta ~ 0.90 > tau_int4=0.70)
-        k_perturbed = k_base + 0.95 * torch.randn_like(k_base)
-        v_perturbed = v_base + 0.95 * torch.randn_like(v_base)
+        # Non-edited rows have large perturbation (eta ~ 0.83 > tau_int4=0.70)
+        k_perturbed = k_base + 1.5 * torch.randn_like(k_base)
+        v_perturbed = v_base + 1.5 * torch.randn_like(v_base)
         hash_edited = compute_full_prefix_block_hash("ROOT", edited_tuple)
         rec = store.store_block(
             layer_name, hash_edited, edited_tuple, 0, k_perturbed, v_perturbed
