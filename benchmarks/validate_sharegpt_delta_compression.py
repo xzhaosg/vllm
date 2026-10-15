@@ -310,7 +310,7 @@ def main() -> None:
             llm.reset_prefix_cache()
             cold_out = llm.generate(
                 [TokensPrompt(prompt_token_ids=final_target_ids)],
-                sampling_params=sampling_params,
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
                 use_tqdm=False,
             )[0].outputs[0]
             cold_top1_id = cold_out.token_ids[0]

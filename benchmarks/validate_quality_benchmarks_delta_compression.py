@@ -460,17 +460,8 @@ def run_task_evaluation(
             ]
 
             # 1. Uncompressed Baseline on final_prompts
-            # Warm the uncompressed GPU HBM prefix cache on the full prompt blocks
-            # so Baseline and Delta-Reconstructed share the exact same FlashAttention
-            # cache_seqlens / q_len split on Turn 4.
             store.clear()
             llm.reset_prefix_cache()
-            _ = llm.generate(
-                final_prompts,
-                sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
-                use_tqdm=False,
-            )
-            store.clear()
             ref_outputs = llm.generate(
                 final_prompts,
                 sampling_params=sampling_params,
