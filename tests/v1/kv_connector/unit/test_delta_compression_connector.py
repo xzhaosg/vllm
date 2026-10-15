@@ -971,7 +971,7 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             rope_theta = None
             rope_local_base_freq = None
             rotary_dim = None
-            layer_types = ["sliding_attention", "full_attention"]
+            layer_types = ["sliding_attention", "full_attention", "sliding_attention", "sliding_attention"]
             sliding_window = 1024
 
             def __getattribute__(self, name: str):
@@ -993,7 +993,11 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         sw_grp = SimpleNamespace(
             kv_cache_spec=SimpleNamespace(block_size=16, sliding_window=1024),
-            layer_names=["model.language_model.layers.0.self_attn.attn"],
+            layer_names=[
+                "model.language_model.layers.0.self_attn.attn",
+                "model.language_model.layers.2.self_attn.attn",
+                "model.language_model.layers.3.self_attn.attn",
+            ],
         )
         full_grp = SimpleNamespace(
             kv_cache_spec=SimpleNamespace(block_size=32, sliding_window=None),
@@ -1016,9 +1020,16 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         pol_full = conn.store.get_layer_policy(
             "model.language_model.layers.1.self_attn.attn"
         )
+        pol_sw3 = conn.store.get_layer_policy(
+            "model.language_model.layers.3.self_attn.attn"
+        )
         self.assertTrue(pol_sw.is_sliding_window)
         self.assertEqual(pol_sw.rope_theta, 10000.0)
         self.assertIsNone(pol_sw.rotary_dim)
+        self.assertGreaterEqual(pol_sw.sliding_window_dedup_threshold, 1024)
+        self.assertTrue(pol_sw3.is_sliding_window)
+        self.assertGreaterEqual(pol_sw3.sliding_window_dedup_threshold, 1_000_000)
+        self.assertAlmostEqual(pol_sw3.tau_zero_bit, 0.01)
         self.assertFalse(pol_full.is_sliding_window)
         self.assertEqual(pol_full.rope_theta, 1000000.0)
         self.assertIsNone(pol_full.rotary_dim)

@@ -1438,17 +1438,25 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         is_sw
                         and layer_idx > 0
                         and isinstance(layer_types, (list, tuple))
-                        and layer_idx < len(layer_types)
-                        and layer_types[layer_idx - 1] == "full_attention"
+                        and "full_attention"
+                        in layer_types[: min(layer_idx, len(layer_types))]
+                    )
+                    min_exact_sw_dedup = (
+                        max(
+                            self.store.sliding_window_dedup_threshold,
+                            int(sw_size) * max(1, layer_idx),
+                        )
+                        if sw_size is not None
+                        else self.store.sliding_window_dedup_threshold
                     )
                     sw_dedup_thresh = (
                         max(self.store.sliding_window_dedup_threshold, 1_000_000)
                         if follows_global_layer
-                        else self.store.sliding_window_dedup_threshold
+                        else min_exact_sw_dedup
                     )
                     sw_tau_zero = (
                         min(self.store.tau_zero_bit, 0.01)
-                        if follows_global_layer
+                        if (follows_global_layer or sw_size is not None)
                         else self.store.tau_zero_bit
                     )
                     self.store.register_layer_policy(
@@ -1476,6 +1484,16 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def reset_shared_stores(cls) -> None:
         cls._shared_stores.clear()
+
+    def bind_connector_metadata(
+        self, connector_metadata: KVConnectorMetadata
+    ) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        self._layers_saved_in_step.clear()
+
+    def clear_connector_metadata(self) -> None:
+        super().clear_connector_metadata()
+        self._layers_saved_in_step.clear()
 
     def register_kv_caches(
         self, kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]]
@@ -2133,10 +2151,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if forward_context is not None
             else 0
         )
-        self._layers_saved_in_step.clear()
 
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, DeltaConnectorMetadata):
+            return
+        if not any(not req_meta.is_store for req_meta in metadata.requests):
             return
 
         attn_metadata = getattr(forward_context, "attn_metadata", None)
