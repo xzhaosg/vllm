@@ -947,6 +947,188 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             [(14, 24)],
         )
 
+    def test_gemma4_proportional_rope_and_heterogeneous_group_block_sizes(
+        self,
+    ) -> None:
+        """Verifies Gemma 4 proportional RoPE, nested rope_parameters, and 16 vs 32 group block_size."""
+        DeltaCompressionConnector.reset_shared_stores()
+        gemma4_rope_params = {
+            "full_attention": {
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 1000000.0,
+                "rope_type": "proportional",
+            },
+            "sliding_attention": {
+                "rope_theta": 10000.0,
+                "rope_type": "default",
+            },
+        }
+
+        class MockGemma4TextConfig:
+            model_type = "gemma4_text"
+            rope_parameters = gemma4_rope_params
+            rope_scaling = None
+            rope_theta = None
+            rope_local_base_freq = None
+            rotary_dim = None
+            layer_types = ["sliding_attention", "full_attention"]
+            sliding_window = 1024
+
+            def __getattribute__(self, name: str):
+                if name in ("head_dim", "num_key_value_heads"):
+                    raise ValueError(
+                        f"AmbiguousGlobalPerLayerAttributeError: {name} is per-layer"
+                    )
+                return super().__getattribute__(name)
+
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16, enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            model_config=SimpleNamespace(hf_text_config=MockGemma4TextConfig()),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                engine_id="gemma4-test",
+            ),
+        )
+        sw_grp = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(block_size=16, sliding_window=1024),
+            layer_names=["model.language_model.layers.0.self_attn.attn"],
+        )
+        full_grp = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(block_size=32, sliding_window=None),
+            layer_names=["model.language_model.layers.1.self_attn.attn"],
+        )
+        kv_cache_cfg = SimpleNamespace(kv_cache_groups=[sw_grp, full_grp])
+
+        conn = DeltaCompressionConnector(
+            vllm_config=vllm_config,  # type: ignore[arg-type]
+            role=KVConnectorRole.SCHEDULER,
+            kv_cache_config=kv_cache_cfg,  # type: ignore[arg-type]
+        )
+        self.assertEqual(conn._scheduler_block_size, 32)
+        self.assertEqual(conn._get_group_block_scale(0), 1)
+        self.assertEqual(conn._get_group_block_scale(1), 2)
+
+        pol_sw = conn.store.get_layer_policy(
+            "model.language_model.layers.0.self_attn.attn"
+        )
+        pol_full = conn.store.get_layer_policy(
+            "model.language_model.layers.1.self_attn.attn"
+        )
+        self.assertTrue(pol_sw.is_sliding_window)
+        self.assertEqual(pol_sw.rope_theta, 10000.0)
+        self.assertIsNone(pol_sw.rotary_dim)
+        self.assertFalse(pol_full.is_sliding_window)
+        self.assertEqual(pol_full.rope_theta, 1000000.0)
+        self.assertIsNone(pol_full.rotary_dim)
+        self.assertEqual(
+            pol_full.rope_scaling,
+            gemma4_rope_params["full_attention"],
+        )
+
+        # Verify proportional RoPE rotates only [0:64] paired with [256:320] for head_dim=512
+        k_raw = torch.randn(16, 4, 512, dtype=torch.float32)
+        k_rot = apply_relative_rope_rotation(
+            k_raw,
+            delta_pos=16,
+            rope_theta=1000000.0,
+            rotary_dim=None,
+            is_neox_style=True,
+            rope_scaling=gemma4_rope_params["full_attention"],
+        )
+        # Non-rotated regions [64:256] and [320:512] must be bitwise identical to k_raw
+        self.assertTrue(torch.equal(k_rot[..., 64:256], k_raw[..., 64:256]))
+        self.assertTrue(torch.equal(k_rot[..., 320:512], k_raw[..., 320:512]))
+        # Rotated regions [0:64] and [256:320] must preserve norm and compose additively
+        k_rot2 = apply_relative_rope_rotation(
+            k_rot,
+            delta_pos=-16,
+            rope_theta=1000000.0,
+            rotary_dim=None,
+            is_neox_style=True,
+            rope_scaling=gemma4_rope_params["full_attention"],
+        )
+        self.assertTrue(torch.allclose(k_rot2, k_raw, atol=1e-5))
+
+        # Verify sub-block extraction & injection on Group 1 (kbs=32, block_size=16)
+        kv_layer_32 = torch.zeros(2, 4, 32, 4, 512, dtype=torch.bfloat16)
+        k_sub0 = torch.ones(16, 4, 512, dtype=torch.bfloat16) * 3.0
+        v_sub0 = torch.ones(16, 4, 512, dtype=torch.bfloat16) * 4.0
+        k_sub1 = torch.ones(16, 4, 512, dtype=torch.bfloat16) * 7.0
+        v_sub1 = torch.ones(16, 4, 512, dtype=torch.bfloat16) * 8.0
+
+        conn._inject_block_kv(
+            kv_layer_32,
+            physical_block_id=2,
+            k_block=k_sub0,
+            v_block=v_sub0,
+            is_mla=False,
+            block_size=16,
+            start_position=0,
+        )
+        conn._inject_block_kv(
+            kv_layer_32,
+            physical_block_id=2,
+            k_block=k_sub1,
+            v_block=v_sub1,
+            is_mla=False,
+            block_size=16,
+            start_position=16,
+        )
+        ext_k0, ext_v0 = conn._extract_block_kv(
+            kv_layer_32,
+            physical_block_id=2,
+            is_mla=False,
+            block_size=16,
+            start_position=0,
+        )
+        ext_k1, ext_v1 = conn._extract_block_kv(
+            kv_layer_32,
+            physical_block_id=2,
+            is_mla=False,
+            block_size=16,
+            start_position=16,
+        )
+        self.assertTrue(torch.equal(ext_k0, k_sub0))
+        self.assertTrue(torch.equal(ext_v0, v_sub0))
+        self.assertTrue(torch.equal(ext_k1, k_sub1))
+        self.assertTrue(torch.equal(ext_v1, v_sub1))
+
+        # Verify _build_block_specs_for_tokens maps b_idx 0,1 -> full_grp[0] and b_idx 2 -> full_grp[1]
+        tokens_48 = list(range(100, 148))
+        specs = conn._build_block_specs_for_tokens(
+            tokens_48,
+            block_ids=[10, 11, 12],
+            all_group_block_ids=([10, 11, 12], [20, 21]),
+        )
+        self.assertEqual(len(specs), 3)
+        self.assertEqual(
+            [s.group_block_ids for s in specs],
+            [(10, 20), (11, 20), (12, 21)],
+        )
+        # Populate all 3 blocks (48 tokens) into the store and check that get_num_new_matched_tokens
+        # aligns external hits to _scheduler_block_size = 32 tokens
+        for s in specs:
+            conn.store.store_block(
+                layer_name="model.language_model.layers.0.self_attn.attn",
+                full_block_hash=s.full_block_hash,
+                token_ids=s.token_ids,
+                start_position=s.start_position,
+                k_block=torch.ones(16, 8, 256, dtype=torch.bfloat16),
+                v_block=torch.ones(16, 8, 256, dtype=torch.bfloat16),
+            )
+        req_50 = SimpleNamespace(
+            request_id="req_gemma4_align",
+            prompt_token_ids=tokens_48 + [998, 999],
+        )
+        matched_toks, _ = conn.get_num_new_matched_tokens(
+            req_50,  # type: ignore[arg-type]
+            num_computed_tokens=0,
+        )
+        self.assertEqual(matched_toks, 48)
+
+
 
 if __name__ == "__main__":
     unittest.main()

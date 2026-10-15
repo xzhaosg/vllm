@@ -671,7 +671,7 @@ def main() -> None:
     if args.mamba_ssm_cache_dtype != "auto":
         llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
     if args.disable_mm:
-        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+        llm_kwargs["language_model_only"] = True
 
     llm = LLM(**llm_kwargs)
     resolved_block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)

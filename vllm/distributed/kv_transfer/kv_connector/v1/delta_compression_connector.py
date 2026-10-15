@@ -49,6 +49,16 @@ class CompressionTier(enum.IntEnum):
     TIER3_SPARSE_BF16_INT4_DELTA = 4
 
 
+def _safe_getattr(obj: Any, attr: str, default: Any = None) -> Any:
+    """Safely read an attribute even if __getattribute__ raises ValueError (e.g. Gemma4TextConfig)."""
+    if obj is None:
+        return default
+    try:
+        return getattr(obj, attr, default)
+    except Exception:
+        return default
+
+
 def compute_token_block_hash(token_ids: tuple[int, ...] | list[int]) -> str:
     """Compute a position-independent hash of a block's token IDs."""
     token_tuple = tuple(int(t) for t in token_ids)
@@ -103,7 +113,19 @@ def apply_relative_rope_rotation(
 
     orig_dtype = k_tensor.dtype
     head_dim = k_tensor.shape[-1]
-    r_dim = head_dim if rotary_dim is None else min(rotary_dim, head_dim)
+    r_type = (
+        (rope_scaling.get("rope_type") or rope_scaling.get("type"))
+        if isinstance(rope_scaling, dict)
+        else None
+    )
+    if r_type == "proportional":
+        r_dim = (
+            0
+            if (rotary_dim is not None and rotary_dim <= 0)
+            else head_dim
+        )
+    else:
+        r_dim = head_dim if rotary_dim is None else min(rotary_dim, head_dim)
     if r_dim <= 0:
         return k_tensor.clone()
 
@@ -112,12 +134,35 @@ def apply_relative_rope_rotation(
     k_pass = k_fp32[..., r_dim:]
 
     half_dim = r_dim // 2
-    freq_seq = torch.arange(0, half_dim, dtype=torch.float32, device=k_tensor.device)
-    pos_freqs = rope_theta ** (freq_seq / float(half_dim))
-    inv_freq = 1.0 / pos_freqs
+    if r_type == "proportional" and isinstance(rope_scaling, dict):
+        partial_factor = float(rope_scaling.get("partial_rotary_factor", 1.0))
+        rope_angles = int(partial_factor * head_dim) // 2
+        nope_angles = half_dim - rope_angles
+        freq_seq = torch.arange(
+            0, rope_angles, dtype=torch.float32, device=k_tensor.device
+        )
+        pos_freqs = rope_theta ** (freq_seq / float(half_dim))
+        inv_freq_rot = 1.0 / pos_freqs
+        inv_freq = (
+            torch.cat(
+                [
+                    inv_freq_rot,
+                    torch.zeros(
+                        nope_angles, dtype=torch.float32, device=k_tensor.device
+                    ),
+                ]
+            )
+            if nope_angles > 0
+            else inv_freq_rot
+        )
+    else:
+        freq_seq = torch.arange(
+            0, half_dim, dtype=torch.float32, device=k_tensor.device
+        )
+        pos_freqs = rope_theta ** (freq_seq / float(half_dim))
+        inv_freq = 1.0 / pos_freqs
 
     if isinstance(rope_scaling, dict):
-        r_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
         factor = float(rope_scaling.get("factor", 1.0))
         if r_type in ("yarn", "deepseek_yarn") and factor > 1.0:
             orig_max_pos = int(
@@ -446,6 +491,9 @@ class DeltaBlockStore:
         self.layer_policies: dict[str, LayerCompressionPolicy] = {}
         # Layer name -> KV cache group index (shared across scheduler & worker roles)
         self.layer_to_group_idx: dict[str, int] = {}
+        # Per-KV-cache-group physical block sizes and Mamba flags
+        self.group_block_sizes: list[int] = []
+        self.group_is_mamba: list[bool] = []
 
         # Primary index: (layer_name, full_block_hash) -> CompressedKVBlockRecord
         self._records: dict[tuple[str, str], CompressedKVBlockRecord] = {}
@@ -1153,10 +1201,35 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             str, torch.Tensor | tuple[torch.Tensor, ...]
         ] = {}
         self._layer_to_group_idx: dict[str, int] = self.store.layer_to_group_idx
+        self._group_block_sizes: list[int] = self.store.group_block_sizes
+        self._group_is_mamba: list[bool] = self.store.group_is_mamba
         self._active_no_compile_layers: dict[str, Any] = {}
         self._active_virtual_engine: int = 0
         self._layers_saved_in_step: set[str] = set()
         self._auto_configure_layers(vllm_config, kv_cache_config)
+
+    @property
+    def _scheduler_block_size(self) -> int:
+        attn_bs = [
+            bs
+            for bs, is_m in zip(self._group_block_sizes, self._group_is_mamba)
+            if not is_m and bs > 0
+        ]
+        if not attn_bs:
+            return self._block_size
+        return math.lcm(self._block_size, *attn_bs)
+
+    def _get_group_block_scale(self, g_idx: int) -> int:
+        if (
+            g_idx < len(self._group_is_mamba)
+            and self._group_is_mamba[g_idx]
+        ):
+            return 1
+        if g_idx < len(self._group_block_sizes):
+            g_bs = self._group_block_sizes[g_idx]
+            if g_bs > self._block_size and g_bs % self._block_size == 0:
+                return g_bs // self._block_size
+        return 1
 
     def _auto_configure_layers(
         self,
@@ -1164,42 +1237,71 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config: "KVCacheConfig | None",
     ) -> None:
         """Auto-populate layer-to-group mapping and RoPE/SWA/Mamba policies from config."""
-        model_config = getattr(vllm_config, "model_config", None)
+        model_config = _safe_getattr(vllm_config, "model_config", None)
         hf_config = (
-            getattr(model_config, "hf_text_config", None)
+            _safe_getattr(model_config, "hf_text_config", None)
             if model_config is not None
             else None
         )
         rope_params = (
-            getattr(hf_config, "rope_parameters", None)
-            or getattr(hf_config, "rope_scaling", None)
+            _safe_getattr(hf_config, "rope_parameters", None)
+            or _safe_getattr(hf_config, "rope_scaling", None)
             if hf_config is not None
             else None
         )
         if not isinstance(rope_params, dict):
             rope_params = None
 
+        full_rope_params = (
+            rope_params.get("full_attention")
+            if rope_params is not None
+            and isinstance(rope_params.get("full_attention"), dict)
+            else rope_params
+        )
+        sliding_rope_params = (
+            rope_params.get("sliding_attention")
+            if rope_params is not None
+            and isinstance(rope_params.get("sliding_attention"), dict)
+            else None
+        )
+
         raw_theta = (
-            rope_params.get("rope_theta")
-            if rope_params is not None and rope_params.get("rope_theta") is not None
-            else (getattr(hf_config, "rope_theta", None) if hf_config is not None else None)
+            full_rope_params.get("rope_theta")
+            if full_rope_params is not None
+            and full_rope_params.get("rope_theta") is not None
+            else (
+                _safe_getattr(hf_config, "rope_theta", None)
+                if hf_config is not None
+                else None
+            )
         )
         global_theta = (
             float(raw_theta) if raw_theta is not None else self.store.default_rope_theta
         )
         model_type = (
-            getattr(hf_config, "model_type", None) if hf_config is not None else None
+            _safe_getattr(hf_config, "model_type", None)
+            if hf_config is not None
+            else None
         )
         raw_local_theta = (
-            getattr(hf_config, "rope_local_base_freq", None)
+            _safe_getattr(hf_config, "rope_local_base_freq", None)
             if hf_config is not None
             else None
         )
         if raw_local_theta is None and rope_params is not None:
             raw_local_theta = rope_params.get("rope_local_base_freq")
-        has_separate_local_rope = raw_local_theta is not None or model_type in (
-            "gemma3",
-            "gemma3_text",
+        if raw_local_theta is None and sliding_rope_params is not None:
+            raw_local_theta = sliding_rope_params.get("rope_theta")
+        has_separate_local_rope = (
+            raw_local_theta is not None
+            or sliding_rope_params is not None
+            or model_type
+            in (
+                "gemma3",
+                "gemma3_text",
+                "gemma4",
+                "gemma4_text",
+            )
         )
         local_theta = (
             float(raw_local_theta)
@@ -1207,21 +1309,34 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             else (10000.0 if has_separate_local_rope else global_theta)
         )
 
-        # Resolve partial rotary factor / rotary_dim (e.g. Qwen3.5 / Qwen3-Next)
-        rotary_dim: int | None = (
-            getattr(hf_config, "rotary_dim", None) if hf_config is not None else None
+        full_rope_type = (
+            (full_rope_params.get("rope_type") or full_rope_params.get("type"))
+            if isinstance(full_rope_params, dict)
+            else None
         )
-        if rotary_dim is None and hf_config is not None:
+        # Resolve partial rotary factor / rotary_dim (e.g. Qwen3.5 / Qwen3-Next).
+        # Note: for proportional RoPE (Gemma 4), rotary_dim stays None (full head_dim)
+        # and partial_rotary_factor is handled via rope_scaling in apply_relative_rope_rotation.
+        rotary_dim: int | None = (
+            _safe_getattr(hf_config, "rotary_dim", None)
+            if hf_config is not None
+            else None
+        )
+        if (
+            rotary_dim is None
+            and hf_config is not None
+            and full_rope_type != "proportional"
+        ):
             partial_factor = (
-                rope_params.get("partial_rotary_factor")
-                if rope_params is not None
-                and rope_params.get("partial_rotary_factor") is not None
-                else getattr(hf_config, "partial_rotary_factor", None)
+                full_rope_params.get("partial_rotary_factor")
+                if full_rope_params is not None
+                and full_rope_params.get("partial_rotary_factor") is not None
+                else _safe_getattr(hf_config, "partial_rotary_factor", None)
             )
-            head_dim = getattr(hf_config, "head_dim", None)
+            head_dim = _safe_getattr(hf_config, "head_dim", None)
             if head_dim is None:
-                hidden_size = getattr(hf_config, "hidden_size", 0)
-                num_heads = getattr(hf_config, "num_attention_heads", 0)
+                hidden_size = _safe_getattr(hf_config, "hidden_size", 0)
+                num_heads = _safe_getattr(hf_config, "num_attention_heads", 0)
                 if hidden_size and num_heads:
                     head_dim = hidden_size // num_heads
             if (
@@ -1234,18 +1349,22 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if hf_config is not None:
             self.store.default_rope_theta = global_theta
             self.store.default_rotary_dim = rotary_dim
-            self.store.default_rope_scaling = rope_params
+            self.store.default_rope_scaling = full_rope_params
 
         layer_types = (
-            getattr(hf_config, "layer_types", None) if hf_config is not None else None
+            _safe_getattr(hf_config, "layer_types", None)
+            if hf_config is not None
+            else None
         )
         default_sw = (
-            getattr(hf_config, "sliding_window", None)
+            _safe_getattr(hf_config, "sliding_window", None)
             if hf_config is not None
             else None
         )
 
         if kv_cache_config is not None and hasattr(kv_cache_config, "kv_cache_groups"):
+            self._group_block_sizes.clear()
+            self._group_is_mamba.clear()
             for group_idx, group_spec in enumerate(kv_cache_config.kv_cache_groups):
                 spec = getattr(group_spec, "kv_cache_spec", None)
                 inner_specs = (
@@ -1253,6 +1372,13 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     if spec is not None
                     else None
                 )
+                grp_bs = int(getattr(spec, "block_size", self._block_size) or self._block_size)
+                grp_is_mamba = spec is not None and (
+                    spec.__class__.__name__ == "MambaSpec"
+                    or getattr(spec, "mamba_type", None) is not None
+                )
+                self._group_block_sizes.append(grp_bs)
+                self._group_is_mamba.append(grp_is_mamba)
                 for layer_name in getattr(group_spec, "layer_names", []):
                     self._layer_to_group_idx[layer_name] = group_idx
                     if layer_name in self.store.layer_policies:
@@ -1280,6 +1406,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                         or ("linear_attn" in layer_name or ".mamba" in layer_name)
                     )
+                    if is_mamba and group_idx < len(self._group_is_mamba):
+                        self._group_is_mamba[group_idx] = True
                     is_sw = False if is_mamba else (spec_sw is not None)
                     if (
                         not is_mamba
@@ -1294,11 +1422,18 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         else (default_sw if is_sw else None)
                     )
                     theta = local_theta if is_sw else global_theta
-                    layer_rope_scaling = (
-                        None
-                        if (is_mamba or (is_sw and has_separate_local_rope))
-                        else rope_params
-                    )
+                    if is_mamba:
+                        layer_rope_scaling = None
+                        layer_rotary_dim: int | None = 0
+                    elif is_sw and sliding_rope_params is not None:
+                        layer_rope_scaling = sliding_rope_params
+                        layer_rotary_dim = None
+                    elif is_sw and has_separate_local_rope:
+                        layer_rope_scaling = None
+                        layer_rotary_dim = rotary_dim
+                    else:
+                        layer_rope_scaling = full_rope_params
+                        layer_rotary_dim = rotary_dim
                     follows_global_layer = (
                         is_sw
                         and layer_idx > 0
@@ -1324,7 +1459,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                             is_mamba=is_mamba,
                             sliding_window_size=sw_size,
                             rope_theta=0.0 if is_mamba else theta,
-                            rotary_dim=0 if is_mamba else rotary_dim,
+                            rotary_dim=layer_rotary_dim,
                             rope_scaling=layer_rope_scaling,
                             sliding_window_dedup_threshold=sw_dedup_thresh,
                             tau_zero_bit=0.0
@@ -1366,9 +1501,15 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         all_group_block_ids: tuple[list[int], ...] | None = None,
     ) -> list[DeltaBlockTransferSpec]:
         max_avail_blocks = (
-            max((len(g) for g in all_group_block_ids), default=len(block_ids))
+            max(
+                (
+                    len(g) * self._get_group_block_scale(g_idx)
+                    for g_idx, g in enumerate(all_group_block_ids)
+                ),
+                default=len(block_ids) * self._get_group_block_scale(0),
+            )
             if all_group_block_ids
-            else len(block_ids)
+            else len(block_ids) * self._get_group_block_scale(0)
         )
         num_full_blocks = min(len(token_ids) // self._block_size, max_avail_blocks)
         specs: list[DeltaBlockTransferSpec] = []
@@ -1399,15 +1540,20 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             grp_ids: tuple[int | None, ...] = ()
             if all_group_block_ids:
                 grp_ids = tuple(
-                    int(g_blks[b_idx])
-                    if (b_idx < len(g_blks) and g_blks[b_idx] is not None)
+                    int(g_blks[b_idx // self._get_group_block_scale(g_idx)])
+                    if (
+                        (b_idx // self._get_group_block_scale(g_idx)) < len(g_blks)
+                        and g_blks[b_idx // self._get_group_block_scale(g_idx)]
+                        is not None
+                    )
                     else None
-                    for g_blks in all_group_block_ids
+                    for g_idx, g_blks in enumerate(all_group_block_ids)
                 )
 
+            b0_idx = b_idx // self._get_group_block_scale(0)
             phys_id = (
-                int(block_ids[b_idx])
-                if b_idx < len(block_ids) and block_ids[b_idx] is not None
+                int(block_ids[b0_idx])
+                if b0_idx < len(block_ids) and block_ids[b0_idx] is not None
                 else 0
             )
             specs.append(
@@ -1731,6 +1877,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         physical_block_id: int,
         is_mla: bool,
         block_size: int | None = None,
+        start_position: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Extract (K_block, V_block) or Mamba/GDN (ssm_state, conv_state)."""
         if isinstance(kv_layer, tuple):
@@ -1753,9 +1900,19 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if is_mla:
             # MLA shape: [num_pages, 1, page_size, head_dim] or [num_pages, page_size, head_dim]
             if ratio == 1:
-                if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
-                    return kv_layer[physical_block_id, 0], None
-                return kv_layer[physical_block_id], None
+                blk = (
+                    kv_layer[physical_block_id, 0]
+                    if (kv_layer.ndim == 4 and kv_layer.shape[1] == 1)
+                    else kv_layer[physical_block_id]
+                )
+                if (
+                    block_size is not None
+                    and 0 < block_size < blk.shape[0]
+                    and blk.shape[0] % block_size == 0
+                ):
+                    sub_start = start_position % blk.shape[0]
+                    blk = blk[sub_start : sub_start + block_size]
+                return blk, None
             if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
                 sub = kv_layer[start_blk:end_blk, 0]
             else:
@@ -1764,7 +1921,17 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if kv_layer.ndim == 5 and kv_layer.shape[0] == 2:
             # Shape: [2, num_pages, page_size, num_kv_heads, head_dim]
             if ratio == 1:
-                return kv_layer[0, physical_block_id], kv_layer[1, physical_block_id]
+                k_blk = kv_layer[0, physical_block_id]
+                v_blk = kv_layer[1, physical_block_id]
+                if (
+                    block_size is not None
+                    and 0 < block_size < k_blk.shape[0]
+                    and k_blk.shape[0] % block_size == 0
+                ):
+                    sub_start = start_position % k_blk.shape[0]
+                    k_blk = k_blk[sub_start : sub_start + block_size]
+                    v_blk = v_blk[sub_start : sub_start + block_size]
+                return k_blk, v_blk
             k_sub = kv_layer[0, start_blk:end_blk]
             v_sub = kv_layer[1, start_blk:end_blk]
             return (
@@ -1774,7 +1941,17 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if kv_layer.ndim == 5 and kv_layer.shape[1] == 2:
             # Shape: [num_pages, 2, page_size, num_kv_heads, head_dim]
             if ratio == 1:
-                return kv_layer[physical_block_id, 0], kv_layer[physical_block_id, 1]
+                k_blk = kv_layer[physical_block_id, 0]
+                v_blk = kv_layer[physical_block_id, 1]
+                if (
+                    block_size is not None
+                    and 0 < block_size < k_blk.shape[0]
+                    and k_blk.shape[0] % block_size == 0
+                ):
+                    sub_start = start_position % k_blk.shape[0]
+                    k_blk = k_blk[sub_start : sub_start + block_size]
+                    v_blk = v_blk[sub_start : sub_start + block_size]
+                return k_blk, v_blk
             k_sub = kv_layer[start_blk:end_blk, 0]
             v_sub = kv_layer[start_blk:end_blk, 1]
             return (
@@ -1785,6 +1962,13 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             # Standardized vLLM V1 4D layout: [num_blocks, num_kv_heads, kernel_block_size, 2 * head_dim]
             if ratio == 1:
                 blk = kv_layer[physical_block_id].transpose(0, 1)
+                if (
+                    block_size is not None
+                    and 0 < block_size < blk.shape[0]
+                    and blk.shape[0] % block_size == 0
+                ):
+                    sub_start = start_position % blk.shape[0]
+                    blk = blk[sub_start : sub_start + block_size]
             else:
                 sub = kv_layer[start_blk:end_blk]
                 blk = sub.permute(0, 2, 1, 3).reshape(
@@ -1802,6 +1986,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         v_block: torch.Tensor | None,
         is_mla: bool,
         block_size: int | None = None,
+        start_position: int = 0,
     ) -> None:
         """Write reconstructed (K_block, V_block) or Mamba/GDN (ssm_state, conv_state) into cache."""
         if isinstance(kv_layer, tuple):
@@ -1834,10 +2019,19 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         if is_mla or v_block is None:
             k_dev = k_block.to(device=target_device, non_blocking=True)
             if ratio == 1:
-                if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
-                    kv_layer[physical_block_id, 0].copy_(k_dev)
+                target = (
+                    kv_layer[physical_block_id, 0]
+                    if (kv_layer.ndim == 4 and kv_layer.shape[1] == 1)
+                    else kv_layer[physical_block_id]
+                )
+                if (
+                    0 < effective_block_size < target.shape[0]
+                    and target.shape[0] % effective_block_size == 0
+                ):
+                    sub_start = start_position % target.shape[0]
+                    target[sub_start : sub_start + effective_block_size].copy_(k_dev)
                 else:
-                    kv_layer[physical_block_id].copy_(k_dev)
+                    target.copy_(k_dev)
             else:
                 if kv_layer.ndim == 4 and kv_layer.shape[1] == 1:
                     kbs = kv_layer.shape[2]
@@ -1854,8 +2048,18 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             k_dev = k_block.to(device=target_device, non_blocking=True)
             v_dev = v_block.to(device=target_device, non_blocking=True)
             if ratio == 1:
-                kv_layer[0, physical_block_id].copy_(k_dev)
-                kv_layer[1, physical_block_id].copy_(v_dev)
+                k_target = kv_layer[0, physical_block_id]
+                v_target = kv_layer[1, physical_block_id]
+                if (
+                    0 < effective_block_size < k_target.shape[0]
+                    and k_target.shape[0] % effective_block_size == 0
+                ):
+                    sub_start = start_position % k_target.shape[0]
+                    k_target[sub_start : sub_start + effective_block_size].copy_(k_dev)
+                    v_target[sub_start : sub_start + effective_block_size].copy_(v_dev)
+                else:
+                    k_target.copy_(k_dev)
+                    v_target.copy_(v_dev)
             else:
                 kbs = kv_layer.shape[2]
                 kv_layer[0, start_blk:end_blk].copy_(
@@ -1868,8 +2072,18 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             k_dev = k_block.to(device=target_device, non_blocking=True)
             v_dev = v_block.to(device=target_device, non_blocking=True)
             if ratio == 1:
-                kv_layer[physical_block_id, 0].copy_(k_dev)
-                kv_layer[physical_block_id, 1].copy_(v_dev)
+                k_target = kv_layer[physical_block_id, 0]
+                v_target = kv_layer[physical_block_id, 1]
+                if (
+                    0 < effective_block_size < k_target.shape[0]
+                    and k_target.shape[0] % effective_block_size == 0
+                ):
+                    sub_start = start_position % k_target.shape[0]
+                    k_target[sub_start : sub_start + effective_block_size].copy_(k_dev)
+                    v_target[sub_start : sub_start + effective_block_size].copy_(v_dev)
+                else:
+                    k_target.copy_(k_dev)
+                    v_target.copy_(v_dev)
             else:
                 kbs = kv_layer.shape[2]
                 kv_layer[start_blk:end_blk, 0].copy_(
@@ -1882,9 +2096,19 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             # Standardized vLLM V1 4D layout: [num_blocks, num_kv_heads, kernel_block_size, 2 * head_dim]
             if ratio == 1:
                 kv_combined = torch.cat([k_block, v_block], dim=-1).transpose(0, 1)
-                kv_layer[physical_block_id].copy_(
-                    kv_combined.to(device=target_device, non_blocking=True)
-                )
+                target = kv_layer[physical_block_id]
+                if (
+                    0 < effective_block_size < target.shape[1]
+                    and target.shape[1] % effective_block_size == 0
+                ):
+                    sub_start = start_position % target.shape[1]
+                    target[
+                        :, sub_start : sub_start + effective_block_size, :
+                    ].copy_(kv_combined.to(device=target_device, non_blocking=True))
+                else:
+                    target.copy_(
+                        kv_combined.to(device=target_device, non_blocking=True)
+                    )
             else:
                 kbs = kv_layer.shape[2]
                 kv_combined = (
@@ -1925,6 +2149,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if req_meta.is_store:
                 continue
             for layer_name in all_layer_names:
+                if (
+                    self._layer_to_group_idx
+                    and layer_name not in self._layer_to_group_idx
+                ):
+                    continue
                 layer = self._active_no_compile_layers.get(layer_name)
                 kv_tensor = self._get_layer_kv_cache(
                     layer_name, layer, self._active_virtual_engine
@@ -1976,6 +2205,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         v_recon,
                         is_mla=is_mla,
                         block_size=self._block_size,
+                        start_position=blk_spec.start_position,
                     )
                     if isinstance(kv_tensor, tuple) or policy.is_mamba:
                         running_blk_id = self._resolve_running_block_id(
@@ -1993,6 +2223,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                                 v_recon,
                                 is_mla=is_mla,
                                 block_size=self._block_size,
+                                start_position=blk_spec.start_position,
                             )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -2006,6 +2237,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         **kwargs: Any,
     ) -> None:
         self._layers_saved_in_step.add(layer_name)
+        if self._layer_to_group_idx and layer_name not in self._layer_to_group_idx:
+            return
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, DeltaConnectorMetadata):
             return
@@ -2040,6 +2273,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     phys_blk_id,
                     is_mla=is_mla,
                     block_size=self._block_size,
+                    start_position=blk_spec.start_position,
                 )
                 self.store.store_block(
                     layer_name=layer_name,
