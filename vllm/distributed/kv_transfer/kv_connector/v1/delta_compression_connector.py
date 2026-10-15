@@ -264,11 +264,15 @@ def quantize_residual_packed(
     orig_dtype = residual.dtype
     res_fp32 = residual.to(torch.float32)
 
-    # Reshape to [num_groups, group_size]. Use orig_shape[-1] when >= 32 (per-head),
-    # or a factor up to 128 when the trailing dimension is small (e.g. Mamba conv_state).
+    # Reshape to [num_groups, group_size]. Cap group_size at 32 for INT4 (128 for INT2)
+    # so large-head_dim architectures (e.g. Gemma 4 head_dim=256/512 with learned k_norm)
+    # do not suffer from per-head outlier channel scale inflation.
     total_elems = res_fp32.numel()
     group_size = orig_shape[-1]
-    if group_size < 32 and total_elems >= 32:
+    max_group_size = 32 if bits == 4 else 128
+    if group_size > max_group_size:
+        group_size = math.gcd(total_elems, max_group_size) or group_size
+    elif group_size < 32 and total_elems >= 32:
         group_size = math.gcd(total_elems, 128)
         if group_size < 16:
             group_size = math.gcd(total_elems, 64) or orig_shape[-1]
@@ -910,17 +914,15 @@ class DeltaBlockStore:
                 idx_tensor = torch.tensor(
                     diff_indices, dtype=torch.long, device=self.device
                 )
-                sparse_k = k_cpu[idx_tensor].clone()
-                sparse_v = v_cpu[idx_tensor].clone() if v_cpu is not None else None
 
                 # Zero out the edited rows in the residual so their large outliers do not
                 # pollute the per-head INT4 quantization scale of the remaining rows!
                 delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
                 delta_k[idx_tensor] = 0.0
-                q_dk = (
-                    quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
-                    if policy.layer_idx > 0
-                    else None
+                k_rem = k_cpu.to(torch.float32).clone()
+                k_rem[idx_tensor] = 0.0
+                eta_k = torch.linalg.norm(delta_k).item() / max(
+                    torch.linalg.norm(k_rem).item(), 1e-8
                 )
 
                 if v_cpu is not None and partial_base.raw_v is not None:
@@ -928,31 +930,51 @@ class DeltaBlockStore:
                         torch.float32
                     )
                     delta_v[idx_tensor] = 0.0
-                    q_dv = (
-                        quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                    v_rem = v_cpu.to(torch.float32).clone()
+                    v_rem[idx_tensor] = 0.0
+                    eta_v = torch.linalg.norm(delta_v).item() / max(
+                        torch.linalg.norm(v_rem).item(), 1e-8
+                    )
+                    eta_max = max(eta_k, eta_v)
+                else:
+                    delta_v = None
+                    eta_max = eta_k
+
+                if policy.layer_idx == 0 or eta_max <= policy.tau_int4:
+                    sparse_k = k_cpu[idx_tensor].clone()
+                    sparse_v = v_cpu[idx_tensor].clone() if v_cpu is not None else None
+                    q_dk = (
+                        quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
                         if policy.layer_idx > 0
                         else None
                     )
-                else:
-                    q_dv = None
+                    q_dv = (
+                        quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                        if (
+                            policy.layer_idx > 0
+                            and delta_v is not None
+                            and v_cpu is not None
+                        )
+                        else None
+                    )
 
-                record = CompressedKVBlockRecord(
-                    tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
-                    full_block_hash=full_block_hash,
-                    token_block_hash=token_hash,
-                    token_ids=token_tuple,
-                    start_position=start_position,
-                    layer_idx=policy.layer_idx,
-                    is_mla=is_mla,
-                    ref_base_hash=partial_base.full_block_hash,
-                    delta_pos=delta_pos,
-                    quant_delta_k=q_dk,
-                    quant_delta_v=q_dv,
-                    sparse_token_indices=idx_tensor.to(torch.int16),
-                    sparse_k_bf16=sparse_k,
-                    sparse_v_bf16=sparse_v,
-                )
-                return self._commit_record(layer_name, record, raw_bytes)
+                    record = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                        full_block_hash=full_block_hash,
+                        token_block_hash=token_hash,
+                        token_ids=token_tuple,
+                        start_position=start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=is_mla,
+                        ref_base_hash=partial_base.full_block_hash,
+                        delta_pos=delta_pos,
+                        quant_delta_k=q_dk,
+                        quant_delta_v=q_dv,
+                        sparse_token_indices=idx_tensor.to(torch.int16),
+                        sparse_k_bf16=sparse_k,
+                        sparse_v_bf16=sparse_v,
+                    )
+                    return self._commit_record(layer_name, record, raw_bytes)
 
         # 3. Default: Store as UNCOMPRESSED_BASE and index for single-hop reference
         base_record = CompressedKVBlockRecord(

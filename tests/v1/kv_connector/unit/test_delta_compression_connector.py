@@ -1139,6 +1139,42 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         self.assertEqual(matched_toks, 48)
 
+    def test_large_head_dim_subhead_quant_and_tier3_threshold(self) -> None:
+        """Verifies sub-head group_size=32 on head_dim=512 and TIER3 residual threshold fallback."""
+        # 1. Simulate Gemma 4 full_attention head_dim=512 with learned k_norm channel outliers
+        res_512 = 0.10 * torch.randn(16, 2, 512, dtype=torch.bfloat16)
+        res_512[:, :, 0] *= 8.0  # Outlier channel in group 0 only
+        packed = quantize_residual_packed(res_512, bits=4)
+        # 16 * 2 * 512 / 32 = 512 scale groups
+        self.assertEqual(packed.scales.shape[0], (16 * 2 * 512) // 32)
+        recon = dequantize_residual_packed(packed)
+        # Non-outlier channels (32..511) should have high SQNR unaffected by channel 0 outlier
+        sqnr_non_outlier = _compute_sqnr_db(res_512[:, :, 32:], recon[:, :, 32:])
+        self.assertGreater(sqnr_non_outlier, 24.0)
+
+        # 2. Verify TIER3 falls back to UNCOMPRESSED_BASE when non-edited rows exceed tau_int4
+        store = DeltaBlockStore(block_size=16)
+        layer_name = "model.language_model.layers.11.self_attn.attn"
+        store.register_layer_policy(
+            layer_name, LayerCompressionPolicy(layer_idx=11, tau_int4=0.70)
+        )
+        base_tokens = tuple(range(600, 616))
+        k_base = torch.randn(16, 2, 512, dtype=torch.bfloat16)
+        v_base = torch.randn(16, 2, 512, dtype=torch.bfloat16)
+        hash_base = compute_full_prefix_block_hash("ROOT", base_tokens)
+        store.store_block(layer_name, hash_base, base_tokens, 0, k_base, v_base)
+
+        edited_tokens = list(base_tokens)
+        edited_tokens[4] = 7777
+        edited_tuple = tuple(edited_tokens)
+        # Non-edited rows have large perturbation (eta ~ 0.90 > tau_int4=0.70)
+        k_perturbed = k_base + 0.95 * torch.randn_like(k_base)
+        v_perturbed = v_base + 0.95 * torch.randn_like(v_base)
+        hash_edited = compute_full_prefix_block_hash("ROOT", edited_tuple)
+        rec = store.store_block(
+            layer_name, hash_edited, edited_tuple, 0, k_perturbed, v_perturbed
+        )
+        self.assertEqual(rec.tier, CompressionTier.UNCOMPRESSED_BASE)
 
 
 if __name__ == "__main__":
