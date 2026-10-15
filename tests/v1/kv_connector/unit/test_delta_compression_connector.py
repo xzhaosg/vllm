@@ -1176,6 +1176,61 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         self.assertEqual(rec.tier, CompressionTier.UNCOMPRESSED_BASE)
 
+    def test_gemma4_high_crest_zero_preserving_quant_and_moe_token_spike(self) -> None:
+        """Verifies zero-preserving INT2/INT4 on high-crest V residuals and 1-token MoE spike promotion."""
+        torch.manual_seed(7)
+        # 1. High-crest-factor residual (1 outlier channel = 12.0, 255 near-zero channels ~ 0.02)
+        res_sparse = 0.02 * torch.randn(16, 4, 256, dtype=torch.bfloat16)
+        res_sparse[:, :, 0] = 12.0
+        pre_norm = torch.linalg.norm(res_sparse.to(torch.float32)).item()
+
+        for bits in (2, 4):
+            q = quantize_residual_packed(res_sparse, bits=bits)
+            recon = dequantize_residual_packed(q)
+            err_norm = torch.linalg.norm(
+                (res_sparse.to(torch.float32) - recon.to(torch.float32))
+            ).item()
+            # Zero-preserving quantization must sharply reduce residual norm (never amplify it!)
+            self.assertLess(err_norm, 0.25 * pre_norm)
+
+        # 2. Exact token match where 1 token out of 16 has a 120% MoE routing spike
+        store = DeltaBlockStore(block_size=16)
+        layer_name = "model.language_model.layers.22.self_attn.attn"
+        store.register_layer_policy(layer_name, LayerCompressionPolicy(layer_idx=22))
+        toks = tuple(range(800, 816))
+        k_base = torch.randn(16, 4, 256, dtype=torch.bfloat16)
+        v_base = torch.randn(16, 4, 256, dtype=torch.bfloat16)
+        h_base = compute_full_prefix_block_hash("P1", toks)
+        store.store_block(layer_name, h_base, toks, 32, k_base, v_base)
+
+        k_target = k_base + 0.05 * torch.randn_like(k_base)
+        v_target = v_base + 0.05 * torch.randn_like(v_base)
+        # Token 9 flips MoE expert routing (eta_tok > 1.0) while block-wide eta ~ 0.30 <= tau_int4
+        v_target[9] = -v_base[9] + 0.8 * torch.randn_like(v_base[9])
+        h_target = compute_full_prefix_block_hash("P2", toks)
+        rec_t = store.store_block(layer_name, h_target, toks, 32, k_target, v_target)
+        self.assertEqual(rec_t.tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+        assert rec_t.sparse_token_indices is not None
+        self.assertEqual(rec_t.sparse_token_indices.tolist(), [9])
+        k_rec, v_rec = store.reconstruct_block(layer_name, h_target)
+        assert v_rec is not None
+        self.assertTrue(torch.equal(v_rec[9], v_target[9]))
+
+        # 3. Intra-request exclude_base_hashes prevents same-request partial-match shadowing
+        near_toks = list(toks)
+        near_toks[0] = 99999
+        h_same_req = compute_full_prefix_block_hash("P1_LATER", tuple(near_toks))
+        rec_same = store.store_block(
+            layer_name,
+            h_same_req,
+            tuple(near_toks),
+            96,
+            k_target,
+            v_target,
+            exclude_base_hashes={h_base},
+        )
+        self.assertEqual(rec_same.tier, CompressionTier.UNCOMPRESSED_BASE)
+
 
 if __name__ == "__main__":
     unittest.main()

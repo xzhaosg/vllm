@@ -252,10 +252,14 @@ def quantize_residual_packed(
 ) -> PackedQuantizedTensor:
     """Quantize a residual tensor [block_size, num_heads, head_dim] into packed uint8.
 
-    Uses per-head symmetric quantization:
-      - INT4: range [-7, +7] mapped to unsigned [1, 15] (offset +8), 2 elems per byte.
-      - INT2: range [-1, +1] or 4-level symmetric [-1.5, -0.5, +0.5, +1.5] mapped to
-        unsigned [0, 3], 4 elems per byte.
+    Uses sub-head group quantization:
+      - INT4: zero-preserving 16-level mid-tread [-8, +7] mapped to unsigned [0, 15]
+        (exact 0.0 at code 8, exact ±max_abs at codes 1 and 15), 2 elems per byte.
+      - INT2: crest-adaptive 4-level quantizer (4 elems per byte) using the sign bit
+        of the fp16 group scale to select between:
+          * Low-crest dense mode (scale > 0): symmetric {-1.5, -0.5, +0.5, +1.5} * scale
+          * High-crest outlier mode (scale < 0): zero-preserving {-1.0, 0.0, +0.38, +1.0} * |scale|
+            (exact 0.0 at code 1, exact ±max_abs at codes 0 and 3).
     """
     if bits not in (2, 4):
         raise ValueError(f"Unsupported bit-width: {bits}. Expected 2 or 4.")
@@ -264,12 +268,12 @@ def quantize_residual_packed(
     orig_dtype = residual.dtype
     res_fp32 = residual.to(torch.float32)
 
-    # Reshape to [num_groups, group_size]. Cap group_size at 32 for INT4 (128 for INT2)
-    # so large-head_dim architectures (e.g. Gemma 4 head_dim=256/512 with learned k_norm)
-    # do not suffer from per-head outlier channel scale inflation.
+    # Reshape to [num_groups, group_size]. Cap group_size at 32 for INT4 (64 for INT2)
+    # so large-head_dim architectures (e.g. Gemma 4 head_dim=256/512 with learned k_norm
+    # or unscaled v_norm) do not suffer from per-head outlier channel scale inflation.
     total_elems = res_fp32.numel()
     group_size = orig_shape[-1]
-    max_group_size = 32 if bits == 4 else 128
+    max_group_size = 32 if bits == 4 else 64
     if group_size > max_group_size:
         group_size = math.gcd(total_elems, max_group_size) or group_size
     elif group_size < 32 and total_elems >= 32:
@@ -280,11 +284,12 @@ def quantize_residual_packed(
     max_abs = flat_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
 
     if bits == 4:
-        # 16-level symmetric mid-riser quantizer: levels {-7.5, -6.5, ..., +6.5, +7.5} * scale
-        scales_fp32 = max_abs / 7.5
+        # 16-level zero-preserving mid-tread quantizer:
+        # levels {-8.0, -7.0, ..., 0.0, ..., +7.0} * scale (exact 0.0 at q=8)
+        scales_fp32 = max_abs / 7.0
         normalized = flat_groups / scales_fp32
         q_unsigned = (
-            torch.floor(normalized + 8.0).clamp(0.0, 15.0).to(torch.uint8).reshape(-1)
+            torch.round(normalized + 8.0).clamp(0.0, 15.0).to(torch.uint8).reshape(-1)
         )
         if q_unsigned.numel() % 2 != 0:
             q_unsigned = torch.cat(
@@ -294,14 +299,31 @@ def quantize_residual_packed(
         high_nibble = (q_unsigned[1::2] & 0x0F) << 4
         packed = low_nibble | high_nibble
     else:
-        # 4-level Lloyd-Max calibrated symmetric mid-riser quantizer:
-        # levels {-1.5, -0.5, +0.5, +1.5} * scale with optimal clipping for group_size=128
-        scales_fp32 = max_abs / 2.15
-        normalized = flat_groups / scales_fp32
-        # Map to {0, 1, 2, 3} corresponding to {-1.5, -0.5, +0.5, +1.5}
-        q_unsigned = (
-            torch.floor(normalized + 2.0).clamp(0.0, 3.0).to(torch.uint8).reshape(-1)
+        # Crest-adaptive 4-level INT2 quantizer:
+        # High-crest groups (crest > 3.2, e.g. Gemma 4 outlier V/K channels) use negative
+        # scale to select zero-preserving codebook [-1.0, 0.0, +0.38, +1.0] * |scale|.
+        # Low-crest groups (crest <= 3.2) use positive scale with Lloyd-Max [-1.5, -0.5, +0.5, +1.5].
+        rms = torch.sqrt(torch.mean(flat_groups * flat_groups, dim=-1, keepdim=True)).clamp(
+            min=1e-8
         )
+        is_sparse = (max_abs / rms) > 3.2
+
+        dense_scale = max_abs / 2.15
+        norm_dense = flat_groups / dense_scale
+        q_dense = torch.floor(norm_dense + 2.0).clamp(0.0, 3.0).to(torch.uint8)
+
+        norm_sparse = flat_groups / max_abs
+        q_sparse = torch.ones_like(q_dense)  # code 1 -> 0.0
+        q_sparse = torch.where(norm_sparse < -0.50, torch.zeros_like(q_sparse), q_sparse)
+        q_sparse = torch.where(
+            norm_sparse >= 0.19, torch.full_like(q_sparse, 2), q_sparse
+        )
+        q_sparse = torch.where(
+            norm_sparse >= 0.69, torch.full_like(q_sparse, 3), q_sparse
+        )
+
+        scales_fp32 = torch.where(is_sparse, -max_abs, dense_scale)
+        q_unsigned = torch.where(is_sparse, q_sparse, q_dense).reshape(-1)
         rem = q_unsigned.numel() % 4
         if rem != 0:
             q_unsigned = torch.cat(
@@ -339,7 +361,7 @@ def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Te
         unpacked = torch.stack([low_nibble, high_nibble], dim=-1).reshape(-1)[
             :total_elems
         ]
-        levels = unpacked.to(torch.float32) - 7.5
+        levels = unpacked.to(torch.float32) - 8.0
         flat_groups = levels.reshape(-1, group_size)
         recon = flat_groups * scales_fp32
     elif packed_tensor.bits == 2:
@@ -348,10 +370,15 @@ def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Te
         c2 = (packed >> 4) & 0x03
         c3 = (packed >> 6) & 0x03
         unpacked = torch.stack([c0, c1, c2, c3], dim=-1).reshape(-1)[:total_elems]
-        # Map {0, 1, 2, 3} -> {-1.5, -0.5, +0.5, +1.5}
-        levels = unpacked.to(torch.float32) - 1.5
-        flat_groups = levels.reshape(-1, group_size)
-        recon = flat_groups * scales_fp32
+        u_groups = unpacked.reshape(-1, group_size)
+        dense_levels = u_groups.to(torch.float32) - 1.5
+        sparse_codebook = torch.tensor(
+            [-1.0, 0.0, 0.38, 1.0], dtype=torch.float32, device=packed.device
+        )
+        sparse_levels = sparse_codebook[u_groups.to(torch.long)]
+        is_sparse = scales_fp32 < 0.0
+        levels = torch.where(is_sparse, sparse_levels, dense_levels)
+        recon = levels * scales_fp32.abs()
     else:
         raise ValueError(f"Unsupported bit-width: {packed_tensor.bits}")
 
@@ -505,6 +532,9 @@ class DeltaBlockStore:
         # Single-Hop Reference Index (ONLY stores UNCOMPRESSED_BASE blocks):
         # (layer_name, token_block_hash) -> CompressedKVBlockRecord
         self._base_by_token_hash: dict[tuple[str, str], CompressedKVBlockRecord] = {}
+        self._base_by_token_hash_list: dict[
+            tuple[str, str], list[CompressedKVBlockRecord]
+        ] = {}
 
         # Secondary list of UNCOMPRESSED_BASE blocks per layer for R2 partial-edit matching:
         # layer_name -> list[CompressedKVBlockRecord]
@@ -528,6 +558,7 @@ class DeltaBlockStore:
         """Clear all stored KV block records and reset telemetry while preserving layer policies."""
         self._records.clear()
         self._base_by_token_hash.clear()
+        self._base_by_token_hash_list.clear()
         self._base_blocks_by_layer.clear()
         self._base_by_subchunk.clear()
         self._known_prefix_blocks.clear()
@@ -592,8 +623,36 @@ class DeltaBlockStore:
             p.is_mamba for p in self.layer_policies.values()
         )
 
+    def _find_exact_base_block(
+        self,
+        layer_name: str,
+        token_hash: str,
+        start_position: int | None = None,
+        exclude_hashes: set[str] | None = None,
+    ) -> CompressedKVBlockRecord | None:
+        """Find the closest-position UNCOMPRESSED_BASE block with the same token_hash."""
+        candidates = self._base_by_token_hash_list.get((layer_name, token_hash), [])
+        if not candidates:
+            single = self._base_by_token_hash.get((layer_name, token_hash))
+            if single is not None:
+                candidates = [single]
+        valid = [
+            rec
+            for rec in candidates
+            if not exclude_hashes or rec.full_block_hash not in exclude_hashes
+        ]
+        if not valid:
+            return None
+        if start_position is None or len(valid) == 1:
+            return valid[0]
+        return min(valid, key=lambda r: abs(start_position - r.start_position))
+
     def _find_partial_match_base_block(
-        self, layer_name: str, token_ids: tuple[int, ...]
+        self,
+        layer_name: str,
+        token_ids: tuple[int, ...],
+        start_position: int | None = None,
+        exclude_hashes: set[str] | None = None,
     ) -> tuple[CompressedKVBlockRecord | None, list[int]]:
         """Find an UNCOMPRESSED_BASE block in the same layer differing in <= M tokens."""
         policy = self.get_layer_policy(layer_name)
@@ -611,6 +670,8 @@ class DeltaBlockStore:
             bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
             if bucket:
                 for rec in bucket[-8:]:
+                    if exclude_hashes and rec.full_block_hash in exclude_hashes:
+                        continue
                     if rec.full_block_hash not in seen_hashes:
                         seen_hashes.add(rec.full_block_hash)
                         candidates.append(rec)
@@ -620,6 +681,11 @@ class DeltaBlockStore:
 
         for base_rec in candidates:
             if len(base_rec.token_ids) != len(token_ids):
+                continue
+            if (
+                start_position is not None
+                and base_rec.start_position != start_position
+            ):
                 continue
             diff_idx = [
                 i
@@ -643,6 +709,7 @@ class DeltaBlockStore:
         k_block: torch.Tensor,
         v_block: torch.Tensor | None = None,
         divergence_distance: int | None = None,
+        exclude_base_hashes: set[str] | None = None,
     ) -> CompressedKVBlockRecord:
         """Compress and store a single KV cache block using the 4-tier policy.
 
@@ -658,6 +725,8 @@ class DeltaBlockStore:
                 for MLA unified latent cache, or Mamba/GDN conv_state).
             divergence_distance: Number of contiguous matching tokens separating the
                 start of this block from the most recent prefix divergence point.
+            exclude_base_hashes: Optional set of UNCOMPRESSED_BASE hashes created earlier
+                within the same request, preventing intra-request self-shadowing.
 
         Returns:
             The stored CompressedKVBlockRecord.
@@ -684,7 +753,12 @@ class DeltaBlockStore:
             self._known_mamba_blocks.add(full_block_hash)
 
         # 1. Check for an UNCOMPRESSED_BASE block with the exact same token_block_hash
-        base_rec = self._base_by_token_hash.get((layer_name, token_hash))
+        base_rec = self._find_exact_base_block(
+            layer_name,
+            token_hash,
+            start_position=start_position,
+            exclude_hashes=exclude_base_hashes,
+        )
         if base_rec is not None:
             delta_pos = start_position - base_rec.start_position
 
@@ -767,10 +841,91 @@ class DeltaBlockStore:
                 )
                 return self._commit_record(layer_name, record, raw_bytes)
 
+            # Check for localized 1-2 token MoE/attention-sink spikes inside an
+            # exact-token-match block before falling through to dense INT2/INT4:
+            if (
+                not policy.is_mamba
+                and policy.max_sparse_exceptions > 0
+                and delta_k.ndim >= 2
+                and delta_k.shape[0] >= 4
+            ):
+                b_tok = delta_k.shape[0]
+                dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
+                k_tok = torch.linalg.norm(
+                    k_cpu.to(torch.float32).reshape(b_tok, -1), dim=-1
+                ).clamp(min=1e-6)
+                tok_eta_k = dk_tok / k_tok
+                if delta_v is not None and v_cpu is not None:
+                    dv_tok = torch.linalg.norm(delta_v.reshape(b_tok, -1), dim=-1)
+                    v_tok = torch.linalg.norm(
+                        v_cpu.to(torch.float32).reshape(b_tok, -1), dim=-1
+                    ).clamp(min=1e-6)
+                    tok_eta = torch.maximum(tok_eta_k, dv_tok / v_tok)
+                else:
+                    tok_eta = tok_eta_k
+                max_sparse = min(2, policy.max_sparse_exceptions)
+                outlier_mask = tok_eta > 0.65
+                num_outliers = int(outlier_mask.sum().item())
+                if 0 < num_outliers <= max_sparse:
+                    outlier_idx = torch.nonzero(outlier_mask, as_tuple=False).reshape(-1)
+                    delta_k_rem = delta_k.clone()
+                    delta_k_rem[outlier_idx] = 0.0
+                    k_rem = k_cpu.to(torch.float32).clone()
+                    k_rem[outlier_idx] = 0.0
+                    rem_eta_k = torch.linalg.norm(delta_k_rem).item() / max(
+                        torch.linalg.norm(k_rem).item(), 1e-8
+                    )
+                    if delta_v is not None and v_cpu is not None:
+                        delta_v_rem = delta_v.clone()
+                        delta_v_rem[outlier_idx] = 0.0
+                        v_rem = v_cpu.to(torch.float32).clone()
+                        v_rem[outlier_idx] = 0.0
+                        rem_eta_v = torch.linalg.norm(delta_v_rem).item() / max(
+                            torch.linalg.norm(v_rem).item(), 1e-8
+                        )
+                        rem_eta_max = max(rem_eta_k, rem_eta_v)
+                    else:
+                        delta_v_rem = None
+                        rem_eta_max = rem_eta_k
+
+                    if rem_eta_max <= policy.tau_int4:
+                        sparse_k = k_cpu[outlier_idx].clone()
+                        sparse_v = (
+                            v_cpu[outlier_idx].clone() if v_cpu is not None else None
+                        )
+                        q_dk = quantize_residual_packed(
+                            delta_k_rem.to(k_cpu.dtype), bits=4
+                        )
+                        q_dv = (
+                            quantize_residual_packed(
+                                delta_v_rem.to(v_cpu.dtype), bits=4
+                            )
+                            if (delta_v_rem is not None and v_cpu is not None)
+                            else None
+                        )
+                        record = CompressedKVBlockRecord(
+                            tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                            full_block_hash=full_block_hash,
+                            token_block_hash=token_hash,
+                            token_ids=token_tuple,
+                            start_position=start_position,
+                            layer_idx=policy.layer_idx,
+                            is_mla=is_mla,
+                            ref_base_hash=base_rec.full_block_hash,
+                            delta_pos=delta_pos,
+                            quant_delta_k=q_dk,
+                            quant_delta_v=q_dv,
+                            sparse_token_indices=outlier_idx.to(torch.int16),
+                            sparse_k_bf16=sparse_k,
+                            sparse_v_bf16=sparse_v,
+                        )
+                        return self._commit_record(layer_name, record, raw_bytes)
+
+            eff_tau_int2 = min(policy.tau_int2, 0.08)
             tier1_eligible = (
                 (eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4)
                 if policy.is_mamba
-                else (eta_max <= policy.tau_int2)
+                else (eta_max <= eff_tau_int2)
             )
             if tier1_eligible:
                 q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=2)
@@ -821,7 +976,10 @@ class DeltaBlockStore:
 
         # 2. Check for Regime R2: Intra-block partial token edit (<= M tokens changed)
         partial_base, diff_indices = self._find_partial_match_base_block(
-            layer_name, token_tuple
+            layer_name,
+            token_tuple,
+            start_position=start_position,
+            exclude_hashes=exclude_base_hashes,
         )
         if partial_base is not None and diff_indices:
             assert partial_base.raw_k is not None
@@ -911,13 +1069,45 @@ class DeltaBlockStore:
                     is_neox_style=policy.is_neox_style,
                     rope_scaling=policy.rope_scaling,
                 )
-                idx_tensor = torch.tensor(
-                    diff_indices, dtype=torch.long, device=self.device
+                delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
+                delta_v = (
+                    (v_cpu.to(torch.float32) - partial_base.raw_v.to(torch.float32))
+                    if (v_cpu is not None and partial_base.raw_v is not None)
+                    else None
                 )
 
-                # Zero out the edited rows in the residual so their large outliers do not
+                # If there are unused sparse exception slots and an adjacent token
+                # inside the edited block experienced a large MoE/attention shift,
+                # promote that token to BF16 as well.
+                all_sparse_indices = list(diff_indices)
+                rem_slots = policy.max_sparse_exceptions - len(all_sparse_indices)
+                if rem_slots > 0 and delta_k.ndim >= 2 and delta_k.shape[0] >= 4:
+                    b_tok = delta_k.shape[0]
+                    dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
+                    k_tok = torch.linalg.norm(
+                        k_cpu.to(torch.float32).reshape(b_tok, -1), dim=-1
+                    ).clamp(min=1e-6)
+                    tok_eta = dk_tok / k_tok
+                    if delta_v is not None and v_cpu is not None:
+                        dv_tok = torch.linalg.norm(delta_v.reshape(b_tok, -1), dim=-1)
+                        v_tok = torch.linalg.norm(
+                            v_cpu.to(torch.float32).reshape(b_tok, -1), dim=-1
+                        ).clamp(min=1e-6)
+                        tok_eta = torch.maximum(tok_eta, dv_tok / v_tok)
+                    for idx_i in all_sparse_indices:
+                        tok_eta[idx_i] = 0.0
+                    top_vals, top_idxs = torch.topk(tok_eta, k=min(rem_slots, b_tok))
+                    for val, idx_i in zip(top_vals.tolist(), top_idxs.tolist()):
+                        if val > 0.65:
+                            all_sparse_indices.append(int(idx_i))
+                    all_sparse_indices.sort()
+
+                idx_tensor = torch.tensor(
+                    all_sparse_indices, dtype=torch.long, device=self.device
+                )
+
+                # Zero out the sparse BF16 rows in the residual so their large outliers do not
                 # pollute the per-head INT4 quantization scale of the remaining rows!
-                delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
                 delta_k[idx_tensor] = 0.0
                 k_rem = k_cpu.to(torch.float32).clone()
                 k_rem[idx_tensor] = 0.0
@@ -925,10 +1115,7 @@ class DeltaBlockStore:
                     torch.linalg.norm(k_rem).item(), 1e-8
                 )
 
-                if v_cpu is not None and partial_base.raw_v is not None:
-                    delta_v = v_cpu.to(torch.float32) - partial_base.raw_v.to(
-                        torch.float32
-                    )
+                if delta_v is not None and v_cpu is not None:
                     delta_v[idx_tensor] = 0.0
                     v_rem = v_cpu.to(torch.float32).clone()
                     v_rem[idx_tensor] = 0.0
@@ -937,7 +1124,6 @@ class DeltaBlockStore:
                     )
                     eta_max = max(eta_k, eta_v)
                 else:
-                    delta_v = None
                     eta_max = eta_k
 
                 if policy.layer_idx == 0 or eta_max <= policy.tau_int4:
@@ -989,6 +1175,9 @@ class DeltaBlockStore:
             raw_v=v_cpu.clone() if v_cpu is not None else None,
         )
         self._base_by_token_hash.setdefault((layer_name, token_hash), base_record)
+        self._base_by_token_hash_list.setdefault((layer_name, token_hash), []).append(
+            base_record
+        )
         self._base_blocks_by_layer.setdefault(layer_name, []).append(base_record)
         max_exceptions = (
             self.max_sparse_exceptions
@@ -1037,7 +1226,9 @@ class DeltaBlockStore:
         # a token_block_hash match (e.g. Layer 0 or LOCAL_SLIDING zero-bit hit).
         if rec is None and token_ids is not None:
             token_hash = compute_token_block_hash(token_ids)
-            base_rec = self._base_by_token_hash.get((layer_name, token_hash))
+            base_rec = self._find_exact_base_block(
+                layer_name, token_hash, start_position=target_start_position
+            )
             if base_rec is not None:
                 assert base_rec.raw_k is not None
                 delta_pos = (
@@ -2299,6 +2490,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         for req_meta in metadata.requests:
             if not req_meta.is_store:
                 continue
+            req_new_base_hashes: set[str] = set()
             for blk_spec in req_meta.blocks:
                 phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                 if phys_blk_id is None or phys_blk_id >= num_blocks:
@@ -2316,7 +2508,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     block_size=self._block_size,
                     start_position=blk_spec.start_position,
                 )
-                self.store.store_block(
+                rec = self.store.store_block(
                     layer_name=layer_name,
                     full_block_hash=blk_spec.full_block_hash,
                     token_ids=blk_spec.token_ids,
@@ -2324,7 +2516,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     k_block=k_blk,
                     v_block=v_blk,
                     divergence_distance=blk_spec.divergence_distance,
+                    exclude_base_hashes=req_new_base_hashes,
                 )
+                if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
+                    req_new_base_hashes.add(blk_spec.full_block_hash)
 
     def wait_for_save(self) -> None:
         """Save any Mamba/GDN recurrent state layers not visited by @maybe_transfer_kv_layer."""
@@ -2366,6 +2561,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_tensor, is_mla=False, block_size=self._block_size
             )
             for req_meta in store_reqs:
+                req_new_base_hashes: set[str] = set()
                 for blk_spec in req_meta.blocks:
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                     if (
@@ -2380,7 +2576,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         is_mla=False,
                         block_size=self._block_size,
                     )
-                    self.store.store_block(
+                    rec = self.store.store_block(
                         layer_name=layer_name,
                         full_block_hash=blk_spec.full_block_hash,
                         token_ids=blk_spec.token_ids,
@@ -2388,6 +2584,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         k_block=k_blk,
                         v_block=v_blk,
                         divergence_distance=blk_spec.divergence_distance,
+                        exclude_base_hashes=req_new_base_hashes,
                     )
+                    if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
+                        req_new_base_hashes.add(blk_spec.full_block_hash)
 
         self._layers_saved_in_step.clear()

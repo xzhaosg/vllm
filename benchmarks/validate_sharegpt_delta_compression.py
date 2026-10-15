@@ -276,7 +276,10 @@ def main() -> None:
         print(f"{'=' * 72}")
 
         top1_matches = 0
+        cold_top1_matches = 0
+        uncomp_vs_cold_top1_matches = 0
         top5_overlaps: list[float] = []
+        top5_nontrivial_overlaps: list[float] = []
         seq_token_matches = 0
         total_seq_tokens = 0
         abs_logprob_diffs: list[float] = []
@@ -298,8 +301,20 @@ def main() -> None:
             base_ids = turns[0]
             final_target_ids = turns[-1]
 
-            # Step 1: Exact uncompressed ground-truth reference for final_target_ids
+            # Step 1: Exact uncompressed ground-truth reference for final_target_ids.
+            # First run cold full-sequence prefill (M = N) to populate UNCOMPRESSED_BASE
+            # blocks in the store, then evict HBM and reload the uncompressed KV cache
+            # so ref_out uses the exact same suffix-prefill kernel path (M = tail) as
+            # Step 3's delta-reconstructed evaluation.
             store.clear()
+            llm.reset_prefix_cache()
+            cold_out = llm.generate(
+                [TokensPrompt(prompt_token_ids=final_target_ids)],
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )[0].outputs[0]
+            cold_top1_id = cold_out.token_ids[0]
+
             llm.reset_prefix_cache()
             ref_out = llm.generate(
                 [TokensPrompt(prompt_token_ids=final_target_ids)],
@@ -311,6 +326,8 @@ def main() -> None:
             ref_top1_id = ref_gen_ids[0]
             ref_top1_lp = ref_first_logprobs[ref_top1_id].logprob
             ref_top5_set = set(ref_first_logprobs.keys())
+            if ref_top1_id == cold_top1_id:
+                uncomp_vs_cold_top1_matches += 1
 
             # Step 2: Populate Turn 1 (P_1), then run Turns 2..N to delta-compress
             store.clear()
@@ -368,11 +385,24 @@ def main() -> None:
 
             if recon_top1_id == ref_top1_id:
                 top1_matches += 1
+            if recon_top1_id == cold_top1_id:
+                cold_top1_matches += 1
 
             overlap = len(ref_top5_set.intersection(recon_top5_set)) / max(
                 len(ref_top5_set), 1
             )
             top5_overlaps.append(overlap)
+
+            # Non-trivial Top-5 overlap: filter out peaked-softmax tail noise
+            # (tokens with logprob < -8.0, i.e., prob < 3.3e-4, where 1-ULP BF16
+            # fluctuations across 262k vocab items randomly permute the tail).
+            ref_nontrivial = {
+                tid for tid, lp in ref_first_logprobs.items() if lp.logprob >= -8.0
+            } or {ref_top1_id}
+            nontrivial_overlap = len(
+                ref_nontrivial.intersection(recon_top5_set)
+            ) / len(ref_nontrivial)
+            top5_nontrivial_overlaps.append(nontrivial_overlap)
 
             if ref_top1_id in recon_first_logprobs:
                 recon_lp = recon_first_logprobs[ref_top1_id].logprob
@@ -389,7 +419,8 @@ def main() -> None:
                 print(
                     f"  [{idx + 1:2d}/{len(conversations)}] "
                     f"Top-1 Match: {top1_matches / (idx + 1) * 100:5.1f}% | "
-                    f"Top-5 Overlap: {sum(top5_overlaps) / len(top5_overlaps) * 100:5.1f}% | "
+                    f"Top-5 Overlap: {sum(top5_overlaps) / len(top5_overlaps) * 100:5.1f}% "
+                    f"(Non-Trivial: {sum(top5_nontrivial_overlaps) / len(top5_nontrivial_overlaps) * 100:5.1f}%) | "
                     f"16-Tok Seq Match: {seq_token_matches / total_seq_tokens * 100:5.1f}% | "
                     f"Last Inc Ratio: {cur_inc_ratio:5.2f}x"
                 )
@@ -445,6 +476,15 @@ def main() -> None:
             ),
             "top5_overlap_pct": round(
                 sum(top5_overlaps) / len(top5_overlaps) * 100.0, 2
+            ),
+            "top5_nontrivial_overlap_pct": round(
+                sum(top5_nontrivial_overlaps) / len(top5_nontrivial_overlaps) * 100.0, 2
+            ),
+            "vs_cold_prefill_top1_match_pct": round(
+                cold_top1_matches / len(conversations) * 100.0, 2
+            ),
+            "uncomp_vs_cold_prefill_top1_match_pct": round(
+                uncomp_vs_cold_top1_matches / len(conversations) * 100.0, 2
             ),
             "seq_16tok_match_pct": round(
                 seq_token_matches / max(total_seq_tokens, 1) * 100.0, 2
