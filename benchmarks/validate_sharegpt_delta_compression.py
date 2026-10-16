@@ -233,7 +233,10 @@ def main() -> None:
     print("Initializing vLLM V1 with DeltaCompressionConnector on GPU...")
     effective_max_model_len = args.max_model_len
     if (
-        "35b" in args.model.lower() or "moe" in args.model.lower()
+        "35b" in args.model.lower()
+        or "397b" in args.model.lower()
+        or "qwen3.5" in args.model.lower()
+        or "moe" in args.model.lower()
     ) and effective_max_model_len < 3584:
         effective_max_model_len = 3584
 

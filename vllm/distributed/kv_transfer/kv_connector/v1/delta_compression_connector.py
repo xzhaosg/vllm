@@ -552,6 +552,7 @@ class DeltaBlockStore:
         self._known_token_blocks: dict[str, str] = {}
         # Set of full_block_hashes materialized in Mamba/GDN recurrent state layers
         self._known_mamba_blocks: set[str] = set()
+        self._has_mamba_config: bool = False
         self._clear_epoch: int = 0
 
         self.stats = DeltaCompressionStats()
@@ -574,13 +575,14 @@ class DeltaBlockStore:
         full_block_hash: str,
         token_ids: tuple[int, ...] | list[int],
         start_position: int,
+        has_mamba_state: bool = True,
     ) -> None:
         """Record scheduled store block hashes on the Scheduler side for multi-process TP/PP."""
         token_tuple = tuple(int(t) for t in token_ids)
         token_hash = compute_token_block_hash(token_tuple)
         self._known_prefix_blocks[full_block_hash] = (token_tuple, start_position)
         self._known_token_blocks.setdefault(token_hash, full_block_hash)
-        if self.has_mamba_layers:
+        if self.has_mamba_layers and has_mamba_state:
             self._known_mamba_blocks.add(full_block_hash)
 
     @staticmethod
@@ -636,8 +638,10 @@ class DeltaBlockStore:
 
     @property
     def has_mamba_layers(self) -> bool:
-        return bool(self._known_mamba_blocks) or any(
-            p.is_mamba for p in self.layer_policies.values()
+        return (
+            self._has_mamba_config
+            or bool(self._known_mamba_blocks)
+            or any(p.is_mamba for p in self.layer_policies.values())
         )
 
     def _find_exact_base_block(
@@ -1618,6 +1622,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if hf_config is not None
             else None
         )
+        if isinstance(layer_types, (list, tuple)) and any(
+            lt in ("linear_attention", "mamba") for lt in layer_types
+        ):
+            self.store._has_mamba_config = True
         default_sw = (
             _safe_getattr(hf_config, "sliding_window", None)
             if hf_config is not None
@@ -2045,13 +2053,31 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         len(specs),
                     )
 
+        mamba_g_indices = [
+            g_idx for g_idx, is_m in enumerate(self._group_is_mamba) if is_m
+        ]
         for req_meta in meta.requests:
             if req_meta.is_store:
                 for blk_spec in req_meta.blocks:
+                    if mamba_g_indices and blk_spec.group_block_ids:
+                        has_mamba_state = all(
+                            g_idx < len(blk_spec.group_block_ids)
+                            and blk_spec.group_block_ids[g_idx] is not None
+                            and blk_spec.group_block_ids[g_idx] > 0
+                            for g_idx in mamba_g_indices
+                        )
+                    elif blk_spec.group_block_ids:
+                        has_mamba_state = all(
+                            g_id is not None and g_id > 0
+                            for g_id in blk_spec.group_block_ids
+                        )
+                    else:
+                        has_mamba_state = blk_spec.physical_block_id > 0
                     self.store.register_scheduled_store_block(
                         blk_spec.full_block_hash,
                         blk_spec.token_ids,
                         blk_spec.start_position,
+                        has_mamba_state=has_mamba_state,
                     )
 
         self._requests_need_load.clear()
