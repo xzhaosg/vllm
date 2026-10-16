@@ -500,8 +500,17 @@ def run_task_evaluation(
                 TokensPrompt(prompt_token_ids=t[-1]) for t in batch_turns
             ]
 
-            # 1. Uncompressed Baseline on final_prompts
+            # 1. Uncompressed Baseline on final_prompts:
+            # Populate UNCOMPRESSED_BASE blocks first, then evict HBM and reload
+            # the uncompressed KV cache so ref_outputs uses the exact same
+            # suffix-prefill kernel path (q_len = tail) as Step 3.
             store.clear()
+            llm.reset_prefix_cache()
+            _ = llm.generate(
+                final_prompts,
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
+                use_tqdm=False,
+            )
             llm.reset_prefix_cache()
             ref_outputs = llm.generate(
                 final_prompts,
@@ -739,7 +748,7 @@ def main() -> None:
 
     gsm8k_params = SamplingParams(
         temperature=0.0,
-        max_tokens=384,
+        max_tokens=512,
         stop=[
             "Question:",
             "\nQuestion",
