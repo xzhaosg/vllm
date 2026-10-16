@@ -40,12 +40,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector im
 
 
 def load_nebius_passing_trajectories(
-    cache_path: str = "/tmp/nebius_swe_agent_passing_allturns_20.json",
+    cache_path: str | None = None,
     num_trajectories: int = 20,
     min_turns: int = 8,
     max_turns: int = 12,
 ) -> list[dict[str, Any]]:
     """Load verified-passing (`target == True`) multi-turn SWE-agent trajectories."""
+    if cache_path is None:
+        cache_path = (
+            f"/tmp/nebius_swe_agent_passing_n{num_trajectories}"
+            f"_min{min_turns}_max{max_turns}.json"
+        )
     if os.path.exists(cache_path):
         with open(cache_path, encoding="utf-8") as f:
             cached = json.load(f)
@@ -57,6 +62,7 @@ def load_nebius_passing_trajectories(
 
     # Prefer local Parquet shard if available (contains 6,670 trajectories / 1,268 passing)
     parquet_candidates = [
+        "/mnt/ssd/hf_cache/hub/datasets--nebius--SWE-agent-trajectories/snapshots/68195a1450865274106246d0d0296a1d6807b88e/data/train-00000-of-00012.parquet",
         "/mnt/ssd/hf_cache/datasets--nebius--SWE-agent-trajectories/snapshots/68195a1450865274106246d0d0296a1d6807b88e/data/train-00000-of-00012.parquet",
     ]
     parquet_path = next((p for p in parquet_candidates if os.path.exists(p)), None)
@@ -288,17 +294,20 @@ def build_trajectory_samples(
     )
 
     samples: list[dict[str, Any]] = []
-    for item in trajectories:
+    for sample_idx, item in enumerate(trajectories):
         inst = item["instance_id"]
         fpath = item["file_path"]
         issue_txt = item["issue_text"]
         patch = item["generated_patch"]
         gt_symbols = _extract_patch_symbols(patch, fpath)
+        sid_h = 100000000 + sample_idx
+        sid_b = 200000000 + sample_idx
+        sid_p = 300000000 + sample_idx
 
         # 1. Base SWE-Agent ACI Header (Block 0..edit_blk)
         base_step_idx = item["turns"][0]["step_idx"]
         header_text = (
-            f"ID: 100000000 | SWE-Agent Trajectory: {inst} | "
+            f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | "
             f"Step: {base_step_idx} | Open File: {fpath}\n"
             f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
         )
@@ -316,7 +325,7 @@ def build_trajectory_samples(
         # 2. Shared Issue Description + Real Recorded `[File: ...]` Window from `turns[0]["user_obs"]`
         turn0_obs = item["turns"][0]["user_obs"]
         body_section_text = (
-            "ID: 100000000 | Active SWE-Agent File Editor Window: 200000000\n\n"
+            f"ID: {sid_h} | Active SWE-Agent File Editor Window: {sid_b}\n\n"
             f"### GitHub Issue ({inst})\n"
             f"{issue_txt[:1200]}\n\n"
             f"### SWE-Agent File Viewer ({fpath})\n"
@@ -341,7 +350,7 @@ def build_trajectory_samples(
 
         # 3. Rolling Action Log Prepend Block (1 * block_size tokens)
         prepend_text = (
-            f"ID: 300000000 | Rolling Trajectory Log: {inst} | Active File: {fpath}\n"
+            f"ID: {sid_p} | Rolling Trajectory Log: {inst} | Active File: {fpath}\n"
             f"Previous Command: {item['turns'][0]['prev_ai_resp'][:220]}\n\n"
         )
         if block_size >= 128:
@@ -572,12 +581,23 @@ def token_f1(pred_text: str, ref_text: str) -> float:
     return (2 * precision * recall) / (precision + recall)
 
 
+def _accumulate_snap(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    dst["hbm_store_cuda_allocated_bytes"] += int(
+        src.get("hbm_store_cuda_allocated_bytes", 0)
+    )
+    dst["raw_bytes_equivalent"] += int(src.get("raw_bytes_equivalent", 0))
+    dst["compressed_bytes_stored"] += int(src.get("compressed_bytes_stored", 0))
+    for k, v in src.get("tier_counts", {}).items():
+        dst["tier_counts"][k] = dst["tier_counts"].get(k, 0) + int(v)
+
+
 def evaluate_swe_agent_trajectories_hbm(
     llm: LLM,
     store: DeltaBlockStore,
     samples: list[dict[str, Any]],
     block_size: int,
     gen_tokens: int = 128,
+    wave_size: int = 20,
 ) -> dict[str, Any]:
     regimes = ["T1_stateful_aci_window_dp0", "T2_rolling_action_history_dpB"]
     prefill_params = SamplingParams(temperature=0.0, max_tokens=1)
@@ -590,81 +610,135 @@ def evaluate_swe_agent_trajectories_hbm(
         min_turns = min(len(s_turns) for s_turns in all_turns_per_sample)
         total_trajectory_turns = sum(len(s_turns) for s_turns in all_turns_per_sample)
         avg_turns = total_trajectory_turns / max(1, len(samples))
+        num_waves = (len(all_turns_per_sample) + wave_size - 1) // wave_size
 
         print(f"\n{'=' * 80}")
         print(
             f"[NEBIUS SWE-AGENT TRAJECTORIES GPU HBM] Regime: {regime} "
             f"({len(samples)} verified-passing trajectories, {min_turns}-{max_turns} turns/traj, "
-            f"{total_trajectory_turns} total trajectory-turns)"
+            f"{total_trajectory_turns} total trajectory-turns, {num_waves} HBM waves)"
         )
         print(f"{'=' * 80}")
 
-        # ------------------------------------------------------------------
-        # 1. UNCOMPRESSED GPU HBM MODE (`force_uncompressed=True`)
-        # ------------------------------------------------------------------
-        llm.reset_prefix_cache()
-        base_cuda_uncomp = _configure_and_clear_all(
-            llm, store, force_uncompressed=True
-        )
-        uncomp_turn_snaps: list[dict[str, Any]] = []
-        for t in range(max_turns):
-            active_prompts = [
-                s_turns[t] for s_turns in all_turns_per_sample if t < len(s_turns)
-            ]
-            turn_prompts = _unique_full_block_prompts(active_prompts, block_size)
-            _ = llm.generate(
-                [{"prompt_token_ids": p} for p in turn_prompts],
-                prefill_params,
-                use_tqdm=False,
-            )
-            llm.reset_prefix_cache()
-            snap = _collect_hbm_snapshot(llm, store, base_cuda_uncomp)
-            uncomp_turn_snaps.append(snap)
-            if t == 0:
-                uncomp_turn1_snap = snap
+        uncomp_turn_snaps: list[dict[str, Any]] = [
+            {
+                "hbm_store_cuda_allocated_bytes": 0,
+                "raw_bytes_equivalent": 0,
+                "compressed_bytes_stored": 0,
+                "tier_counts": {},
+            }
+            for _ in range(max_turns)
+        ]
+        comp_turn_snaps: list[dict[str, Any]] = [
+            {
+                "hbm_store_cuda_allocated_bytes": 0,
+                "raw_bytes_equivalent": 0,
+                "compressed_bytes_stored": 0,
+                "tier_counts": {},
+            }
+            for _ in range(max_turns)
+        ]
+        uncomp_outputs: list[Any] = []
+        comp_outputs: list[Any] = []
 
+        for w_idx in range(num_waves):
+            w_start = w_idx * wave_size
+            w_end = min(len(all_turns_per_sample), w_start + wave_size)
+            wave_turns = all_turns_per_sample[w_start:w_end]
+            wave_final_prompts = [s_turns[-1] for s_turns in wave_turns]
+
+            # ------------------------------------------------------------------
+            # 1. UNCOMPRESSED GPU HBM MODE (`force_uncompressed=True`)
+            # ------------------------------------------------------------------
+            llm.reset_prefix_cache()
+            base_cuda_uncomp = _configure_and_clear_all(
+                llm, store, force_uncompressed=True
+            )
+            last_uncomp_snap: dict[str, Any] = {
+                "hbm_store_cuda_allocated_bytes": 0,
+                "raw_bytes_equivalent": 0,
+                "compressed_bytes_stored": 0,
+                "tier_counts": {},
+            }
+            for t in range(max_turns):
+                active_prompts = [
+                    s_turns[t] for s_turns in wave_turns if t < len(s_turns)
+                ]
+                if active_prompts:
+                    turn_prompts = _unique_full_block_prompts(
+                        active_prompts, block_size
+                    )
+                    _ = llm.generate(
+                        [{"prompt_token_ids": p} for p in turn_prompts],
+                        prefill_params,
+                        use_tqdm=False,
+                    )
+                    llm.reset_prefix_cache()
+                    last_uncomp_snap = _collect_hbm_snapshot(
+                        llm, store, base_cuda_uncomp
+                    )
+                _accumulate_snap(uncomp_turn_snaps[t], last_uncomp_snap)
+
+            uncomp_outputs.extend(
+                llm.generate(
+                    [{"prompt_token_ids": p} for p in wave_final_prompts],
+                    eval_params,
+                    use_tqdm=False,
+                )
+            )
+
+            # ------------------------------------------------------------------
+            # 2. DELTA-COMPRESSED GPU HBM MODE (`force_uncompressed=False`)
+            # ------------------------------------------------------------------
+            llm.reset_prefix_cache()
+            base_cuda_comp = _configure_and_clear_all(
+                llm, store, force_uncompressed=False
+            )
+            last_comp_snap: dict[str, Any] = {
+                "hbm_store_cuda_allocated_bytes": 0,
+                "raw_bytes_equivalent": 0,
+                "compressed_bytes_stored": 0,
+                "tier_counts": {},
+            }
+            for t in range(max_turns):
+                active_prompts = [
+                    s_turns[t] for s_turns in wave_turns if t < len(s_turns)
+                ]
+                if active_prompts:
+                    turn_prompts = _unique_full_block_prompts(
+                        active_prompts, block_size
+                    )
+                    _ = llm.generate(
+                        [{"prompt_token_ids": p} for p in turn_prompts],
+                        prefill_params,
+                        use_tqdm=False,
+                    )
+                    llm.reset_prefix_cache()
+                    last_comp_snap = _collect_hbm_snapshot(llm, store, base_cuda_comp)
+                _accumulate_snap(comp_turn_snaps[t], last_comp_snap)
+
+            comp_outputs.extend(
+                llm.generate(
+                    [{"prompt_token_ids": p} for p in wave_final_prompts],
+                    eval_params,
+                    use_tqdm=False,
+                )
+            )
+
+            u_mb = uncomp_turn_snaps[-1]["hbm_store_cuda_allocated_bytes"] / (1024**2)
+            c_mb = comp_turn_snaps[-1]["hbm_store_cuda_allocated_bytes"] / (1024**2)
+            print(
+                f"  [{regime}] Wave {w_idx + 1}/{num_waves} "
+                f"(trajectories {w_start + 1}..{w_end}/{len(samples)}) done | "
+                f"Cumul Uncomp HBM: {u_mb:.1f} MB -> Delta HBM: {c_mb:.1f} MB "
+                f"({u_mb / max(c_mb, 1e-6):.2f}x)",
+                flush=True,
+            )
+
+        uncomp_turn1_snap = uncomp_turn_snaps[0]
         uncomp_total_snap = uncomp_turn_snaps[-1]
-
-        # Generate Final-Turn outputs under Uncompressed GPU HBM
-        final_turn_prompts = [s_turns[-1] for s_turns in all_turns_per_sample]
-        uncomp_outputs = llm.generate(
-            [{"prompt_token_ids": p} for p in final_turn_prompts],
-            eval_params,
-            use_tqdm=False,
-        )
-
-        # ------------------------------------------------------------------
-        # 2. DELTA-COMPRESSED GPU HBM MODE (`force_uncompressed=False`)
-        # ------------------------------------------------------------------
-        llm.reset_prefix_cache()
-        base_cuda_comp = _configure_and_clear_all(
-            llm, store, force_uncompressed=False
-        )
-        comp_turn_snaps: list[dict[str, Any]] = []
-        for t in range(max_turns):
-            active_prompts = [
-                s_turns[t] for s_turns in all_turns_per_sample if t < len(s_turns)
-            ]
-            turn_prompts = _unique_full_block_prompts(active_prompts, block_size)
-            _ = llm.generate(
-                [{"prompt_token_ids": p} for p in turn_prompts],
-                prefill_params,
-                use_tqdm=False,
-            )
-            llm.reset_prefix_cache()
-            snap = _collect_hbm_snapshot(llm, store, base_cuda_comp)
-            comp_turn_snaps.append(snap)
-            if t == 0:
-                comp_turn1_snap = snap
-
+        comp_turn1_snap = comp_turn_snaps[0]
         comp_total_snap = comp_turn_snaps[-1]
-
-        # Generate Final-Turn outputs reconstructed from Delta-Compressed GPU HBM
-        comp_outputs = llm.generate(
-            [{"prompt_token_ids": p} for p in final_turn_prompts],
-            eval_params,
-            use_tqdm=False,
-        )
 
         # Build turn-by-turn cumulative HBM progression
         turn_progression: list[dict[str, Any]] = []
