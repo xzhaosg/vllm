@@ -197,7 +197,7 @@ def build_gsm8k_samples(
         hasattr(tokenizer, "get_vocab") and "<|channel|>" in tokenizer.get_vocab()
     )
     samples: list[dict[str, Any]] = []
-    for i in range(min(num_samples, len(test_data))):
+    for i in range(len(test_data)):
         if is_harmony:
             q_text = (
                 f"Question: {test_data[i]['question']}\n"
@@ -227,6 +227,8 @@ def build_gsm8k_samples(
                 "question": test_data[i]["question"],
             }
         )
+        if len(samples) >= num_samples:
+            break
     return samples
 
 
@@ -591,10 +593,11 @@ def run_task_evaluation(
 
             done = len(base_scores)
             print(
-                f"  [{done:2d}/{len(samples)}] "
+                f"  [{done:4d}/{len(samples)}] "
                 f"Baseline Score: {sum(base_scores)/done*100:5.2f}% | "
                 f"Delta-Comp Score: {sum(recon_scores)/done*100:5.2f}% | "
-                f"Pred Agreement: {sum(pred_agreements)/done*100:5.2f}%"
+                f"Pred Agreement: {sum(pred_agreements)/done*100:5.2f}%",
+                flush=True,
             )
 
         overall_store_ratio = (base_uncomp_total + inc_uncomp_total) / max(
@@ -716,6 +719,8 @@ def main() -> None:
             kv_role="kv_both",
         ),
     }
+    if args.batch_size > 1:
+        llm_kwargs["max_num_batched_tokens"] = max(16384, args.batch_size * 1024)
     if args.mamba_ssm_cache_dtype != "auto":
         llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
     if args.disable_mm:
@@ -725,25 +730,41 @@ def main() -> None:
     resolved_block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
     store = get_shared_store()
 
-    gsm8k_samples = build_gsm8k_samples(
-        train_path,
-        test_path,
-        tokenizer,
-        num_samples=args.num_gsm8k,
-        block_size=resolved_block_size,
+    gsm8k_samples = (
+        build_gsm8k_samples(
+            train_path,
+            test_path,
+            tokenizer,
+            num_samples=args.num_gsm8k,
+            block_size=resolved_block_size,
+        )
+        if args.num_gsm8k > 0
+        else []
     )
-    coqa_samples = build_coqa_samples(
-        coqa_path,
-        tokenizer,
-        num_samples=args.num_coqa,
-        block_size=resolved_block_size,
+    coqa_samples = (
+        build_coqa_samples(
+            coqa_path,
+            tokenizer,
+            num_samples=args.num_coqa,
+            block_size=resolved_block_size,
+        )
+        if args.num_coqa > 0
+        else []
     )
 
+    gsm8k_avg = (
+        sum(len(s["token_ids"]) for s in gsm8k_samples) / len(gsm8k_samples)
+        if gsm8k_samples
+        else 0.0
+    )
+    coqa_avg = (
+        sum(len(s["token_ids"]) for s in coqa_samples) / len(coqa_samples)
+        if coqa_samples
+        else 0.0
+    )
     print(
-        f"Built {len(gsm8k_samples)} GSM8K samples "
-        f"(avg len={sum(len(s['token_ids']) for s in gsm8k_samples)/len(gsm8k_samples):.1f} toks) "
-        f"and {len(coqa_samples)} CoQA 4-turn samples "
-        f"(avg len={sum(len(s['token_ids']) for s in coqa_samples)/len(coqa_samples):.1f} toks)."
+        f"Built {len(gsm8k_samples)} GSM8K samples (avg len={gsm8k_avg:.1f} toks) "
+        f"and {len(coqa_samples)} CoQA 4-turn samples (avg len={coqa_avg:.1f} toks)."
     )
 
     gsm8k_params = SamplingParams(
@@ -772,12 +793,14 @@ def main() -> None:
         ],
     )
 
-    all_out = {
+    all_out: dict[str, Any] = {
         "model": args.model,
         "device": torch.cuda.get_device_name(0),
         "block_size": resolved_block_size,
         "num_turns": args.num_turns,
-        "gsm8k": run_task_evaluation(
+    }
+    if gsm8k_samples:
+        all_out["gsm8k"] = run_task_evaluation(
             llm=llm,
             store=store,
             samples=gsm8k_samples,
@@ -786,8 +809,9 @@ def main() -> None:
             num_turns=args.num_turns,
             block_size=resolved_block_size,
             batch_size=args.batch_size,
-        ),
-        "coqa": run_task_evaluation(
+        )
+    if coqa_samples:
+        all_out["coqa"] = run_task_evaluation(
             llm=llm,
             store=store,
             samples=coqa_samples,
@@ -796,8 +820,7 @@ def main() -> None:
             num_turns=args.num_turns,
             block_size=resolved_block_size,
             batch_size=args.batch_size,
-        ),
-    }
+        )
 
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(all_out, f, indent=2)

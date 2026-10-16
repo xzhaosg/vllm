@@ -396,6 +396,7 @@ class CompressedKVBlockRecord:
     start_position: int
     layer_idx: int
     is_mla: bool = False
+    prev_token_block_hash: str = ""
 
     # For UNCOMPRESSED_BASE:
     raw_k: torch.Tensor | None = None
@@ -645,6 +646,7 @@ class DeltaBlockStore:
         token_hash: str,
         start_position: int | None = None,
         exclude_hashes: set[str] | None = None,
+        prev_token_block_hash: str = "",
     ) -> CompressedKVBlockRecord | None:
         """Find the closest-position UNCOMPRESSED_BASE block with the same token_hash."""
         candidates = self._base_by_token_hash_list.get((layer_name, token_hash), [])
@@ -659,9 +661,22 @@ class DeltaBlockStore:
         ]
         if not valid:
             return None
-        if start_position is None or len(valid) == 1:
+        if len(valid) == 1:
             return valid[0]
-        return min(valid, key=lambda r: abs(start_position - r.start_position))
+        return min(
+            valid,
+            key=lambda r: (
+                0
+                if (
+                    prev_token_block_hash
+                    and r.prev_token_block_hash == prev_token_block_hash
+                )
+                else 1,
+                abs(start_position - r.start_position)
+                if start_position is not None
+                else 0,
+            ),
+        )
 
     def _find_partial_match_base_block(
         self,
@@ -669,6 +684,7 @@ class DeltaBlockStore:
         token_ids: tuple[int, ...],
         start_position: int | None = None,
         exclude_hashes: set[str] | None = None,
+        prev_token_block_hash: str = "",
     ) -> tuple[CompressedKVBlockRecord | None, list[int]]:
         """Find an UNCOMPRESSED_BASE block in the same layer differing in <= M tokens."""
         policy = self.get_layer_policy(layer_name)
@@ -685,7 +701,7 @@ class DeltaBlockStore:
         for s_idx, sub_tuple in self._get_pigeonhole_slices(token_ids, num_slices):
             bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
             if bucket:
-                for rec in bucket[-8:]:
+                for rec in bucket[-32:]:
                     if exclude_hashes and rec.full_block_hash in exclude_hashes:
                         continue
                     if rec.full_block_hash not in seen_hashes:
@@ -694,6 +710,7 @@ class DeltaBlockStore:
 
         best_base: CompressedKVBlockRecord | None = None
         best_diff_indices: list[int] = []
+        best_score: tuple[int, int] = (999, 999)
 
         for base_rec in candidates:
             if len(base_rec.token_ids) != len(token_ids):
@@ -709,10 +726,20 @@ class DeltaBlockStore:
                 if t_a != t_b
             ]
             if 0 < len(diff_idx) <= max_exceptions:
-                if best_base is None or len(diff_idx) < len(best_diff_indices):
+                prev_match = (
+                    0
+                    if (
+                        prev_token_block_hash
+                        and base_rec.prev_token_block_hash == prev_token_block_hash
+                    )
+                    else 1
+                )
+                score = (prev_match, len(diff_idx))
+                if best_base is None or score < best_score:
                     best_base = base_rec
                     best_diff_indices = diff_idx
-                    if len(diff_idx) == 1:
+                    best_score = score
+                    if score == (0, 1):
                         break
         return best_base, best_diff_indices
 
@@ -726,6 +753,7 @@ class DeltaBlockStore:
         v_block: torch.Tensor | None = None,
         divergence_distance: int | None = None,
         exclude_base_hashes: set[str] | None = None,
+        prev_token_block_hash: str = "",
     ) -> CompressedKVBlockRecord:
         """Compress and store a single KV cache block using the 4-tier policy.
 
@@ -774,6 +802,7 @@ class DeltaBlockStore:
             token_hash,
             start_position=start_position,
             exclude_hashes=exclude_base_hashes,
+            prev_token_block_hash=prev_token_block_hash,
         )
         if base_rec is not None:
             delta_pos = start_position - base_rec.start_position
@@ -996,6 +1025,7 @@ class DeltaBlockStore:
             token_tuple,
             start_position=start_position,
             exclude_hashes=exclude_base_hashes,
+            prev_token_block_hash=prev_token_block_hash,
         )
         if partial_base is not None and diff_indices:
             assert partial_base.raw_k is not None
@@ -1187,6 +1217,7 @@ class DeltaBlockStore:
             start_position=start_position,
             layer_idx=policy.layer_idx,
             is_mla=is_mla,
+            prev_token_block_hash=prev_token_block_hash,
             raw_k=k_cpu.clone(),
             raw_v=v_cpu.clone() if v_cpu is not None else None,
         )
@@ -1353,6 +1384,7 @@ class DeltaBlockTransferSpec:
     divergence_distance: int | None = None
     group_block_ids: tuple[int | None, ...] = ()
     group_running_block_ids: tuple[int | None, ...] = ()
+    prev_token_block_hash: str = ""
 
 
 @dataclass
@@ -1766,6 +1798,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         num_full_blocks = min(len(token_ids) // self._block_size, max_avail_blocks)
         specs: list[DeltaBlockTransferSpec] = []
         parent_hash = "ROOT"
+        prev_tok_hash = ""
         divergence_distance: int | None = 0
 
         for b_idx in range(num_full_blocks):
@@ -1816,9 +1849,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     physical_block_id=phys_id,
                     divergence_distance=divergence_distance,
                     group_block_ids=grp_ids,
+                    prev_token_block_hash=prev_tok_hash,
                 )
             )
             parent_hash = full_hash
+            prev_tok_hash = token_hash
         return specs
 
     def get_num_new_matched_tokens(
@@ -2517,10 +2552,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         num_blocks = self._get_kv_layer_num_blocks(
             kv_layer, is_mla=is_mla, block_size=self._block_size
         )
+        step_new_base_hashes: set[str] = set()
         for req_meta in metadata.requests:
             if not req_meta.is_store:
                 continue
-            req_new_base_hashes: set[str] = set()
             for blk_spec in req_meta.blocks:
                 phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                 if phys_blk_id is None or phys_blk_id >= num_blocks:
@@ -2546,10 +2581,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     k_block=k_blk,
                     v_block=v_blk,
                     divergence_distance=blk_spec.divergence_distance,
-                    exclude_base_hashes=req_new_base_hashes,
+                    exclude_base_hashes=step_new_base_hashes,
+                    prev_token_block_hash=blk_spec.prev_token_block_hash,
                 )
                 if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
-                    req_new_base_hashes.add(blk_spec.full_block_hash)
+                    step_new_base_hashes.add(blk_spec.full_block_hash)
 
     def wait_for_save(self) -> None:
         """Save any Mamba/GDN recurrent state layers not visited by @maybe_transfer_kv_layer."""
@@ -2590,8 +2626,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             num_blocks = self._get_kv_layer_num_blocks(
                 kv_tensor, is_mla=False, block_size=self._block_size
             )
+            step_new_base_hashes: set[str] = set()
             for req_meta in store_reqs:
-                req_new_base_hashes: set[str] = set()
                 for blk_spec in req_meta.blocks:
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                     if (
@@ -2614,9 +2650,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         k_block=k_blk,
                         v_block=v_blk,
                         divergence_distance=blk_spec.divergence_distance,
-                        exclude_base_hashes=req_new_base_hashes,
+                        exclude_base_hashes=step_new_base_hashes,
+                        prev_token_block_hash=blk_spec.prev_token_block_hash,
                     )
                     if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
-                        req_new_base_hashes.add(blk_spec.full_block_hash)
+                        step_new_base_hashes.add(blk_spec.full_block_hash)
 
         self._layers_saved_in_step.clear()
