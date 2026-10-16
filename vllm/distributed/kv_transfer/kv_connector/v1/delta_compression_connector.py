@@ -507,6 +507,7 @@ class DeltaBlockStore:
         tau_int4: float = 0.85,
         max_sparse_exceptions: int = 4,
         device: str = "cpu",
+        force_uncompressed: bool = False,
     ):
         self.block_size = block_size
         self.default_rope_theta = default_rope_theta
@@ -518,6 +519,7 @@ class DeltaBlockStore:
         self.tau_int4 = tau_int4
         self.max_sparse_exceptions = max_sparse_exceptions
         self.device = device
+        self.force_uncompressed = force_uncompressed
 
         # Layer name -> LayerCompressionPolicy
         self.layer_policies: dict[str, LayerCompressionPolicy] = {}
@@ -569,6 +571,8 @@ class DeltaBlockStore:
         self._known_mamba_blocks.clear()
         self._clear_epoch += 1
         self.stats = DeltaCompressionStats()
+        if str(self.device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def register_scheduled_store_block(
         self,
@@ -788,8 +792,13 @@ class DeltaBlockStore:
         policy = self.get_layer_policy(layer_name)
         is_mla = v_block is None and not policy.is_mamba
 
-        k_cpu = k_block.detach().to(self.device)
-        v_cpu = v_block.detach().to(self.device) if v_block is not None else None
+        target_dev = (
+            k_block.device
+            if str(self.device).startswith("cuda")
+            else self.device
+        )
+        k_cpu = k_block.detach().to(target_dev)
+        v_cpu = v_block.detach().to(target_dev) if v_block is not None else None
 
         raw_bytes = k_cpu.numel() * k_cpu.element_size()
         if v_cpu is not None:
@@ -801,12 +810,16 @@ class DeltaBlockStore:
             self._known_mamba_blocks.add(full_block_hash)
 
         # 1. Check for an UNCOMPRESSED_BASE block with the exact same token_block_hash
-        base_rec = self._find_exact_base_block(
-            layer_name,
-            token_hash,
-            start_position=start_position,
-            exclude_hashes=exclude_base_hashes,
-            prev_token_block_hash=prev_token_block_hash,
+        base_rec = (
+            None
+            if self.force_uncompressed
+            else self._find_exact_base_block(
+                layer_name,
+                token_hash,
+                start_position=start_position,
+                exclude_hashes=exclude_base_hashes,
+                prev_token_block_hash=prev_token_block_hash,
+            )
         )
         if base_rec is not None:
             delta_pos = start_position - base_rec.start_position
@@ -1024,12 +1037,16 @@ class DeltaBlockStore:
                 return self._commit_record(layer_name, record, raw_bytes)
 
         # 2. Check for Regime R2: Intra-block partial token edit (<= M tokens changed)
-        partial_base, diff_indices = self._find_partial_match_base_block(
-            layer_name,
-            token_tuple,
-            start_position=start_position,
-            exclude_hashes=exclude_base_hashes,
-            prev_token_block_hash=prev_token_block_hash,
+        partial_base, diff_indices = (
+            (None, [])
+            if self.force_uncompressed
+            else self._find_partial_match_base_block(
+                layer_name,
+                token_tuple,
+                start_position=start_position,
+                exclude_hashes=exclude_base_hashes,
+                prev_token_block_hash=prev_token_block_hash,
+            )
         )
         if partial_base is not None and diff_indices:
             assert partial_base.raw_k is not None
@@ -1153,7 +1170,7 @@ class DeltaBlockStore:
                     all_sparse_indices.sort()
 
                 idx_tensor = torch.tensor(
-                    all_sparse_indices, dtype=torch.long, device=self.device
+                    all_sparse_indices, dtype=torch.long, device=k_cpu.device
                 )
 
                 # Zero out the sparse BF16 rows in the residual so their large outliers do not
@@ -1446,6 +1463,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         tau_int2 = float(extra_config.get("tau_int2", 0.12))
         tau_int4 = float(extra_config.get("tau_int4", 0.85))
         max_sparse_exceptions = int(extra_config.get("max_sparse_exceptions", 4))
+        store_device = str(extra_config.get("store_device", "cpu"))
+        force_uncompressed = bool(extra_config.get("force_uncompressed", False))
 
         if engine_id not in self._shared_stores:
             self._shared_stores[engine_id] = DeltaBlockStore(
@@ -1456,6 +1475,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 tau_int2=tau_int2,
                 tau_int4=tau_int4,
                 max_sparse_exceptions=max_sparse_exceptions,
+                device=store_device,
+                force_uncompressed=force_uncompressed,
             )
         self.store: DeltaBlockStore = self._shared_stores[engine_id]
         self._requests_need_load: dict[str, tuple["Request", int, int]] = {}
