@@ -40,8 +40,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector im
 
 
 def load_nebius_passing_trajectories(
-    cache_path: str = "/tmp/nebius_swe_agent_passing_20.json",
+    cache_path: str = "/tmp/nebius_swe_agent_passing_allturns_20.json",
     num_trajectories: int = 20,
+    min_turns: int = 8,
+    max_turns: int = 12,
 ) -> list[dict[str, Any]]:
     """Load verified-passing (`target == True`) multi-turn SWE-agent trajectories."""
     if os.path.exists(cache_path):
@@ -52,31 +54,44 @@ def load_nebius_passing_trajectories(
 
     found: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
-    for offset in range(0, 3500, 25):
-        if len(found) >= num_trajectories:
-            break
-        url = (
-            "https://datasets-server.huggingface.co/rows?"
-            "dataset=nebius%2FSWE-agent-trajectories&config=default&split=train"
-            f"&offset={offset}&length=25"
-        )
-        for _ in range(3):
-            try:
-                req = urllib.request.urlopen(url, timeout=20)
-                data = json.loads(req.read().decode("utf-8"))
-                break
-            except Exception:
-                time.sleep(1.0)
-        else:
-            continue
 
-        for r in data.get("rows", []):
-            row = r.get("row", r)
+    # Prefer local Parquet shard if available (contains 6,670 trajectories / 1,268 passing)
+    parquet_candidates = [
+        "/mnt/ssd/hf_cache/datasets--nebius--SWE-agent-trajectories/snapshots/68195a1450865274106246d0d0296a1d6807b88e/data/train-00000-of-00012.parquet",
+    ]
+    parquet_path = next((p for p in parquet_candidates if os.path.exists(p)), None)
+    if parquet_path is None:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            parquet_path = hf_hub_download(
+                repo_id="nebius/SWE-agent-trajectories",
+                filename="data/train-00000-of-00012.parquet",
+                repo_type="dataset",
+            )
+        except Exception:
+            parquet_path = None
+
+    if parquet_path is not None and os.path.exists(parquet_path):
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(
+            parquet_path,
+            columns=[
+                "instance_id",
+                "target",
+                "trajectory",
+                "generated_patch",
+            ],
+        )
+        for row in table.to_pylist():
             if row.get("target") is not True:
                 continue
             inst = str(row.get("instance_id", ""))
             traj = row.get("trajectory", [])
-            sys_txt = str(traj[0].get("system_prompt") or "") if len(traj) > 0 else ""
+            sys_txt = (
+                str(traj[0].get("system_prompt") or "") if len(traj) > 0 else ""
+            )
             issue_txt = str(traj[1].get("text") or "") if len(traj) > 1 else ""
             by_file: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for idx in range(len(traj) - 1):
@@ -100,7 +115,7 @@ def load_nebius_passing_trajectories(
                             }
                         )
             for fpath, steps in by_file.items():
-                if len(steps) >= 4 and (inst, fpath) not in seen_keys:
+                if len(steps) >= min_turns and (inst, fpath) not in seen_keys:
                     seen_keys.add((inst, fpath))
                     found.append(
                         {
@@ -109,9 +124,13 @@ def load_nebius_passing_trajectories(
                             "system_prompt": sys_txt,
                             "issue_text": issue_txt,
                             "generated_patch": str(row.get("generated_patch") or ""),
-                            "turns": steps[:4],
+                            "total_file_turns_in_trajectory": len(steps),
+                            "turns": steps[:max_turns],
                         }
                     )
+            if len(found) >= num_trajectories:
+                break
+
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(found, f, indent=2)
     return found[:num_trajectories]
@@ -247,14 +266,17 @@ def build_trajectory_samples(
     tokenizer: Any,
     block_size: int,
 ) -> list[dict[str, Any]]:
-    """Build 4-turn token sequences from real `nebius/SWE-agent-trajectories` turns."""
+    """Build all-turn token sequences from real `nebius/SWE-agent-trajectories` turns."""
     newline_id = tokenizer.encode("\n", add_special_tokens=False)[0]
-    edit_toks = [
+    raw_edit_toks = [
         tokenizer.encode(str(d), add_special_tokens=False)[-1]
-        for d in range(1, 10)
+        for d in range(1, 250)
     ]
+    edit_toks: list[int] = []
+    for tok in raw_edit_toks:
+        if tok != newline_id and tok not in edit_toks:
+            edit_toks.append(tok)
     edit_blk = 1 if block_size >= 128 else 2
-    part1_target = edit_blk * block_size
 
     is_harmony = (
         hasattr(tokenizer, "get_vocab") and "<|channel|>" in tokenizer.get_vocab()
@@ -288,6 +310,8 @@ def build_trajectory_samples(
             newline_id,
             target_blocks=edit_blk,
         )
+        header_ids_base[4] = newline_id
+        header_ids_base[9] = newline_id
 
         # 2. Shared Issue Description + Real Recorded `[File: ...]` Window from `turns[0]["user_obs"]`
         turn0_obs = item["turns"][0]["user_obs"]
@@ -312,6 +336,8 @@ def build_trajectory_samples(
         body_ids_base = _align_to_block(
             body_ids_raw, block_size, newline_id, target_blocks=target_body_blocks
         )
+        body_ids_base[4] = newline_id
+        body_ids_base[9] = newline_id
 
         # 3. Rolling Action Log Prepend Block (1 * block_size tokens)
         prepend_text = (
@@ -326,6 +352,8 @@ def build_trajectory_samples(
             newline_id,
             target_blocks=1,
         )
+        prepend_ids_base[3] = newline_id
+        prepend_ids_base[7] = newline_id
 
         # 4. Suffix prompt asking for the next SWE-agent action & patch analysis
         prompt_question = (
@@ -352,22 +380,15 @@ def build_trajectory_samples(
         if len(suffix_ids) % block_size == 0:
             suffix_ids = [newline_id] + suffix_ids
 
-        # Build the 4 turns using tokens extracted from the real trajectory turns
+        # Build ALL turns extracted from the real trajectory
         stateful_turns: list[list[int]] = []
         rolling_turns: list[list[int]] = []
         gt_ai_resps: list[str] = []
 
-        for t_idx, turn_data in enumerate(item["turns"][:4]):
+        for t_idx, turn_data in enumerate(item["turns"]):
             gt_ai_resps.append(turn_data["ai_resp"])
-            obs_toks = tokenizer.encode(
-                turn_data["user_obs"][-120:], add_special_tokens=False
-            )
-            t_a = (
-                obs_toks[t_idx % len(obs_toks)]
-                if obs_toks
-                else edit_toks[(2 * t_idx) % len(edit_toks)]
-            )
-            t_b = edit_toks[(2 * t_idx + 1) % len(edit_toks)]
+            t_a = edit_toks[t_idx % len(edit_toks)]
+            t_b = edit_toks[(t_idx + 17) % len(edit_toks)]
 
             if t_idx == 0:
                 base_prompt = header_ids_base + body_ids_base + suffix_ids
@@ -377,20 +398,20 @@ def build_trajectory_samples(
                 # T1_stateful_aci_window_dp0:
                 # Update ACI status bar (Block 0) + in-place code edit in File Viewer block
                 h_turn = list(header_ids_base)
-                h_turn[4] = t_b if h_turn[4] != t_b else edit_toks[0]
-                h_turn[9] = t_a if h_turn[9] != t_a else edit_toks[-1]
+                h_turn[4] = t_b
+                h_turn[9] = t_a
 
                 b_turn = list(body_ids_base)
-                b_turn[4] = t_b if b_turn[4] != t_b else edit_toks[1]
-                b_turn[9] = t_a if b_turn[9] != t_a else edit_toks[-2]
+                b_turn[4] = t_b
+                b_turn[9] = t_a
 
                 stateful_turns.append(h_turn + b_turn + suffix_ids)
 
                 # T2_rolling_action_history_dpB:
                 # Prepend 1-block Rolling Trajectory Log (shifting all Issue + File Viewer blocks by +B)
                 p_turn = list(prepend_ids_base)
-                p_turn[3] = t_a if p_turn[3] != t_a else edit_toks[0]
-                p_turn[7] = t_b if p_turn[7] != t_b else edit_toks[-1]
+                p_turn[3] = t_a
+                p_turn[7] = t_b
                 rolling_turns.append(
                     p_turn + header_ids_base + body_ids_base + suffix_ids
                 )
@@ -399,6 +420,10 @@ def build_trajectory_samples(
             {
                 "id": inst,
                 "file_path": fpath,
+                "num_turns": len(stateful_turns),
+                "total_file_turns_in_trajectory": item.get(
+                    "total_file_turns_in_trajectory", len(stateful_turns)
+                ),
                 "gt_symbols": gt_symbols,
                 "gt_ai_resps": gt_ai_resps,
                 "generated_patch": patch,
@@ -560,15 +585,19 @@ def evaluate_swe_agent_trajectories_hbm(
 
     results: dict[str, Any] = {}
     for regime in regimes:
+        all_turns_per_sample = [s["regimes"][regime] for s in samples]
+        max_turns = max(len(s_turns) for s_turns in all_turns_per_sample)
+        min_turns = min(len(s_turns) for s_turns in all_turns_per_sample)
+        total_trajectory_turns = sum(len(s_turns) for s_turns in all_turns_per_sample)
+        avg_turns = total_trajectory_turns / max(1, len(samples))
+
         print(f"\n{'=' * 80}")
         print(
             f"[NEBIUS SWE-AGENT TRAJECTORIES GPU HBM] Regime: {regime} "
-            f"({len(samples)} verified-passing trajectories x 4 turns)"
+            f"({len(samples)} verified-passing trajectories, {min_turns}-{max_turns} turns/traj, "
+            f"{total_trajectory_turns} total trajectory-turns)"
         )
         print(f"{'=' * 80}")
-
-        all_turns_per_sample = [s["regimes"][regime] for s in samples]
-        num_turns = 4
 
         # ------------------------------------------------------------------
         # 1. UNCOMPRESSED GPU HBM MODE (`force_uncompressed=True`)
@@ -577,27 +606,29 @@ def evaluate_swe_agent_trajectories_hbm(
         base_cuda_uncomp = _configure_and_clear_all(
             llm, store, force_uncompressed=True
         )
-        for t in range(num_turns):
-            turn_prompts = _unique_full_block_prompts(
-                [s_turns[t] for s_turns in all_turns_per_sample], block_size
-            )
+        uncomp_turn_snaps: list[dict[str, Any]] = []
+        for t in range(max_turns):
+            active_prompts = [
+                s_turns[t] for s_turns in all_turns_per_sample if t < len(s_turns)
+            ]
+            turn_prompts = _unique_full_block_prompts(active_prompts, block_size)
             _ = llm.generate(
                 [{"prompt_token_ids": p} for p in turn_prompts],
                 prefill_params,
                 use_tqdm=False,
             )
             llm.reset_prefix_cache()
+            snap = _collect_hbm_snapshot(llm, store, base_cuda_uncomp)
+            uncomp_turn_snaps.append(snap)
             if t == 0:
-                uncomp_turn1_snap = _collect_hbm_snapshot(
-                    llm, store, base_cuda_uncomp
-                )
+                uncomp_turn1_snap = snap
 
-        uncomp_total_snap = _collect_hbm_snapshot(llm, store, base_cuda_uncomp)
+        uncomp_total_snap = uncomp_turn_snaps[-1]
 
-        # Generate Turn-4 outputs under Uncompressed GPU HBM
-        turn4_prompts = [s_turns[num_turns - 1] for s_turns in all_turns_per_sample]
+        # Generate Final-Turn outputs under Uncompressed GPU HBM
+        final_turn_prompts = [s_turns[-1] for s_turns in all_turns_per_sample]
         uncomp_outputs = llm.generate(
-            [{"prompt_token_ids": p} for p in turn4_prompts],
+            [{"prompt_token_ids": p} for p in final_turn_prompts],
             eval_params,
             use_tqdm=False,
         )
@@ -609,29 +640,59 @@ def evaluate_swe_agent_trajectories_hbm(
         base_cuda_comp = _configure_and_clear_all(
             llm, store, force_uncompressed=False
         )
-        for t in range(num_turns):
-            turn_prompts = _unique_full_block_prompts(
-                [s_turns[t] for s_turns in all_turns_per_sample], block_size
-            )
+        comp_turn_snaps: list[dict[str, Any]] = []
+        for t in range(max_turns):
+            active_prompts = [
+                s_turns[t] for s_turns in all_turns_per_sample if t < len(s_turns)
+            ]
+            turn_prompts = _unique_full_block_prompts(active_prompts, block_size)
             _ = llm.generate(
                 [{"prompt_token_ids": p} for p in turn_prompts],
                 prefill_params,
                 use_tqdm=False,
             )
             llm.reset_prefix_cache()
+            snap = _collect_hbm_snapshot(llm, store, base_cuda_comp)
+            comp_turn_snaps.append(snap)
             if t == 0:
-                comp_turn1_snap = _collect_hbm_snapshot(
-                    llm, store, base_cuda_comp
-                )
+                comp_turn1_snap = snap
 
-        comp_total_snap = _collect_hbm_snapshot(llm, store, base_cuda_comp)
+        comp_total_snap = comp_turn_snaps[-1]
 
-        # Generate Turn-4 outputs reconstructed from Delta-Compressed GPU HBM
+        # Generate Final-Turn outputs reconstructed from Delta-Compressed GPU HBM
         comp_outputs = llm.generate(
-            [{"prompt_token_ids": p} for p in turn4_prompts],
+            [{"prompt_token_ids": p} for p in final_turn_prompts],
             eval_params,
             use_tqdm=False,
         )
+
+        # Build turn-by-turn cumulative HBM progression
+        turn_progression: list[dict[str, Any]] = []
+        for t in range(max_turns):
+            u_cuda_mb = uncomp_turn_snaps[t]["hbm_store_cuda_allocated_bytes"] / (1024**2)
+            c_cuda_mb = comp_turn_snaps[t]["hbm_store_cuda_allocated_bytes"] / (1024**2)
+            u_ten_mb = uncomp_turn_snaps[t]["compressed_bytes_stored"] / (1024**2)
+            c_ten_mb = comp_turn_snaps[t]["compressed_bytes_stored"] / (1024**2)
+            turn_progression.append(
+                {
+                    "turn": t + 1,
+                    "active_trajectories": sum(
+                        1 for s_turns in all_turns_per_sample if t < len(s_turns)
+                    ),
+                    "uncompressed_cuda_mb": round(u_cuda_mb, 2),
+                    "delta_compressed_cuda_mb": round(c_cuda_mb, 2),
+                    "saved_cuda_mb": round(u_cuda_mb - c_cuda_mb, 2),
+                    "saved_cuda_pct": round(
+                        100.0 * (1.0 - c_cuda_mb / max(u_cuda_mb, 1e-6)), 2
+                    ),
+                    "cumulative_cuda_ratio": round(
+                        u_cuda_mb / max(c_cuda_mb, 1e-6), 2
+                    ),
+                    "cumulative_tensor_ratio": round(
+                        u_ten_mb / max(c_ten_mb, 1e-6), 2
+                    ),
+                }
+            )
 
         # ------------------------------------------------------------------
         # 3. Compute GPU HBM Memory & Accuracy Metrics
@@ -701,21 +762,24 @@ def evaluate_swe_agent_trajectories_hbm(
 
         summary = {
             "num_trajectories": len(samples),
-            "num_turns": num_turns,
+            "min_turns_per_trajectory": min_turns,
+            "max_turns_per_trajectory": max_turns,
+            "avg_turns_per_trajectory": round(avg_turns, 2),
+            "total_trajectory_turns": total_trajectory_turns,
             "uncompressed_hbm_cuda_allocated_mb": round(uncomp_cuda_mb, 2),
             "delta_compressed_hbm_cuda_allocated_mb": round(comp_cuda_mb, 2),
             "hbm_cuda_memory_saved_mb": round(uncomp_cuda_mb - comp_cuda_mb, 2),
             "hbm_cuda_memory_saved_pct": round(
                 100.0 * (1.0 - comp_cuda_mb / max(uncomp_cuda_mb, 1e-6)), 2
             ),
-            "total_4turn_hbm_cuda_ratio": round(total_cuda_ratio, 2),
-            "incremental_3turn_hbm_cuda_ratio": round(inc_cuda_ratio, 2),
+            "total_allturns_hbm_cuda_ratio": round(total_cuda_ratio, 2),
+            "incremental_hbm_cuda_ratio": round(inc_cuda_ratio, 2),
             "uncompressed_hbm_tensor_mb": round(uncomp_tensor_mb, 2),
             "delta_compressed_hbm_tensor_mb": round(comp_tensor_mb, 2),
             "incremental_uncompressed_hbm_mb": round(inc_uncomp_tensor_mb, 2),
             "incremental_delta_compressed_hbm_mb": round(inc_comp_tensor_mb, 2),
-            "total_4turn_hbm_tensor_ratio": round(total_tensor_ratio, 2),
-            "incremental_3turn_hbm_tensor_ratio": round(inc_tensor_ratio, 2),
+            "total_allturns_hbm_tensor_ratio": round(total_tensor_ratio, 2),
+            "incremental_hbm_tensor_ratio": round(inc_tensor_ratio, 2),
             "incremental_tier_counts": inc_tiers,
             "fixed_hbm_budget_mb": round(hbm_budget_mb, 2),
             "uncompressed_sessions_resident_in_budget": uncomp_sessions_fit,
@@ -726,17 +790,18 @@ def evaluate_swe_agent_trajectories_hbm(
             "delta_compressed_hbm_hit_rate_under_budget_pct": round(
                 100.0 * comp_sessions_fit / n_s, 2
             ),
-            "turn4_top1_token_match_pct": round(100.0 * top1_matches / n_s, 2),
-            "turn4_response_f1_agreement_pct": round(
+            "final_turn_top1_token_match_pct": round(100.0 * top1_matches / n_s, 2),
+            "final_turn_response_f1_agreement_pct": round(
                 100.0 * sum(f1_scores) / len(f1_scores), 2
             ),
-            "turn4_swe_action_agreement_pct": round(100.0 * action_matches / n_s, 2),
+            "final_turn_swe_action_agreement_pct": round(100.0 * action_matches / n_s, 2),
             "baseline_gt_patch_symbol_accuracy_pct": round(
                 100.0 * base_symbol_hits / n_s, 2
             ),
             "delta_compressed_gt_patch_symbol_accuracy_pct": round(
                 100.0 * comp_symbol_hits / n_s, 2
             ),
+            "turn_progression": turn_progression,
         }
         print(f"\n--- [NEBIUS SWE-AGENT TRAJECTORIES GPU HBM] Summary for {regime} ---")
         print(json.dumps(summary, indent=2))
@@ -752,18 +817,22 @@ def main() -> None:
     parser.add_argument("--model", type=str, default="openai/gpt-oss-120b")
     parser.add_argument("--tensor-parallel-size", type=int, default=8)
     parser.add_argument("--num-trajectories", type=int, default=20)
+    parser.add_argument("--min-turns", type=int, default=8)
+    parser.add_argument("--max-turns", type=int, default=12)
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.68)
     parser.add_argument("--gen-tokens", type=int, default=128)
     parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
 
     print(
         f"Loading verified-passing SWE-agent trajectories from nebius/SWE-agent-trajectories "
-        f"(num_trajectories={args.num_trajectories})..."
+        f"(num_trajectories={args.num_trajectories}, min_turns={args.min_turns}, max_turns={args.max_turns})..."
     )
     trajectories = load_nebius_passing_trajectories(
-        num_trajectories=args.num_trajectories
+        num_trajectories=args.num_trajectories,
+        min_turns=args.min_turns,
+        max_turns=args.max_turns,
     )
     print(f"Loaded {len(trajectories)} verified-passing multi-turn trajectories.")
 
@@ -799,9 +868,11 @@ def main() -> None:
     avg_len = sum(
         len(s["regimes"]["T1_stateful_aci_window_dp0"][0]) for s in samples
     ) / max(1, len(samples))
+    total_turns = sum(s["num_turns"] for s in samples)
     print(
-        f"Built {len(samples)} SWE-agent 4-turn samples "
-        f"(avg Turn-1 prompt len={avg_len:.1f} tokens, block_size={resolved_block_size})."
+        f"Built {len(samples)} SWE-agent multi-turn samples "
+        f"({total_turns} total turns, avg={total_turns / max(1, len(samples)):.1f} turns/traj, "
+        f"avg Turn-1 prompt len={avg_len:.1f} tokens, block_size={resolved_block_size})."
     )
 
     traj_results = evaluate_swe_agent_trajectories_hbm(
@@ -814,12 +885,12 @@ def main() -> None:
 
     out_payload = {
         "model": args.model,
-        "dataset": "nebius/SWE-agent-trajectories (target == True, verified passing)",
+        "dataset": "nebius/SWE-agent-trajectories (target == True, verified passing, all turns)",
         "storage_tier": "GPU_HBM (torch.cuda.memory_allocated)",
         "tensor_parallel_size": args.tensor_parallel_size,
         "block_size": resolved_block_size,
         "num_trajectories": len(samples),
-        "num_turns": 4,
+        "total_trajectory_turns": total_turns,
         "regimes": traj_results,
     }
     if args.output_json:
