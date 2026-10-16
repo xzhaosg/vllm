@@ -551,6 +551,7 @@ class DeltaBlockStore:
         self._known_token_blocks: dict[str, str] = {}
         # Set of full_block_hashes materialized in Mamba/GDN recurrent state layers
         self._known_mamba_blocks: set[str] = set()
+        self._clear_epoch: int = 0
 
         self.stats = DeltaCompressionStats()
 
@@ -564,7 +565,22 @@ class DeltaBlockStore:
         self._known_prefix_blocks.clear()
         self._known_token_blocks.clear()
         self._known_mamba_blocks.clear()
+        self._clear_epoch += 1
         self.stats = DeltaCompressionStats()
+
+    def register_scheduled_store_block(
+        self,
+        full_block_hash: str,
+        token_ids: tuple[int, ...] | list[int],
+        start_position: int,
+    ) -> None:
+        """Record scheduled store block hashes on the Scheduler side for multi-process TP/PP."""
+        token_tuple = tuple(int(t) for t in token_ids)
+        token_hash = compute_token_block_hash(token_tuple)
+        self._known_prefix_blocks[full_block_hash] = (token_tuple, start_position)
+        self._known_token_blocks.setdefault(token_hash, full_block_hash)
+        if self.has_mamba_layers:
+            self._known_mamba_blocks.add(full_block_hash)
 
     @staticmethod
     def _get_pigeonhole_slices(
@@ -1353,6 +1369,7 @@ class DeltaConnectorMetadata(KVConnectorMetadata):
     """Metadata container passed from Scheduler to Worker on each step."""
 
     requests: list[DeltaRequestMeta] = field(default_factory=list)
+    clear_epoch: int = 0
 
 
 class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
@@ -1703,6 +1720,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> None:
         super().bind_connector_metadata(connector_metadata)
         self._layers_saved_in_step.clear()
+        if isinstance(connector_metadata, DeltaConnectorMetadata):
+            if connector_metadata.clear_epoch > self.store._clear_epoch:
+                self.store.clear()
+                self.store._clear_epoch = connector_metadata.clear_epoch
 
     def clear_connector_metadata(self) -> None:
         super().clear_connector_metadata()
@@ -1852,7 +1873,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        meta = DeltaConnectorMetadata()
+        meta = DeltaConnectorMetadata(clear_epoch=self.store._clear_epoch)
 
         for fin_id in getattr(scheduler_output, "finished_req_ids", ()) or ():
             self._inflight_req_state.pop(fin_id, None)
@@ -1987,6 +2008,15 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         token_ids,
                         group_lists,
                         len(specs),
+                    )
+
+        for req_meta in meta.requests:
+            if req_meta.is_store:
+                for blk_spec in req_meta.blocks:
+                    self.store.register_scheduled_store_block(
+                        blk_spec.full_block_hash,
+                        blk_spec.token_ids,
+                        blk_spec.start_position,
                     )
 
         self._requests_need_load.clear()

@@ -154,6 +154,47 @@ def get_shared_store() -> DeltaBlockStore:
     )
 
 
+def _worker_get_store_stats(worker: Any) -> dict[str, Any]:
+    if DeltaCompressionConnector._shared_stores:
+        w_store = next(iter(DeltaCompressionConnector._shared_stores.values()))
+        return {
+            "raw_bytes_equivalent": w_store.stats.raw_bytes_equivalent,
+            "compressed_bytes_stored": w_store.stats.compressed_bytes_stored,
+            "tier_counts": {k.name: v for k, v in w_store.stats.tier_counts.items()},
+        }
+    return {
+        "raw_bytes_equivalent": 0,
+        "compressed_bytes_stored": 0,
+        "tier_counts": {},
+    }
+
+
+def get_store_stats_snapshot(
+    llm: LLM, store: DeltaBlockStore
+) -> tuple[int, int, dict[str, int]]:
+    """Return (raw_bytes_equivalent, compressed_bytes_stored, tier_counts) across all TP workers."""
+    if store.stats.total_blocks_stored > 0:
+        return (
+            store.stats.raw_bytes_equivalent,
+            store.stats.compressed_bytes_stored,
+            {k.name: v for k, v in store.stats.tier_counts.items()},
+        )
+    worker_stats = llm.collective_rpc(_worker_get_store_stats)
+    if not worker_stats:
+        return 0, 0, {}
+    raw_bytes = sum(w["raw_bytes_equivalent"] for w in worker_stats)
+    comp_bytes = sum(w["compressed_bytes_stored"] for w in worker_stats)
+    num_w = len(worker_stats)
+    all_tiers: set[str] = set()
+    for w in worker_stats:
+        all_tiers.update(w["tier_counts"].keys())
+    tiers = {
+        t: round(sum(w["tier_counts"].get(t, 0) for w in worker_stats) / num_w)
+        for t in all_tiers
+    }
+    return raw_bytes, comp_bytes, tiers
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -172,6 +213,7 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--gen-tokens", type=int, default=16)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--mamba-ssm-cache-dtype", type=str, default="auto")
     parser.add_argument("--disable-mm", action="store_true")
@@ -197,6 +239,7 @@ def main() -> None:
 
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
+        "tensor_parallel_size": args.tensor_parallel_size,
         "block_size": 16,
         "enable_prefix_caching": True,
         "async_scheduling": False,
@@ -338,9 +381,7 @@ def main() -> None:
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
                 use_tqdm=False,
             )
-            base_uncomp = store.stats.raw_bytes_equivalent
-            base_comp = store.stats.compressed_bytes_stored
-            base_tiers = {k.name: v for k, v in store.stats.tier_counts.items()}
+            base_uncomp, base_comp, base_tiers = get_store_stats_snapshot(llm, store)
 
             for turn_ids in turns[1:]:
                 llm.reset_prefix_cache()
@@ -349,9 +390,9 @@ def main() -> None:
                     sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
                     use_tqdm=False,
                 )
-            total_uncomp = store.stats.raw_bytes_equivalent
-            total_comp = store.stats.compressed_bytes_stored
-            total_tiers = {k.name: v for k, v in store.stats.tier_counts.items()}
+            total_uncomp, total_comp, total_tiers = get_store_stats_snapshot(
+                llm, store
+            )
 
             # Record incremental target compression stats across Turns 2..N
             inc_uncomp = total_uncomp - base_uncomp

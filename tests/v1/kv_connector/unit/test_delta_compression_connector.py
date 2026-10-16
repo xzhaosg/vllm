@@ -1231,6 +1231,66 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         )
         self.assertEqual(rec_same.tier, CompressionTier.UNCOMPRESSED_BASE)
 
+    def test_multiprocess_tp_scheduler_worker_store_separation(self) -> None:
+        """Verifies TP>1 multi-process separation between Scheduler and Worker stores."""
+        DeltaCompressionConnector.reset_shared_stores()
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16, enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                engine_id="test_engine_tp8",
+                kv_connector_extra_config={},
+            ),
+        )
+        sched_conn = KVConnectorFactory.create_connector(
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config=None  # type: ignore[arg-type]
+        )
+        worker_conn = KVConnectorFactory.create_connector(
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config=None  # type: ignore[arg-type]
+        )
+        assert isinstance(sched_conn, DeltaCompressionConnector)
+        assert isinstance(worker_conn, DeltaCompressionConnector)
+        # Simulate a separate worker subprocess with its own DeltaBlockStore instance
+        worker_conn._store = DeltaBlockStore(block_size=16)
+
+        toks = list(range(100, 136))
+        req1 = SimpleNamespace(request_id="tp-req-1", prompt_token_ids=toks)
+        m1, _ = sched_conn.get_num_new_matched_tokens(req1, 0)  # type: ignore[arg-type]
+        self.assertEqual(m1, 0)
+        sched_conn.update_state_after_alloc(req1, mock.MagicMock(), 0)  # type: ignore[arg-type]
+        sched_out1 = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="tp-req-1",
+                    prompt_token_ids=toks,
+                    block_ids=([1, 2, 3],),
+                )
+            ]
+        )
+        meta1 = sched_conn.build_connector_meta(sched_out1)  # type: ignore[arg-type]
+        # Scheduler store must already know the prefix hashes even before worker runs
+        req2 = SimpleNamespace(request_id="tp-req-2", prompt_token_ids=toks)
+        m2, _ = sched_conn.get_num_new_matched_tokens(req2, 0)  # type: ignore[arg-type]
+        self.assertEqual(m2, 32)
+
+        # Worker saves its TP KV shard into its own isolated store
+        kv_shard = torch.randn(2, 8, 16, 1, 64, dtype=torch.bfloat16)
+        worker_conn.bind_connector_metadata(meta1)
+        worker_conn.save_kv_layer("model.layers.0.attn", kv_shard, mock.MagicMock())
+        worker_conn.clear_connector_metadata()
+        self.assertEqual(worker_conn.store.stats.total_blocks_stored, 2)
+        self.assertEqual(sched_conn.store.stats.total_blocks_stored, 0)
+
+        # Clear on Scheduler store propagates clear_epoch to Worker on next step
+        sched_conn.store.clear()
+        m3, _ = sched_conn.get_num_new_matched_tokens(req2, 0)  # type: ignore[arg-type]
+        self.assertEqual(m3, 0)
+        meta2 = sched_conn.build_connector_meta(SimpleNamespace(scheduled_new_reqs=[]))  # type: ignore[arg-type]
+        worker_conn.bind_connector_metadata(meta2)
+        self.assertEqual(worker_conn.store.stats.total_blocks_stored, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
