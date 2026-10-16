@@ -526,6 +526,20 @@ def get_store_stats_snapshot(
 # ==============================================================================
 
 
+def _unique_full_block_prompts(
+    token_lists: list[list[int]], block_size: int
+) -> list[TokensPrompt]:
+    seen: set[tuple[int, ...]] = set()
+    out: list[TokensPrompt] = []
+    for toks in token_lists:
+        n_full = (len(toks) // block_size) * block_size
+        key = tuple(toks[:n_full])
+        if key not in seen:
+            seen.add(key)
+            out.append(TokensPrompt(prompt_token_ids=toks))
+    return out
+
+
 def run_task_evaluation(
     llm: LLM,
     store: DeltaBlockStore,
@@ -587,7 +601,9 @@ def run_task_evaluation(
             store.clear()
             llm.reset_prefix_cache()
             _ = llm.generate(
-                final_prompts,
+                _unique_full_block_prompts(
+                    [t[-1] for t in batch_turns], block_size
+                ),
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
                 use_tqdm=False,
             )
@@ -602,7 +618,9 @@ def run_task_evaluation(
             store.clear()
             llm.reset_prefix_cache()
             _ = llm.generate(
-                [TokensPrompt(prompt_token_ids=t[0]) for t in batch_turns],
+                _unique_full_block_prompts(
+                    [t[0] for t in batch_turns], block_size
+                ),
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
                 use_tqdm=False,
             )
@@ -611,10 +629,9 @@ def run_task_evaluation(
             for t_idx in range(1, num_turns):
                 llm.reset_prefix_cache()
                 _ = llm.generate(
-                    [
-                        TokensPrompt(prompt_token_ids=t[t_idx])
-                        for t in batch_turns
-                    ],
+                    _unique_full_block_prompts(
+                        [t[t_idx] for t in batch_turns], block_size
+                    ),
                     sampling_params=SamplingParams(
                         temperature=0.0, max_tokens=1
                     ),
@@ -801,7 +818,7 @@ def main() -> None:
         ),
     }
     if args.batch_size > 1:
-        llm_kwargs["max_num_batched_tokens"] = max(16384, args.batch_size * 1024)
+        llm_kwargs["max_num_batched_tokens"] = 16384
     if args.mamba_ssm_cache_dtype != "auto":
         llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
     if args.disable_mm:
