@@ -556,6 +556,10 @@ class DeltaBlockStore:
         self._known_mamba_blocks: set[str] = set()
         self._has_mamba_config: bool = False
         self._clear_epoch: int = 0
+        # Compact GPU HBM byte-slab sub-allocator to avoid PyTorch CUDACachingAllocator's
+        # 512-byte minimum allocation rounding on small quantized scale/index tensors:
+        self._gpu_slabs: dict[torch.device, list[torch.Tensor]] = {}
+        self._gpu_slab_offsets: dict[torch.device, int] = {}
 
         self.stats = DeltaCompressionStats()
 
@@ -569,10 +573,42 @@ class DeltaBlockStore:
         self._known_prefix_blocks.clear()
         self._known_token_blocks.clear()
         self._known_mamba_blocks.clear()
+        self._gpu_slabs.clear()
+        self._gpu_slab_offsets.clear()
         self._clear_epoch += 1
         self.stats = DeltaCompressionStats()
         if str(self.device).startswith("cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _pack_cuda_tensor(self, t: torch.Tensor) -> torch.Tensor:
+        """Pack a CUDA tensor into a contiguous 256 KB uint8 slab arena.
+
+        Eliminates PyTorch CUDACachingAllocator's 512-byte minimum block rounding
+        for small quantized scale and sparse index tensors stored in GPU HBM.
+        """
+        if not t.is_cuda or t.numel() == 0:
+            return t
+        dev = t.device
+        elem_size = t.element_size()
+        nbytes = t.numel() * elem_size
+        slab_size = 262144  # 256 KB (exact multiple of 512B allocator block)
+        if nbytes >= slab_size:
+            return t.contiguous()
+        slabs = self._gpu_slabs.setdefault(dev, [])
+        off = self._gpu_slab_offsets.get(dev, slab_size)
+        aligned_off = (off + elem_size - 1) & ~(elem_size - 1)
+        if not slabs or aligned_off + nbytes > slab_size:
+            slabs.append(torch.empty(slab_size, dtype=torch.uint8, device=dev))
+            aligned_off = 0
+        slab = slabs[-1]
+        view = (
+            slab[aligned_off : aligned_off + nbytes]
+            .view(t.dtype)
+            .reshape(t.shape)
+        )
+        view.copy_(t)
+        self._gpu_slab_offsets[dev] = aligned_off + nbytes
+        return view
 
     def register_scheduled_store_block(
         self,
@@ -1266,6 +1302,33 @@ class DeltaBlockStore:
         record: CompressedKVBlockRecord,
         raw_bytes: int,
     ) -> CompressedKVBlockRecord:
+        if str(self.device).startswith("cuda"):
+            if record.raw_k is not None:
+                record.raw_k = self._pack_cuda_tensor(record.raw_k)
+            if record.raw_v is not None:
+                record.raw_v = self._pack_cuda_tensor(record.raw_v)
+            if record.quant_delta_k is not None:
+                record.quant_delta_k.packed_data = self._pack_cuda_tensor(
+                    record.quant_delta_k.packed_data
+                )
+                record.quant_delta_k.scales = self._pack_cuda_tensor(
+                    record.quant_delta_k.scales
+                )
+            if record.quant_delta_v is not None:
+                record.quant_delta_v.packed_data = self._pack_cuda_tensor(
+                    record.quant_delta_v.packed_data
+                )
+                record.quant_delta_v.scales = self._pack_cuda_tensor(
+                    record.quant_delta_v.scales
+                )
+            if record.sparse_token_indices is not None:
+                record.sparse_token_indices = self._pack_cuda_tensor(
+                    record.sparse_token_indices
+                )
+            if record.sparse_k_bf16 is not None:
+                record.sparse_k_bf16 = self._pack_cuda_tensor(record.sparse_k_bf16)
+            if record.sparse_v_bf16 is not None:
+                record.sparse_v_bf16 = self._pack_cuda_tensor(record.sparse_v_bf16)
         self._records[(layer_name, record.full_block_hash)] = record
         self.stats.total_blocks_stored += 1
         self.stats.raw_bytes_equivalent += raw_bytes

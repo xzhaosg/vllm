@@ -75,18 +75,39 @@ def extract_target_file_from_patch(patch_str: str) -> str:
 
 
 def load_swebench_verified(max_rows: int = 100) -> list[dict[str, Any]]:
-    from huggingface_hub import hf_hub_download
-    import pandas as pd
+    import urllib.request
 
-    parquet_path = hf_hub_download(
-        repo_id="princeton-nlp/SWE-bench_Verified",
-        filename="data/test-00000-of-00001.parquet",
-        repo_type="dataset",
-    )
-    df = pd.read_parquet(parquet_path)
+    cache_path = "/tmp/swebench_verified_test.json"
+    rows: list[dict[str, Any]] = []
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                rows = json.load(f)
+        except Exception:
+            rows = []
+
+    if len(rows) < max_rows:
+        rows = []
+        offset = 0
+        while len(rows) < max_rows:
+            length = min(100, max_rows - len(rows))
+            url = (
+                "https://datasets-server.huggingface.co/rows?"
+                f"dataset=princeton-nlp%2FSWE-bench_Verified&config=default"
+                f"&split=test&offset={offset}&length={length}"
+            )
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            batch = [r["row"] for r in data.get("rows", [])]
+            if not batch:
+                break
+            rows.extend(batch)
+            offset += len(batch)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+
     records: list[dict[str, Any]] = []
-    for idx in range(min(len(df), max_rows)):
-        row = df.iloc[idx]
+    for row in rows[:max_rows]:
         records.append(
             {
                 "instance_id": str(row["instance_id"]),
@@ -117,12 +138,21 @@ def build_swebench_samples(
     ]
     edit_blk = 1 if block_size >= 128 else 2
     part1_target = edit_blk * block_size
+    if block_size >= 128:
+        max_prompt_blocks = min(max_prompt_blocks, 4)
 
     ctx_header = (
         "ID: 300000000 | Workspace Snapshot: 400000000\n"
         "[SWE-Agent Repository Index & Test Runner Environment Initialized]\n"
         "Use git diff conventions and identify the exact file and function to patch.\n\n"
     )
+    if block_size >= 128 and len(records) > 1:
+        for aux_item in records[-6:]:
+            ctx_header += (
+                f"Reference Example ({aux_item['instance_id']}): "
+                f"Target File: `{aux_item['target_file']}`\n"
+                f"{aux_item['problem_statement'][:400]}\n\n"
+            )
     ctx_ids_raw = tokenizer.encode(ctx_header, add_special_tokens=False)
     if len(ctx_ids_raw) < block_size:
         ctx_ids = ctx_ids_raw + [newline_id] * (block_size - len(ctx_ids_raw))
@@ -150,6 +180,11 @@ def build_swebench_samples(
             f"Base Commit: {item['base_commit']}\n"
             f"Candidate File Under Inspection: {item['target_file']}\n\n"
         )
+        if block_size >= 128:
+            header_text += (
+                f"### Issue Overview ({item['instance_id']})\n"
+                f"{item['problem_statement'][:2000]}\n\n"
+            )
         header_ids = tokenizer.encode(header_text, add_special_tokens=False)
         if len(header_ids) < part1_target:
             part1_ids = header_ids + [newline_id] * (part1_target - len(header_ids))
