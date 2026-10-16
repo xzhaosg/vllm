@@ -1253,7 +1253,7 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         assert isinstance(sched_conn, DeltaCompressionConnector)
         assert isinstance(worker_conn, DeltaCompressionConnector)
         # Simulate a separate worker subprocess with its own DeltaBlockStore instance
-        worker_conn._store = DeltaBlockStore(block_size=16)
+        worker_conn.store = DeltaBlockStore(block_size=16)
 
         toks = list(range(100, 136))
         req1 = SimpleNamespace(request_id="tp-req-1", prompt_token_ids=toks)
