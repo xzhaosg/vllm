@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector import (
     CompressionTier,
     DeltaBlockStore,
+    DeltaBlockTransferSpec,
     DeltaCompressionConnector,
     LayerCompressionPolicy,
     apply_relative_rope_rotation,
@@ -1290,6 +1291,162 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         meta2 = sched_conn.build_connector_meta(SimpleNamespace(scheduled_new_reqs=[]))  # type: ignore[arg-type]
         worker_conn.bind_connector_metadata(meta2)
         self.assertEqual(worker_conn.store.stats.total_blocks_stored, 0)
+
+    def test_batched_store_and_reconstruct_equivalence(self) -> None:
+        """Verifies store_blocks_batch and reconstruct_blocks_batch match single-block execution."""
+        torch.manual_seed(99)
+        store_single = DeltaBlockStore(block_size=16)
+        store_batch = DeltaBlockStore(block_size=16)
+        layer_name = "model.layers.8.self_attn.attn"
+        pol = LayerCompressionPolicy(
+            layer_idx=8,
+            rope_theta=1000000.0,
+            tau_zero_bit=0.05,
+            tau_int2=0.18,
+            tau_int4=0.70,
+        )
+        store_single.register_layer_policy(layer_name, pol)
+        store_batch.register_layer_policy(layer_name, pol)
+
+        # Create 3 base blocks + 4 shifted/perturbed target blocks covering TIER0, TIER1, TIER2, TIER3
+        tok0 = tuple(range(100, 116))
+        tok1 = tuple(range(200, 216))
+        tok2 = tuple(range(300, 316))
+        k0 = torch.randn(16, 4, 128, dtype=torch.bfloat16)
+        v0 = torch.randn(16, 4, 128, dtype=torch.bfloat16)
+        k1 = torch.randn(16, 4, 128, dtype=torch.bfloat16)
+        v1 = torch.randn(16, 4, 128, dtype=torch.bfloat16)
+        k2 = torch.randn(16, 4, 128, dtype=torch.bfloat16)
+        v2 = torch.randn(16, 4, 128, dtype=torch.bfloat16)
+
+        # Shifted K0 (+32 pos): TIER0_IDENTICAL
+        k0_shift = apply_relative_rope_rotation(k0, 32, rope_theta=1000000.0)
+        v0_shift = v0.clone()
+
+        # Shifted K1 (+16 pos) + small perturbation (eta ~ 0.10): TIER1_INT2_DELTA
+        k1_shift = apply_relative_rope_rotation(k1, 16, rope_theta=1000000.0) + 0.08 * torch.randn_like(k1)
+        v1_shift = v1 + 0.08 * torch.randn_like(v1)
+
+        # Shifted K2 (+48 pos) + moderate perturbation (eta ~ 0.30): TIER2_INT4_DELTA
+        k2_shift = apply_relative_rope_rotation(k2, 48, rope_theta=1000000.0) + 0.25 * torch.randn_like(k2)
+        v2_shift = v2 + 0.25 * torch.randn_like(v2)
+
+        # Partial token edit (1 token changed in tok2): TIER3_SPARSE_BF16_INT4_DELTA
+        tok2_edit = (9999,) + tok2[1:]
+        k2_edit = k2_shift.clone()
+        v2_edit = v2_shift.clone()
+        k2_edit[0] = torch.randn(4, 128, dtype=torch.bfloat16)
+        v2_edit[0] = torch.randn(4, 128, dtype=torch.bfloat16)
+
+        base_items = [
+            (
+                DeltaBlockTransferSpec(
+                    physical_block_id=0,
+                    full_block_hash="h_base_0",
+                    token_ids=tok0,
+                    start_position=0,
+                ),
+                k0,
+                v0,
+            ),
+            (
+                DeltaBlockTransferSpec(
+                    physical_block_id=1,
+                    full_block_hash="h_base_1",
+                    token_ids=tok1,
+                    start_position=16,
+                ),
+                k1,
+                v1,
+            ),
+            (
+                DeltaBlockTransferSpec(
+                    physical_block_id=2,
+                    full_block_hash="h_base_2",
+                    token_ids=tok2,
+                    start_position=32,
+                ),
+                k2,
+                v2,
+            ),
+        ]
+        target_items = [
+            (
+                DeltaBlockTransferSpec(
+                    physical_block_id=3,
+                    full_block_hash="h_t0",
+                    token_ids=tok0,
+                    start_position=32,
+                ),
+                k0_shift,
+                v0_shift,
+            ),
+            (
+                DeltaBlockTransferSpec(
+                    physical_block_id=4,
+                    full_block_hash="h_t1",
+                    token_ids=tok1,
+                    start_position=32,
+                ),
+                k1_shift,
+                v1_shift,
+            ),
+            (
+                DeltaBlockTransferSpec(
+                    physical_block_id=5,
+                    full_block_hash="h_t2",
+                    token_ids=tok2,
+                    start_position=80,
+                ),
+                k2_shift,
+                v2_shift,
+            ),
+            (
+                DeltaBlockTransferSpec(
+                    physical_block_id=6,
+                    full_block_hash="h_t3",
+                    token_ids=tok2_edit,
+                    start_position=80,
+                ),
+                k2_edit,
+                v2_edit,
+            ),
+        ]
+
+        recs_single_base = [
+            store_single.store_block(
+                layer_name, spec.full_block_hash, spec.token_ids, spec.start_position, kb, vb
+            )
+            for (spec, kb, vb) in base_items
+        ]
+        recs_batch_base = store_batch.store_blocks_batch(layer_name, base_items)
+
+        recs_single_target = [
+            store_single.store_block(
+                layer_name, spec.full_block_hash, spec.token_ids, spec.start_position, kb, vb
+            )
+            for (spec, kb, vb) in target_items
+        ]
+        recs_batch_target = store_batch.store_blocks_batch(layer_name, target_items)
+
+        for r_s, r_b in zip(
+            recs_single_base + recs_single_target, recs_batch_base + recs_batch_target
+        ):
+            self.assertEqual(r_s.tier, r_b.tier)
+            self.assertEqual(r_s.nbytes, r_b.nbytes)
+
+        all_specs = [spec for (spec, _, _) in base_items + target_items]
+        recons_single = [
+            store_single.reconstruct_block(
+                layer_name, spec.full_block_hash, spec.token_ids, spec.start_position
+            )
+            for spec in all_specs
+        ]
+        recons_batch = store_batch.reconstruct_blocks_batch(layer_name, all_specs)
+        for (ks, vs), (kb, vb) in zip(recons_single, recons_batch):
+            self.assertTrue(torch.allclose(ks, kb, atol=1e-3, rtol=1e-3))
+            assert vs is not None and vb is not None
+            self.assertTrue(torch.allclose(vs, vb, atol=1e-3, rtol=1e-3))
 
 
 if __name__ == "__main__":

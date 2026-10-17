@@ -78,6 +78,133 @@ def compute_full_prefix_block_hash(
     return safe_hash(raw_bytes, usedforsecurity=False).hexdigest()
 
 
+_ROPE_COS_SIN_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+_INT2_SPARSE_CODEBOOK_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_int2_sparse_codebook(device: torch.device) -> torch.Tensor:
+    cb = _INT2_SPARSE_CODEBOOK_CACHE.get(device)
+    if cb is None:
+        cb = torch.tensor(
+            [-1.0, 0.0, 0.38, 1.0], dtype=torch.float32, device=device
+        )
+        _INT2_SPARSE_CODEBOOK_CACHE[device] = cb
+    return cb
+
+
+def _get_cached_rope_cos_sin(
+    device: torch.device,
+    delta_pos: int,
+    r_dim: int,
+    head_dim: int,
+    rope_theta: float,
+    rope_scaling: dict[str, Any] | None,
+    k_rot_ndim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r_type = (
+        (rope_scaling.get("rope_type") or rope_scaling.get("type"))
+        if isinstance(rope_scaling, dict)
+        else None
+    )
+    scale_key = (
+        (
+            r_type,
+            float(rope_scaling.get("factor", 1.0)),
+            float(rope_scaling.get("partial_rotary_factor", 1.0)),
+            int(rope_scaling.get("original_max_position_embeddings", 4096)),
+            float(rope_scaling.get("beta_fast", 32.0)),
+            float(rope_scaling.get("beta_slow", 1.0)),
+            bool(rope_scaling.get("truncate", True)),
+        )
+        if isinstance(rope_scaling, dict)
+        else None
+    )
+    cache_key = (
+        device,
+        int(delta_pos),
+        r_dim,
+        head_dim,
+        float(rope_theta),
+        scale_key,
+        k_rot_ndim,
+    )
+    cached = _ROPE_COS_SIN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    half_dim = r_dim // 2
+    if delta_pos == 0:
+        shape = (1, 1, half_dim) if k_rot_ndim == 3 else (1, half_dim)
+        cos_val = torch.ones(shape, dtype=torch.float32, device=device)
+        sin_val = torch.zeros(shape, dtype=torch.float32, device=device)
+        _ROPE_COS_SIN_CACHE[cache_key] = (cos_val, sin_val)
+        return cos_val, sin_val
+
+    if r_type == "proportional" and isinstance(rope_scaling, dict):
+        partial_factor = float(rope_scaling.get("partial_rotary_factor", 1.0))
+        rope_angles = int(partial_factor * head_dim) // 2
+        nope_angles = half_dim - rope_angles
+        freq_seq = torch.arange(0, rope_angles, dtype=torch.float32, device=device)
+        pos_freqs = rope_theta ** (freq_seq / float(half_dim))
+        inv_freq_rot = 1.0 / pos_freqs
+        inv_freq = (
+            torch.cat(
+                [
+                    inv_freq_rot,
+                    torch.zeros(nope_angles, dtype=torch.float32, device=device),
+                ]
+            )
+            if nope_angles > 0
+            else inv_freq_rot
+        )
+    else:
+        freq_seq = torch.arange(0, half_dim, dtype=torch.float32, device=device)
+        pos_freqs = rope_theta ** (freq_seq / float(half_dim))
+        inv_freq = 1.0 / pos_freqs
+
+    if isinstance(rope_scaling, dict):
+        factor = float(rope_scaling.get("factor", 1.0))
+        if r_type in ("yarn", "deepseek_yarn") and factor > 1.0:
+            orig_max_pos = int(
+                rope_scaling.get("original_max_position_embeddings", 4096)
+            )
+            beta_fast = float(rope_scaling.get("beta_fast", 32.0))
+            beta_slow = float(rope_scaling.get("beta_slow", 1.0))
+            truncate = bool(rope_scaling.get("truncate", True))
+
+            def _yarn_corr_dim(num_rot: float) -> float:
+                return (
+                    r_dim * math.log(orig_max_pos / (num_rot * 2.0 * math.pi))
+                ) / (2.0 * math.log(rope_theta))
+
+            low = _yarn_corr_dim(beta_fast)
+            high = _yarn_corr_dim(beta_slow)
+            if truncate:
+                low = float(math.floor(low))
+                high = float(math.ceil(high))
+            low = max(low, 0.0)
+            high = min(high, float(r_dim - 1))
+            denom = (high - low) if high != low else 0.001
+            ramp = torch.clamp((freq_seq - low) / denom, 0.0, 1.0)
+            inv_freq_mask = 1.0 - ramp
+            inv_freq_interp = 1.0 / (factor * pos_freqs)
+            inv_freq = (
+                inv_freq_interp * (1.0 - inv_freq_mask) + inv_freq * inv_freq_mask
+            )
+        elif r_type == "linear" and factor > 0.0:
+            inv_freq = inv_freq / factor
+
+    angles = (float(delta_pos) * inv_freq).unsqueeze(0)
+    if k_rot_ndim == 3:
+        angles = angles.unsqueeze(1)
+    cos_val = torch.cos(angles)
+    sin_val = torch.sin(angles)
+    if len(_ROPE_COS_SIN_CACHE) > 4096:
+        _ROPE_COS_SIN_CACHE.clear()
+    _ROPE_COS_SIN_CACHE[cache_key] = (cos_val, sin_val)
+    return cos_val, sin_val
+
+
 def apply_relative_rope_rotation(
     k_tensor: torch.Tensor,
     delta_pos: int | torch.Tensor,
@@ -132,82 +259,85 @@ def apply_relative_rope_rotation(
     k_fp32 = k_tensor.to(torch.float32)
     k_rot = k_fp32[..., :r_dim]
     k_pass = k_fp32[..., r_dim:]
-
     half_dim = r_dim // 2
-    if r_type == "proportional" and isinstance(rope_scaling, dict):
-        partial_factor = float(rope_scaling.get("partial_rotary_factor", 1.0))
-        rope_angles = int(partial_factor * head_dim) // 2
-        nope_angles = half_dim - rope_angles
-        freq_seq = torch.arange(
-            0, rope_angles, dtype=torch.float32, device=k_tensor.device
-        )
-        pos_freqs = rope_theta ** (freq_seq / float(half_dim))
-        inv_freq_rot = 1.0 / pos_freqs
-        inv_freq = (
-            torch.cat(
-                [
-                    inv_freq_rot,
-                    torch.zeros(
-                        nope_angles, dtype=torch.float32, device=k_tensor.device
-                    ),
-                ]
-            )
-            if nope_angles > 0
-            else inv_freq_rot
-        )
-    else:
-        freq_seq = torch.arange(
-            0, half_dim, dtype=torch.float32, device=k_tensor.device
-        )
-        pos_freqs = rope_theta ** (freq_seq / float(half_dim))
-        inv_freq = 1.0 / pos_freqs
-
-    if isinstance(rope_scaling, dict):
-        factor = float(rope_scaling.get("factor", 1.0))
-        if r_type in ("yarn", "deepseek_yarn") and factor > 1.0:
-            orig_max_pos = int(
-                rope_scaling.get("original_max_position_embeddings", 4096)
-            )
-            beta_fast = float(rope_scaling.get("beta_fast", 32.0))
-            beta_slow = float(rope_scaling.get("beta_slow", 1.0))
-            truncate = bool(rope_scaling.get("truncate", True))
-
-            def _yarn_corr_dim(num_rot: float) -> float:
-                return (
-                    r_dim * math.log(orig_max_pos / (num_rot * 2.0 * math.pi))
-                ) / (2.0 * math.log(rope_theta))
-
-            low = _yarn_corr_dim(beta_fast)
-            high = _yarn_corr_dim(beta_slow)
-            if truncate:
-                low = float(math.floor(low))
-                high = float(math.ceil(high))
-            low = max(low, 0.0)
-            high = min(high, float(r_dim - 1))
-            denom = (high - low) if high != low else 0.001
-            ramp = torch.clamp((freq_seq - low) / denom, 0.0, 1.0)
-            inv_freq_mask = 1.0 - ramp
-            inv_freq_interp = 1.0 / (factor * pos_freqs)
-            inv_freq = (
-                inv_freq_interp * (1.0 - inv_freq_mask) + inv_freq * inv_freq_mask
-            )
-        elif r_type == "linear" and factor > 0.0:
-            inv_freq = inv_freq / factor
 
     if isinstance(delta_pos, int):
-        pos_tensor = torch.tensor(
-            [float(delta_pos)], dtype=torch.float32, device=k_tensor.device
+        cos_val, sin_val = _get_cached_rope_cos_sin(
+            device=k_tensor.device,
+            delta_pos=delta_pos,
+            r_dim=r_dim,
+            head_dim=head_dim,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            k_rot_ndim=k_rot.ndim,
         )
     else:
+        if r_type == "proportional" and isinstance(rope_scaling, dict):
+            partial_factor = float(rope_scaling.get("partial_rotary_factor", 1.0))
+            rope_angles = int(partial_factor * head_dim) // 2
+            nope_angles = half_dim - rope_angles
+            freq_seq = torch.arange(
+                0, rope_angles, dtype=torch.float32, device=k_tensor.device
+            )
+            pos_freqs = rope_theta ** (freq_seq / float(half_dim))
+            inv_freq_rot = 1.0 / pos_freqs
+            inv_freq = (
+                torch.cat(
+                    [
+                        inv_freq_rot,
+                        torch.zeros(
+                            nope_angles, dtype=torch.float32, device=k_tensor.device
+                        ),
+                    ]
+                )
+                if nope_angles > 0
+                else inv_freq_rot
+            )
+        else:
+            freq_seq = torch.arange(
+                0, half_dim, dtype=torch.float32, device=k_tensor.device
+            )
+            pos_freqs = rope_theta ** (freq_seq / float(half_dim))
+            inv_freq = 1.0 / pos_freqs
+
+        if isinstance(rope_scaling, dict):
+            factor = float(rope_scaling.get("factor", 1.0))
+            if r_type in ("yarn", "deepseek_yarn") and factor > 1.0:
+                orig_max_pos = int(
+                    rope_scaling.get("original_max_position_embeddings", 4096)
+                )
+                beta_fast = float(rope_scaling.get("beta_fast", 32.0))
+                beta_slow = float(rope_scaling.get("beta_slow", 1.0))
+                truncate = bool(rope_scaling.get("truncate", True))
+
+                def _yarn_corr_dim(num_rot: float) -> float:
+                    return (
+                        r_dim * math.log(orig_max_pos / (num_rot * 2.0 * math.pi))
+                    ) / (2.0 * math.log(rope_theta))
+
+                low = _yarn_corr_dim(beta_fast)
+                high = _yarn_corr_dim(beta_slow)
+                if truncate:
+                    low = float(math.floor(low))
+                    high = float(math.ceil(high))
+                low = max(low, 0.0)
+                high = min(high, float(r_dim - 1))
+                denom = (high - low) if high != low else 0.001
+                ramp = torch.clamp((freq_seq - low) / denom, 0.0, 1.0)
+                inv_freq_mask = 1.0 - ramp
+                inv_freq_interp = 1.0 / (factor * pos_freqs)
+                inv_freq = (
+                    inv_freq_interp * (1.0 - inv_freq_mask) + inv_freq * inv_freq_mask
+                )
+            elif r_type == "linear" and factor > 0.0:
+                inv_freq = inv_freq / factor
+
         pos_tensor = delta_pos.to(dtype=torch.float32, device=k_tensor.device)
-
-    # Broadcast angles to [num_tokens, 1, half_dim] or [num_tokens, half_dim]
-    angles = torch.outer(pos_tensor.reshape(-1), inv_freq)
-    if k_rot.ndim == 3:
-        angles = angles.unsqueeze(1)
-
-    cos_val = torch.cos(angles)
-    sin_val = torch.sin(angles)
+        angles = torch.outer(pos_tensor.reshape(-1), inv_freq)
+        if k_rot.ndim == 3:
+            angles = angles.unsqueeze(1)
+        cos_val = torch.cos(angles)
+        sin_val = torch.sin(angles)
 
     if is_neox_style:
         x1 = k_rot[..., :half_dim]
@@ -220,6 +350,85 @@ def apply_relative_rope_rotation(
         x2 = k_rot[..., 1::2]
         out1 = x1 * cos_val - x2 * sin_val
         out2 = x1 * sin_val + x2 * cos_val
+        k_rot_out = torch.stack([out1, out2], dim=-1).flatten(-2)
+
+    if r_dim < head_dim:
+        k_out = torch.cat([k_rot_out, k_pass], dim=-1)
+    else:
+        k_out = k_rot_out
+    return k_out.to(orig_dtype)
+
+
+def apply_relative_rope_rotation_batch(
+    k_batch: torch.Tensor,
+    delta_pos_list: list[int],
+    rope_theta: float = 10000.0,
+    rotary_dim: int | None = None,
+    is_neox_style: bool = True,
+    rope_scaling: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """Apply relative RoPE rotation across a batch of N blocks `[N, *block_shape]`."""
+    n = len(delta_pos_list)
+    if n == 0 or all(d == 0 for d in delta_pos_list):
+        return k_batch.clone()
+    if n == 1:
+        return apply_relative_rope_rotation(
+            k_batch[0],
+            delta_pos=delta_pos_list[0],
+            rope_theta=rope_theta,
+            rotary_dim=rotary_dim,
+            is_neox_style=is_neox_style,
+            rope_scaling=rope_scaling,
+        ).unsqueeze(0)
+
+    orig_dtype = k_batch.dtype
+    head_dim = k_batch.shape[-1]
+    r_type = (
+        (rope_scaling.get("rope_type") or rope_scaling.get("type"))
+        if isinstance(rope_scaling, dict)
+        else None
+    )
+    if r_type == "proportional":
+        r_dim = 0 if (rotary_dim is not None and rotary_dim <= 0) else head_dim
+    else:
+        r_dim = head_dim if rotary_dim is None else min(rotary_dim, head_dim)
+    if r_dim <= 0:
+        return k_batch.clone()
+
+    k_fp32 = k_batch.to(torch.float32)
+    k_rot = k_fp32[..., :r_dim]
+    k_pass = k_fp32[..., r_dim:]
+    half_dim = r_dim // 2
+    single_ndim = k_rot.ndim - 1
+
+    cos_list: list[torch.Tensor] = []
+    sin_list: list[torch.Tensor] = []
+    for d in delta_pos_list:
+        c, s = _get_cached_rope_cos_sin(
+            device=k_batch.device,
+            delta_pos=d,
+            r_dim=r_dim,
+            head_dim=head_dim,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            k_rot_ndim=single_ndim,
+        )
+        cos_list.append(c)
+        sin_list.append(s)
+    cos_batch = torch.stack(cos_list, dim=0)
+    sin_batch = torch.stack(sin_list, dim=0)
+
+    if is_neox_style:
+        x1 = k_rot[..., :half_dim]
+        x2 = k_rot[..., half_dim : 2 * half_dim]
+        out1 = x1 * cos_batch - x2 * sin_batch
+        out2 = x1 * sin_batch + x2 * cos_batch
+        k_rot_out = torch.cat([out1, out2], dim=-1)
+    else:
+        x1 = k_rot[..., 0::2]
+        x2 = k_rot[..., 1::2]
+        out1 = x1 * cos_batch - x2 * sin_batch
+        out2 = x1 * sin_batch + x2 * cos_batch
         k_rot_out = torch.stack([out1, out2], dim=-1).flatten(-2)
 
     if r_dim < head_dim:
@@ -372,9 +581,7 @@ def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Te
         unpacked = torch.stack([c0, c1, c2, c3], dim=-1).reshape(-1)[:total_elems]
         u_groups = unpacked.reshape(-1, group_size)
         dense_levels = u_groups.to(torch.float32) - 1.5
-        sparse_codebook = torch.tensor(
-            [-1.0, 0.0, 0.38, 1.0], dtype=torch.float32, device=packed.device
-        )
+        sparse_codebook = _get_int2_sparse_codebook(packed.device)
         sparse_levels = sparse_codebook[u_groups.to(torch.long)]
         is_sparse = scales_fp32 < 0.0
         levels = torch.where(is_sparse, sparse_levels, dense_levels)
@@ -383,6 +590,164 @@ def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Te
         raise ValueError(f"Unsupported bit-width: {packed_tensor.bits}")
 
     return recon.reshape(packed_tensor.orig_shape).to(packed_tensor.orig_dtype)
+
+
+def quantize_residual_packed_batch(
+    residual_batch: torch.Tensor, bits: int = 4
+) -> list[PackedQuantizedTensor]:
+    """Quantize a batch of N residual tensors `[N, *orig_shape]` in a single fused pass."""
+    n = int(residual_batch.shape[0])
+    if n == 0:
+        return []
+    if n == 1:
+        return [quantize_residual_packed(residual_batch[0], bits=bits)]
+    if bits not in (2, 4):
+        raise ValueError(f"Unsupported bit-width: {bits}. Expected 2 or 4.")
+
+    orig_shape = tuple(residual_batch.shape[1:])
+    orig_dtype = residual_batch.dtype
+    res_fp32 = residual_batch.to(torch.float32)
+
+    total_elems = math.prod(orig_shape)
+    group_size = orig_shape[-1]
+    max_group_size = 32 if bits == 4 else 64
+    if group_size > max_group_size:
+        group_size = math.gcd(total_elems, max_group_size) or group_size
+    elif group_size < 32 and total_elems >= 32:
+        group_size = math.gcd(total_elems, 128)
+        if group_size < 16:
+            group_size = math.gcd(total_elems, 64) or orig_shape[-1]
+    num_groups = total_elems // group_size
+    flat_groups = res_fp32.reshape(n * num_groups, group_size)
+    max_abs = flat_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    if bits == 4:
+        scales_fp32 = max_abs / 7.0
+        normalized = flat_groups / scales_fp32
+        q_unsigned = (
+            torch.round(normalized + 8.0)
+            .clamp(0.0, 15.0)
+            .to(torch.uint8)
+            .reshape(n, total_elems)
+        )
+        if total_elems % 2 != 0:
+            q_unsigned = torch.cat(
+                [
+                    q_unsigned,
+                    torch.zeros(
+                        (n, 1), dtype=torch.uint8, device=q_unsigned.device
+                    ),
+                ],
+                dim=-1,
+            )
+        low_nibble = q_unsigned[:, 0::2] & 0x0F
+        high_nibble = (q_unsigned[:, 1::2] & 0x0F) << 4
+        packed_batch = low_nibble | high_nibble
+    else:
+        rms = torch.sqrt(
+            torch.mean(flat_groups * flat_groups, dim=-1, keepdim=True)
+        ).clamp(min=1e-8)
+        is_sparse = (max_abs / rms) > 3.2
+
+        dense_scale = max_abs / 2.15
+        norm_dense = flat_groups / dense_scale
+        q_dense = torch.floor(norm_dense + 2.0).clamp(0.0, 3.0).to(torch.uint8)
+
+        norm_sparse = flat_groups / max_abs
+        q_sparse = torch.ones_like(q_dense)
+        q_sparse = torch.where(
+            norm_sparse < -0.50, torch.zeros_like(q_sparse), q_sparse
+        )
+        q_sparse = torch.where(
+            norm_sparse >= 0.19, torch.full_like(q_sparse, 2), q_sparse
+        )
+        q_sparse = torch.where(
+            norm_sparse >= 0.69, torch.full_like(q_sparse, 3), q_sparse
+        )
+
+        scales_fp32 = torch.where(is_sparse, -max_abs, dense_scale)
+        q_unsigned = torch.where(is_sparse, q_sparse, q_dense).reshape(
+            n, total_elems
+        )
+        rem = total_elems % 4
+        if rem != 0:
+            q_unsigned = torch.cat(
+                [
+                    q_unsigned,
+                    torch.zeros(
+                        (n, 4 - rem), dtype=torch.uint8, device=q_unsigned.device
+                    ),
+                ],
+                dim=-1,
+            )
+        packed_batch = (
+            (q_unsigned[:, 0::4] & 0x03)
+            | ((q_unsigned[:, 1::4] & 0x03) << 2)
+            | ((q_unsigned[:, 2::4] & 0x03) << 4)
+            | ((q_unsigned[:, 3::4] & 0x03) << 6)
+        )
+
+    scales_f16 = scales_fp32.to(torch.float16).reshape(n, num_groups, 1)
+    return [
+        PackedQuantizedTensor(
+            packed_data=packed_batch[i].clone(),
+            scales=scales_f16[i].clone(),
+            orig_shape=orig_shape,
+            orig_dtype=orig_dtype,
+            bits=bits,
+        )
+        for i in range(n)
+    ]
+
+
+def dequantize_residual_packed_batch(
+    packed_list: list[PackedQuantizedTensor],
+) -> torch.Tensor:
+    """Dequantize a batch of N PackedQuantizedTensors to `[N, *orig_shape]`."""
+    n = len(packed_list)
+    if n == 1:
+        return dequantize_residual_packed(packed_list[0]).unsqueeze(0)
+    first = packed_list[0]
+    orig_shape = first.orig_shape
+    orig_dtype = first.orig_dtype
+    bits = first.bits
+    total_elems = math.prod(orig_shape)
+
+    packed = torch.stack([p.packed_data for p in packed_list], dim=0)
+    scales_fp32 = torch.stack([p.scales for p in packed_list], dim=0).to(
+        torch.float32
+    )
+    num_groups = scales_fp32.shape[1]
+    group_size = total_elems // max(num_groups, 1)
+
+    if bits == 4:
+        low_nibble = packed & 0x0F
+        high_nibble = (packed >> 4) & 0x0F
+        unpacked = torch.stack([low_nibble, high_nibble], dim=-1).reshape(
+            n, -1
+        )[:, :total_elems]
+        levels = unpacked.to(torch.float32) - 8.0
+        flat_groups = levels.reshape(n, num_groups, group_size)
+        recon = flat_groups * scales_fp32
+    elif bits == 2:
+        c0 = packed & 0x03
+        c1 = (packed >> 2) & 0x03
+        c2 = (packed >> 4) & 0x03
+        c3 = (packed >> 6) & 0x03
+        unpacked = torch.stack([c0, c1, c2, c3], dim=-1).reshape(n, -1)[
+            :, :total_elems
+        ]
+        u_groups = unpacked.reshape(n, num_groups, group_size)
+        dense_levels = u_groups.to(torch.float32) - 1.5
+        sparse_codebook = _get_int2_sparse_codebook(packed.device)
+        sparse_levels = sparse_codebook[u_groups.to(torch.long)]
+        is_sparse = scales_fp32 < 0.0
+        levels = torch.where(is_sparse, sparse_levels, dense_levels)
+        recon = levels * scales_fp32.abs()
+    else:
+        raise ValueError(f"Unsupported bit-width: {bits}")
+
+    return recon.reshape(n, *orig_shape).to(orig_dtype)
 
 
 @dataclass
@@ -1501,6 +1866,581 @@ class DeltaBlockStore:
         self.stats.tier_counts[record.tier] += 1
         return record
 
+    def store_blocks_batch(
+        self,
+        layer_name: str,
+        items: list[tuple["DeltaBlockTransferSpec", torch.Tensor, torch.Tensor | None]],
+    ) -> list[CompressedKVBlockRecord]:
+        """Batch-compress and store multiple KV blocks for `layer_name` in a single step.
+
+        Eliminates per-block GPU-to-CPU synchronization stalls (`.tolist()` / `.item()`)
+        and batches RoPE phase alignment, L2 norm evaluation, and INT2/INT4 quantization
+        across all blocks in the layer while preserving exact sequential commit order.
+        """
+        if len(items) <= 1 or self.force_uncompressed:
+            step_new_base_hashes: set[str] = set()
+            out_single: list[CompressedKVBlockRecord] = []
+            for blk_spec, k_blk, v_blk in items:
+                rec = self.store_block(
+                    layer_name=layer_name,
+                    full_block_hash=blk_spec.full_block_hash,
+                    token_ids=blk_spec.token_ids,
+                    start_position=blk_spec.start_position,
+                    k_block=k_blk,
+                    v_block=v_blk,
+                    divergence_distance=blk_spec.divergence_distance,
+                    exclude_base_hashes=step_new_base_hashes,
+                    prev_token_block_hash=blk_spec.prev_token_block_hash,
+                )
+                if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
+                    step_new_base_hashes.add(blk_spec.full_block_hash)
+                out_single.append(rec)
+            return out_single
+
+        policy = self.get_layer_policy(layer_name)
+        n = len(items)
+        k_cpus: list[torch.Tensor] = []
+        v_cpus: list[torch.Tensor | None] = []
+        raw_bytes_list: list[int] = []
+        token_tuples: list[tuple[int, ...]] = []
+        token_hashes: list[str] = []
+        records: list[CompressedKVBlockRecord | None] = [None] * n
+
+        # (item_idx, base_rec, delta_pos)
+        exact_group: list[tuple[int, CompressedKVBlockRecord, int]] = []
+        # (item_idx, partial_base, delta_pos, diff_indices)
+        attn_partial_group: list[
+            tuple[int, CompressedKVBlockRecord, int, list[int]]
+        ] = []
+
+        for i, (blk_spec, k_blk, v_blk) in enumerate(items):
+            token_tuple = tuple(int(t) for t in blk_spec.token_ids)
+            token_hash = compute_token_block_hash(token_tuple)
+            k_cpu = k_blk.detach().to(self.device)
+            v_cpu = v_blk.detach().to(self.device) if v_blk is not None else None
+            is_mla = v_cpu is None
+            raw_b = k_cpu.numel() * k_cpu.element_size() + (
+                v_cpu.numel() * v_cpu.element_size() if v_cpu is not None else 0
+            )
+            k_cpus.append(k_cpu)
+            v_cpus.append(v_cpu)
+            raw_bytes_list.append(raw_b)
+            token_tuples.append(token_tuple)
+            token_hashes.append(token_hash)
+
+            self._known_prefix_blocks[blk_spec.full_block_hash] = (
+                token_tuple,
+                blk_spec.start_position,
+            )
+            self._known_token_blocks.setdefault(
+                token_hash, blk_spec.full_block_hash
+            )
+            if policy.is_mamba:
+                self._known_mamba_blocks.add(blk_spec.full_block_hash)
+
+            base_rec = self._find_exact_base_block(
+                layer_name,
+                token_hash,
+                start_position=blk_spec.start_position,
+                prev_token_block_hash=blk_spec.prev_token_block_hash,
+            )
+            if base_rec is not None:
+                delta_pos = blk_spec.start_position - base_rec.start_position
+                if (policy.layer_idx == 0 and not policy.is_mamba) or (
+                    policy.is_sliding_window
+                    and blk_spec.divergence_distance is not None
+                    and blk_spec.divergence_distance
+                    >= policy.sliding_window_dedup_threshold
+                ):
+                    records[i] = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER0_ZERO_BIT,
+                        full_block_hash=blk_spec.full_block_hash,
+                        token_block_hash=token_hash,
+                        token_ids=token_tuple,
+                        start_position=blk_spec.start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=is_mla,
+                        ref_base_hash=base_rec.full_block_hash,
+                        delta_pos=delta_pos,
+                    )
+                else:
+                    exact_group.append((i, base_rec, delta_pos))
+                continue
+
+            partial_base, diff_indices = self._find_partial_match_base_block(
+                layer_name,
+                token_tuple,
+                start_position=blk_spec.start_position,
+                prev_token_block_hash=blk_spec.prev_token_block_hash,
+                full_block_hash=blk_spec.full_block_hash,
+            )
+            if partial_base is not None and diff_indices:
+                delta_pos = blk_spec.start_position - partial_base.start_position
+                if policy.is_mamba:
+                    exact_group.append((i, partial_base, delta_pos))
+                else:
+                    attn_partial_group.append(
+                        (i, partial_base, delta_pos, diff_indices)
+                    )
+
+        # Pass 2A: Batched GPU evaluation for exact token matches + Mamba partial matches
+        if exact_group:
+            m = len(exact_group)
+            k_stack = torch.stack([k_cpus[idx] for idx, _, _ in exact_group], dim=0)
+            base_k_stack = torch.stack(
+                [b_rec.raw_k for _, b_rec, _ in exact_group], dim=0
+            )
+            dpos_list = [dpos for _, _, dpos in exact_group]
+            k_ref_aligned = apply_relative_rope_rotation_batch(
+                base_k_stack,
+                dpos_list,
+                rope_theta=policy.rope_theta,
+                rotary_dim=0 if policy.is_mamba else policy.rotary_dim,
+                is_neox_style=policy.is_neox_style,
+                rope_scaling=policy.rope_scaling,
+            )
+            k_fp32 = k_stack.to(torch.float32)
+            delta_k = k_fp32 - k_ref_aligned.to(torch.float32)
+            eta_k_t = torch.linalg.norm(delta_k.reshape(m, -1), dim=-1) / (
+                torch.linalg.norm(k_fp32.reshape(m, -1), dim=-1).clamp(min=1e-8)
+            )
+
+            has_v = (
+                v_cpus[exact_group[0][0]] is not None
+                and exact_group[0][1].raw_v is not None
+            )
+            if has_v:
+                v_stack = torch.stack(
+                    [v_cpus[idx] for idx, _, _ in exact_group], dim=0
+                )
+                base_v_stack = torch.stack(
+                    [b_rec.raw_v for _, b_rec, _ in exact_group], dim=0
+                )
+                v_fp32 = v_stack.to(torch.float32)
+                delta_v = v_fp32 - base_v_stack.to(torch.float32)
+                eta_v_t = torch.linalg.norm(delta_v.reshape(m, -1), dim=-1) / (
+                    torch.linalg.norm(v_fp32.reshape(m, -1), dim=-1).clamp(
+                        min=1e-8
+                    )
+                )
+            else:
+                v_stack = None
+                v_fp32 = None
+                delta_v = None
+                eta_v_t = torch.zeros_like(eta_k_t)
+
+            check_outliers = (
+                not policy.is_mamba
+                and policy.max_sparse_exceptions > 0
+                and delta_k.ndim >= 3
+                and delta_k.shape[1] >= 4
+            )
+            if check_outliers:
+                b_tok = delta_k.shape[1]
+                dk_tok = torch.linalg.norm(
+                    delta_k.reshape(m, b_tok, -1), dim=-1
+                )
+                k_tok = torch.linalg.norm(
+                    k_fp32.reshape(m, b_tok, -1), dim=-1
+                ).clamp(min=1e-6)
+                tok_eta = dk_tok / k_tok
+                if has_v and delta_v is not None and v_fp32 is not None:
+                    dv_tok = torch.linalg.norm(
+                        delta_v.reshape(m, b_tok, -1), dim=-1
+                    )
+                    v_tok = torch.linalg.norm(
+                        v_fp32.reshape(m, b_tok, -1), dim=-1
+                    ).clamp(min=1e-6)
+                    tok_eta = torch.maximum(tok_eta, dv_tok / v_tok)
+                outlier_mask = tok_eta > 0.65
+                num_outliers_t = outlier_mask.sum(dim=-1).to(torch.float32)
+                metrics_rows = torch.stack(
+                    [eta_k_t, eta_v_t, num_outliers_t], dim=-1
+                ).tolist()
+            else:
+                outlier_mask = None
+                metrics_rows = torch.stack([eta_k_t, eta_v_t], dim=-1).tolist()
+
+            eff_tau_int2 = min(policy.tau_int2, 0.08)
+            tier1_g_idxs: list[int] = []
+            tier2_g_idxs: list[int] = []
+
+            for g_idx, (item_idx, base_rec, delta_pos) in enumerate(exact_group):
+                row = metrics_rows[g_idx]
+                eta_k = float(row[0])
+                eta_v = float(row[1])
+                num_outliers = int(row[2]) if check_outliers else 0
+                eta_max = max(eta_k, eta_v)
+                blk_spec = items[item_idx][0]
+                is_mla = v_cpus[item_idx] is None
+
+                if (
+                    policy.is_sliding_window and eta_max <= policy.tau_zero_bit
+                ) or (
+                    policy.is_mamba
+                    and eta_max <= min(policy.tau_zero_bit, 0.01)
+                ):
+                    records[item_idx] = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER0_ZERO_BIT,
+                        full_block_hash=blk_spec.full_block_hash,
+                        token_block_hash=token_hashes[item_idx],
+                        token_ids=token_tuples[item_idx],
+                        start_position=blk_spec.start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=is_mla,
+                        ref_base_hash=base_rec.full_block_hash,
+                        delta_pos=delta_pos,
+                    )
+                    continue
+
+                if (
+                    check_outliers
+                    and outlier_mask is not None
+                    and 0 < num_outliers <= min(2, policy.max_sparse_exceptions)
+                ):
+                    outlier_idx = torch.nonzero(
+                        outlier_mask[g_idx], as_tuple=False
+                    ).reshape(-1)
+                    dk_single = delta_k[g_idx].clone()
+                    dk_single[outlier_idx] = 0.0
+                    k_rem = k_fp32[g_idx].clone()
+                    k_rem[outlier_idx] = 0.0
+                    rem_eta_k_t = torch.linalg.norm(dk_single) / (
+                        torch.linalg.norm(k_rem).clamp(min=1e-8)
+                    )
+                    if delta_v is not None and v_fp32 is not None:
+                        dv_single = delta_v[g_idx].clone()
+                        dv_single[outlier_idx] = 0.0
+                        v_rem = v_fp32[g_idx].clone()
+                        v_rem[outlier_idx] = 0.0
+                        rem_eta_v_t = torch.linalg.norm(dv_single) / (
+                            torch.linalg.norm(v_rem).clamp(min=1e-8)
+                        )
+                        rem_eta_k, rem_eta_v = torch.stack(
+                            [rem_eta_k_t, rem_eta_v_t]
+                        ).tolist()
+                        rem_eta_max = max(rem_eta_k, rem_eta_v)
+                    else:
+                        dv_single = None
+                        rem_eta_max = float(rem_eta_k_t.item())
+
+                    if rem_eta_max <= policy.tau_int4:
+                        k_c = k_cpus[item_idx]
+                        v_c = v_cpus[item_idx]
+                        sparse_k = k_c[outlier_idx].clone()
+                        sparse_v = (
+                            v_c[outlier_idx].clone() if v_c is not None else None
+                        )
+                        q_dk = quantize_residual_packed(
+                            dk_single.to(k_c.dtype), bits=4
+                        )
+                        q_dv = (
+                            quantize_residual_packed(
+                                dv_single.to(v_c.dtype), bits=4
+                            )
+                            if (dv_single is not None and v_c is not None)
+                            else None
+                        )
+                        records[item_idx] = CompressedKVBlockRecord(
+                            tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                            full_block_hash=blk_spec.full_block_hash,
+                            token_block_hash=token_hashes[item_idx],
+                            token_ids=token_tuples[item_idx],
+                            start_position=blk_spec.start_position,
+                            layer_idx=policy.layer_idx,
+                            is_mla=is_mla,
+                            ref_base_hash=base_rec.full_block_hash,
+                            delta_pos=delta_pos,
+                            quant_delta_k=q_dk,
+                            quant_delta_v=q_dv,
+                            sparse_token_indices=outlier_idx.to(torch.int16),
+                            sparse_k_bf16=sparse_k,
+                            sparse_v_bf16=sparse_v,
+                        )
+                        continue
+
+                tier1_eligible = (
+                    (eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4)
+                    if policy.is_mamba
+                    else (eta_max <= eff_tau_int2)
+                )
+                if tier1_eligible:
+                    tier1_g_idxs.append(g_idx)
+                elif eta_max <= policy.tau_int4:
+                    tier2_g_idxs.append(g_idx)
+
+            if tier1_g_idxs:
+                q_dk_list = quantize_residual_packed_batch(
+                    delta_k[tier1_g_idxs].to(k_stack.dtype), bits=2
+                )
+                v_bits = 4 if policy.is_mamba else 2
+                q_dv_list = (
+                    quantize_residual_packed_batch(
+                        delta_v[tier1_g_idxs].to(v_stack.dtype), bits=v_bits
+                    )
+                    if (delta_v is not None and v_stack is not None)
+                    else [None] * len(tier1_g_idxs)
+                )
+                for sub_i, g_idx in enumerate(tier1_g_idxs):
+                    item_idx, base_rec, delta_pos = exact_group[g_idx]
+                    blk_spec = items[item_idx][0]
+                    records[item_idx] = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER1_INT2_DELTA,
+                        full_block_hash=blk_spec.full_block_hash,
+                        token_block_hash=token_hashes[item_idx],
+                        token_ids=token_tuples[item_idx],
+                        start_position=blk_spec.start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=v_cpus[item_idx] is None,
+                        ref_base_hash=base_rec.full_block_hash,
+                        delta_pos=delta_pos,
+                        quant_delta_k=q_dk_list[sub_i],
+                        quant_delta_v=q_dv_list[sub_i],
+                    )
+
+            if tier2_g_idxs:
+                q_dk_list2 = quantize_residual_packed_batch(
+                    delta_k[tier2_g_idxs].to(k_stack.dtype), bits=4
+                )
+                q_dv_list2 = (
+                    quantize_residual_packed_batch(
+                        delta_v[tier2_g_idxs].to(v_stack.dtype), bits=4
+                    )
+                    if (delta_v is not None and v_stack is not None)
+                    else [None] * len(tier2_g_idxs)
+                )
+                for sub_i, g_idx in enumerate(tier2_g_idxs):
+                    item_idx, base_rec, delta_pos = exact_group[g_idx]
+                    blk_spec = items[item_idx][0]
+                    records[item_idx] = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER2_INT4_DELTA,
+                        full_block_hash=blk_spec.full_block_hash,
+                        token_block_hash=token_hashes[item_idx],
+                        token_ids=token_tuples[item_idx],
+                        start_position=blk_spec.start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=v_cpus[item_idx] is None,
+                        ref_base_hash=base_rec.full_block_hash,
+                        delta_pos=delta_pos,
+                        quant_delta_k=q_dk_list2[sub_i],
+                        quant_delta_v=q_dv_list2[sub_i],
+                    )
+
+        # Pass 2B: Batched GPU evaluation for full-attention partial matches
+        if attn_partial_group:
+            p = len(attn_partial_group)
+            k_stack = torch.stack(
+                [k_cpus[idx] for idx, _, _, _ in attn_partial_group], dim=0
+            )
+            base_k_stack = torch.stack(
+                [b_rec.raw_k for _, b_rec, _, _ in attn_partial_group], dim=0
+            )
+            dpos_list = [dpos for _, _, dpos, _ in attn_partial_group]
+            k_ref_aligned = apply_relative_rope_rotation_batch(
+                base_k_stack,
+                dpos_list,
+                rope_theta=policy.rope_theta,
+                rotary_dim=policy.rotary_dim,
+                is_neox_style=policy.is_neox_style,
+                rope_scaling=policy.rope_scaling,
+            )
+            k_fp32 = k_stack.to(torch.float32)
+            delta_k = k_fp32 - k_ref_aligned.to(torch.float32)
+            has_v = (
+                v_cpus[attn_partial_group[0][0]] is not None
+                and attn_partial_group[0][1].raw_v is not None
+            )
+            if has_v:
+                v_stack = torch.stack(
+                    [v_cpus[idx] for idx, _, _, _ in attn_partial_group], dim=0
+                )
+                base_v_stack = torch.stack(
+                    [b_rec.raw_v for _, b_rec, _, _ in attn_partial_group], dim=0
+                )
+                v_fp32 = v_stack.to(torch.float32)
+                delta_v = v_fp32 - base_v_stack.to(torch.float32)
+            else:
+                v_stack = None
+                v_fp32 = None
+                delta_v = None
+
+            b_tok = delta_k.shape[1]
+            all_sparse_per_p: list[list[int]] = [
+                list(d_idx) for _, _, _, d_idx in attn_partial_group
+            ]
+            max_rem_slots = max(
+                0,
+                max(
+                    policy.max_sparse_exceptions - len(s_idx)
+                    for s_idx in all_sparse_per_p
+                ),
+            )
+            if max_rem_slots > 0 and delta_k.ndim >= 3 and b_tok >= 4:
+                dk_tok = torch.linalg.norm(
+                    delta_k.reshape(p, b_tok, -1), dim=-1
+                )
+                k_tok = torch.linalg.norm(
+                    k_fp32.reshape(p, b_tok, -1), dim=-1
+                ).clamp(min=1e-6)
+                tok_eta = dk_tok / k_tok
+                if has_v and delta_v is not None and v_fp32 is not None:
+                    dv_tok = torch.linalg.norm(
+                        delta_v.reshape(p, b_tok, -1), dim=-1
+                    )
+                    v_tok = torch.linalg.norm(
+                        v_fp32.reshape(p, b_tok, -1), dim=-1
+                    ).clamp(min=1e-6)
+                    tok_eta = torch.maximum(tok_eta, dv_tok / v_tok)
+                diff_mask_cpu = torch.zeros((p, b_tok), dtype=torch.bool)
+                for p_i, s_idx in enumerate(all_sparse_per_p):
+                    if s_idx:
+                        diff_mask_cpu[p_i, s_idx] = True
+                tok_eta.masked_fill_(
+                    diff_mask_cpu.to(device=tok_eta.device), 0.0
+                )
+                k_top = min(max_rem_slots, b_tok)
+                top_vals, top_idxs = torch.topk(tok_eta, k=k_top, dim=-1)
+                top_rows = torch.stack(
+                    [top_vals, top_idxs.to(torch.float32)], dim=-1
+                ).tolist()
+                for p_i, row in enumerate(top_rows):
+                    rem_s = policy.max_sparse_exceptions - len(
+                        all_sparse_per_p[p_i]
+                    )
+                    if rem_s > 0:
+                        for val, idx_f in row[:rem_s]:
+                            if val > 0.65:
+                                all_sparse_per_p[p_i].append(int(idx_f))
+                        all_sparse_per_p[p_i].sort()
+
+            sparse_mask_cpu = torch.zeros((p, b_tok), dtype=torch.bool)
+            for p_i, s_idx in enumerate(all_sparse_per_p):
+                if s_idx:
+                    sparse_mask_cpu[p_i, s_idx] = True
+            sparse_mask_gpu = sparse_mask_cpu.to(device=delta_k.device)
+            mask_exp = sparse_mask_gpu.view(
+                p, b_tok, *([1] * (delta_k.ndim - 2))
+            )
+            delta_k.masked_fill_(mask_exp, 0.0)
+            k_rem = k_fp32.masked_fill(mask_exp, 0.0)
+            eta_k_t = torch.linalg.norm(delta_k.reshape(p, -1), dim=-1) / (
+                torch.linalg.norm(k_rem.reshape(p, -1), dim=-1).clamp(min=1e-8)
+            )
+            if has_v and delta_v is not None and v_fp32 is not None:
+                delta_v.masked_fill_(mask_exp, 0.0)
+                v_rem = v_fp32.masked_fill(mask_exp, 0.0)
+                eta_v_t = torch.linalg.norm(delta_v.reshape(p, -1), dim=-1) / (
+                    torch.linalg.norm(v_rem.reshape(p, -1), dim=-1).clamp(
+                        min=1e-8
+                    )
+                )
+                p_metrics = torch.stack([eta_k_t, eta_v_t], dim=-1).tolist()
+            else:
+                p_metrics = [[float(v), 0.0] for v in eta_k_t.tolist()]
+
+            valid_p_idxs = [
+                p_i
+                for p_i, (ek, ev) in enumerate(p_metrics)
+                if policy.layer_idx == 0 or max(ek, ev) <= policy.tau_int4
+            ]
+            if valid_p_idxs:
+                if policy.layer_idx > 0:
+                    q_dk_p = quantize_residual_packed_batch(
+                        delta_k[valid_p_idxs].to(k_stack.dtype), bits=4
+                    )
+                    q_dv_p = (
+                        quantize_residual_packed_batch(
+                            delta_v[valid_p_idxs].to(v_stack.dtype), bits=4
+                        )
+                        if (delta_v is not None and v_stack is not None)
+                        else [None] * len(valid_p_idxs)
+                    )
+                else:
+                    q_dk_p = [None] * len(valid_p_idxs)
+                    q_dv_p = [None] * len(valid_p_idxs)
+
+                for sub_i, p_i in enumerate(valid_p_idxs):
+                    item_idx, partial_base, delta_pos, _ = attn_partial_group[
+                        p_i
+                    ]
+                    blk_spec = items[item_idx][0]
+                    k_c = k_cpus[item_idx]
+                    v_c = v_cpus[item_idx]
+                    idx_tensor = torch.tensor(
+                        all_sparse_per_p[p_i],
+                        dtype=torch.long,
+                        device=k_c.device,
+                    )
+                    sparse_k = k_c[idx_tensor].clone()
+                    sparse_v = (
+                        v_c[idx_tensor].clone() if v_c is not None else None
+                    )
+                    records[item_idx] = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                        full_block_hash=blk_spec.full_block_hash,
+                        token_block_hash=token_hashes[item_idx],
+                        token_ids=token_tuples[item_idx],
+                        start_position=blk_spec.start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=v_c is None,
+                        ref_base_hash=partial_base.full_block_hash,
+                        delta_pos=delta_pos,
+                        quant_delta_k=q_dk_p[sub_i],
+                        quant_delta_v=q_dv_p[sub_i],
+                        sparse_token_indices=idx_tensor.to(torch.int16),
+                        sparse_k_bf16=sparse_k,
+                        sparse_v_bf16=sparse_v,
+                    )
+
+        # Pass 3: Commit all records in exact sequential order
+        max_exceptions = (
+            self.max_sparse_exceptions
+            if policy.is_mamba
+            else policy.max_sparse_exceptions
+        )
+        out_records: list[CompressedKVBlockRecord] = []
+        for i in range(n):
+            rec = records[i]
+            if rec is None:
+                blk_spec = items[i][0]
+                token_tuple = token_tuples[i]
+                token_hash = token_hashes[i]
+                k_c = k_cpus[i]
+                v_c = v_cpus[i]
+                rec = CompressedKVBlockRecord(
+                    tier=CompressionTier.UNCOMPRESSED_BASE,
+                    full_block_hash=blk_spec.full_block_hash,
+                    token_block_hash=token_hash,
+                    token_ids=token_tuple,
+                    start_position=blk_spec.start_position,
+                    layer_idx=policy.layer_idx,
+                    is_mla=v_c is None,
+                    prev_token_block_hash=blk_spec.prev_token_block_hash,
+                    raw_k=k_c.clone(),
+                    raw_v=v_c.clone() if v_c is not None else None,
+                )
+                self._base_by_token_hash.setdefault(
+                    (layer_name, token_hash), rec
+                )
+                self._base_by_token_hash_list.setdefault(
+                    (layer_name, token_hash), []
+                ).append(rec)
+                self._base_blocks_by_layer.setdefault(layer_name, []).append(
+                    rec
+                )
+                if max_exceptions > 0:
+                    num_slices = max_exceptions + 1
+                    for s_idx, sub_tuple in self._get_pigeonhole_slices(
+                        token_tuple, num_slices
+                    ):
+                        self._base_by_subchunk.setdefault(
+                            (layer_name, s_idx, sub_tuple), []
+                        ).append(rec)
+            out_records.append(
+                self._commit_record(layer_name, rec, raw_bytes_list[i])
+            )
+        return out_records
+
     def evict_block(self, full_block_hash: str) -> list[str]:
         """Evict `full_block_hash` (and any dependent delta blocks) across all layers."""
         evicted: list[str] = []
@@ -1829,6 +2769,215 @@ class DeltaBlockStore:
             return k_out_typed, v_out_typed
 
         raise ValueError(f"Unsupported compression tier: {rec.tier}")
+
+    def reconstruct_blocks_batch(
+        self,
+        layer_name: str,
+        specs: list["DeltaBlockTransferSpec"],
+    ) -> list[tuple[torch.Tensor, torch.Tensor | None] | None]:
+        """Batch-reconstruct multiple KV blocks for `layer_name` in a single pass."""
+        n = len(specs)
+        if n == 0:
+            return []
+        if n == 1:
+            try:
+                return [
+                    self.reconstruct_block(
+                        layer_name=layer_name,
+                        full_block_hash=specs[0].full_block_hash,
+                        token_ids=specs[0].token_ids,
+                        target_start_position=specs[0].start_position,
+                    )
+                ]
+            except KeyError:
+                return [None]
+
+        policy = self.get_layer_policy(layer_name)
+        results: list[tuple[torch.Tensor, torch.Tensor | None] | None] = [
+            None
+        ] * n
+
+        # Group indices by tier for batched RoPE rotation + dequantization
+        tier0_items: list[tuple[int, CompressedKVBlockRecord, int]] = []
+        tier1_items: list[
+            tuple[int, CompressedKVBlockRecord, CompressedKVBlockRecord]
+        ] = []
+        tier2_items: list[
+            tuple[int, CompressedKVBlockRecord, CompressedKVBlockRecord]
+        ] = []
+        tier3_items: list[
+            tuple[int, CompressedKVBlockRecord, CompressedKVBlockRecord]
+        ] = []
+
+        for i, blk_spec in enumerate(specs):
+            rec = self._records.get((layer_name, blk_spec.full_block_hash))
+            if rec is not None:
+                self._touch_lru(blk_spec.full_block_hash, rec.ref_base_hash)
+            else:
+                token_hash = compute_token_block_hash(blk_spec.token_ids)
+                base_rec = self._find_exact_base_block(
+                    layer_name,
+                    token_hash,
+                    start_position=blk_spec.start_position,
+                )
+                if base_rec is not None and base_rec.raw_k is not None:
+                    self.stats.total_blocks_loaded += 1
+                    tier0_items.append(
+                        (
+                            i,
+                            base_rec,
+                            blk_spec.start_position - base_rec.start_position,
+                        )
+                    )
+                continue
+
+            self.stats.total_blocks_loaded += 1
+            if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
+                assert rec.raw_k is not None
+                results[i] = (
+                    rec.raw_k.clone(),
+                    rec.raw_v.clone() if rec.raw_v is not None else None,
+                )
+                continue
+
+            assert rec.ref_base_hash is not None
+            base_rec = self._records.get((layer_name, rec.ref_base_hash))
+            if base_rec is None or base_rec.raw_k is None:
+                continue
+
+            if rec.tier == CompressionTier.TIER0_ZERO_BIT:
+                tier0_items.append((i, base_rec, rec.delta_pos))
+            elif rec.tier == CompressionTier.TIER1_INT2_DELTA:
+                tier1_items.append((i, rec, base_rec))
+            elif rec.tier == CompressionTier.TIER2_INT4_DELTA:
+                tier2_items.append((i, rec, base_rec))
+            elif rec.tier == CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA:
+                tier3_items.append((i, rec, base_rec))
+
+        if tier0_items:
+            base_k_s = torch.stack(
+                [b.raw_k for _, b, _ in tier0_items], dim=0
+            )
+            dpos_s = [d for _, _, d in tier0_items]
+            k_aligned_s = apply_relative_rope_rotation_batch(
+                base_k_s,
+                dpos_s,
+                rope_theta=policy.rope_theta,
+                rotary_dim=policy.rotary_dim,
+                is_neox_style=policy.is_neox_style,
+                rope_scaling=policy.rope_scaling,
+            )
+            for sub_i, (item_idx, b_rec, _) in enumerate(tier0_items):
+                results[item_idx] = (
+                    k_aligned_s[sub_i],
+                    b_rec.raw_v.clone() if b_rec.raw_v is not None else None,
+                )
+
+        for dense_group in (tier1_items, tier2_items):
+            if not dense_group:
+                continue
+            base_k_s = torch.stack(
+                [b.raw_k for _, _, b in dense_group], dim=0
+            )
+            dpos_s = [r.delta_pos for _, r, _ in dense_group]
+            k_aligned_s = apply_relative_rope_rotation_batch(
+                base_k_s,
+                dpos_s,
+                rope_theta=policy.rope_theta,
+                rotary_dim=policy.rotary_dim,
+                is_neox_style=policy.is_neox_style,
+                rope_scaling=policy.rope_scaling,
+            )
+            dk_batch = dequantize_residual_packed_batch(
+                [r.quant_delta_k for _, r, _ in dense_group]  # type: ignore[misc]
+            )
+            k_out_s = (
+                k_aligned_s.to(torch.float32) + dk_batch.to(torch.float32)
+            ).to(k_aligned_s.dtype)
+
+            has_v = (
+                dense_group[0][2].raw_v is not None
+                and dense_group[0][1].quant_delta_v is not None
+            )
+            if has_v:
+                base_v_s = torch.stack(
+                    [b.raw_v for _, _, b in dense_group], dim=0  # type: ignore[misc]
+                )
+                dv_batch = dequantize_residual_packed_batch(
+                    [r.quant_delta_v for _, r, _ in dense_group]  # type: ignore[misc]
+                )
+                v_out_s = (
+                    base_v_s.to(torch.float32) + dv_batch.to(torch.float32)
+                ).to(base_v_s.dtype)
+                for sub_i, (item_idx, _, _) in enumerate(dense_group):
+                    results[item_idx] = (k_out_s[sub_i], v_out_s[sub_i])
+            else:
+                for sub_i, (item_idx, _, b_rec) in enumerate(dense_group):
+                    results[item_idx] = (
+                        k_out_s[sub_i],
+                        b_rec.raw_v.clone() if b_rec.raw_v is not None else None,
+                    )
+
+        if tier3_items:
+            base_k_s = torch.stack(
+                [b.raw_k for _, _, b in tier3_items], dim=0
+            )
+            dpos_s = [r.delta_pos for _, r, _ in tier3_items]
+            k_aligned_s = apply_relative_rope_rotation_batch(
+                base_k_s,
+                dpos_s,
+                rope_theta=policy.rope_theta,
+                rotary_dim=policy.rotary_dim,
+                is_neox_style=policy.is_neox_style,
+                rope_scaling=policy.rope_scaling,
+            )
+            has_q_dk = tier3_items[0][1].quant_delta_k is not None
+            if has_q_dk and all(
+                r.quant_delta_k is not None for _, r, _ in tier3_items
+            ):
+                dk_batch3 = dequantize_residual_packed_batch(
+                    [r.quant_delta_k for _, r, _ in tier3_items]  # type: ignore[misc]
+                )
+                k_out_s = (
+                    k_aligned_s.to(torch.float32) + dk_batch3.to(torch.float32)
+                ).to(k_aligned_s.dtype)
+            else:
+                k_out_s = k_aligned_s.clone()
+
+            has_v = tier3_items[0][2].raw_v is not None
+            if has_v:
+                base_v_s = torch.stack(
+                    [b.raw_v for _, _, b in tier3_items], dim=0  # type: ignore[misc]
+                )
+                if has_q_dk and all(
+                    r.quant_delta_v is not None for _, r, _ in tier3_items
+                ):
+                    dv_batch3 = dequantize_residual_packed_batch(
+                        [r.quant_delta_v for _, r, _ in tier3_items]  # type: ignore[misc]
+                    )
+                    v_out_s: torch.Tensor | None = (
+                        base_v_s.to(torch.float32)
+                        + dv_batch3.to(torch.float32)
+                    ).to(base_v_s.dtype)
+                else:
+                    v_out_s = base_v_s.clone()
+            else:
+                v_out_s = None
+
+            for sub_i, (item_idx, rec, _) in enumerate(tier3_items):
+                k_item = k_out_s[sub_i]
+                v_item = v_out_s[sub_i] if v_out_s is not None else None
+                if (
+                    rec.sparse_token_indices is not None
+                    and rec.sparse_k_bf16 is not None
+                ):
+                    idx = rec.sparse_token_indices.to(torch.long)
+                    k_item[idx] = rec.sparse_k_bf16
+                    if v_item is not None and rec.sparse_v_bf16 is not None:
+                        v_item[idx] = rec.sparse_v_bf16
+                results[item_idx] = (k_item, v_item)
+
+        return results
 
 
 @dataclass
@@ -2926,42 +4075,48 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if reg_name not in self._active_no_compile_layers:
                 all_layer_names.append(reg_name)
 
-        for req_meta in metadata.requests:
-            if req_meta.is_store:
+        load_reqs = [r for r in metadata.requests if not r.is_store]
+        if not load_reqs:
+            return
+
+        for layer_name in all_layer_names:
+            if (
+                self._layer_to_group_idx
+                and layer_name not in self._layer_to_group_idx
+            ):
                 continue
-            for layer_name in all_layer_names:
-                if (
-                    self._layer_to_group_idx
-                    and layer_name not in self._layer_to_group_idx
-                ):
-                    continue
-                layer = self._active_no_compile_layers.get(layer_name)
-                kv_tensor = self._get_layer_kv_cache(
-                    layer_name, layer, self._active_virtual_engine
-                )
-                if kv_tensor is None:
-                    continue
+            layer = self._active_no_compile_layers.get(layer_name)
+            kv_tensor = self._get_layer_kv_cache(
+                layer_name, layer, self._active_virtual_engine
+            )
+            if kv_tensor is None:
+                continue
 
-                policy = self.store.get_layer_policy(layer_name)
-                if isinstance(kv_tensor, tuple) and not policy.is_mamba:
-                    policy.is_mamba = True
-                    policy.rotary_dim = 0
-                    policy.tau_zero_bit = 0.0
-                    policy.tau_int2 = 0.0
-                    policy.max_sparse_exceptions = 0
+            policy = self.store.get_layer_policy(layer_name)
+            if isinstance(kv_tensor, tuple) and not policy.is_mamba:
+                policy.is_mamba = True
+                policy.rotary_dim = 0
+                policy.tau_zero_bit = 0.0
+                policy.tau_int2 = 0.0
+                policy.max_sparse_exceptions = 0
 
-                layer_attn_meta = (
-                    attn_metadata.get(layer_name)
-                    if isinstance(attn_metadata, dict)
-                    else attn_metadata
-                )
-                is_mla = isinstance(layer_attn_meta, MLACommonMetadata)
-                num_blocks = self._get_kv_layer_num_blocks(
-                    kv_tensor, is_mla=is_mla, block_size=self._block_size
-                )
+            layer_attn_meta = (
+                attn_metadata.get(layer_name)
+                if isinstance(attn_metadata, dict)
+                else attn_metadata
+            )
+            is_mla = isinstance(layer_attn_meta, MLACommonMetadata)
+            num_blocks = self._get_kv_layer_num_blocks(
+                kv_tensor, is_mla=is_mla, block_size=self._block_size
+            )
 
+            valid_specs: list[DeltaBlockTransferSpec] = []
+            valid_phys_ids: list[int] = []
+            for req_meta in load_reqs:
                 for blk_spec in req_meta.blocks:
-                    phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
+                    phys_blk_id = self._resolve_physical_block_id(
+                        layer_name, blk_spec
+                    )
                     if phys_blk_id is None or phys_blk_id >= num_blocks:
                         continue
                     if (
@@ -2970,42 +4125,49 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         or len(blk_spec.group_block_ids) > 1
                     ) and phys_blk_id <= 0:
                         continue
-                    try:
-                        k_recon, v_recon = self.store.reconstruct_block(
-                            layer_name=layer_name,
-                            full_block_hash=blk_spec.full_block_hash,
-                            token_ids=blk_spec.token_ids,
-                            target_start_position=blk_spec.start_position,
-                        )
-                    except KeyError:
-                        continue
-                    self._inject_block_kv(
-                        kv_tensor,
-                        phys_blk_id,
-                        k_recon,
-                        v_recon,
-                        is_mla=is_mla,
-                        block_size=self._block_size,
-                        start_position=blk_spec.start_position,
+                    valid_specs.append(blk_spec)
+                    valid_phys_ids.append(phys_blk_id)
+
+            if not valid_specs:
+                continue
+
+            reconstructed_list = self.store.reconstruct_blocks_batch(
+                layer_name=layer_name,
+                specs=valid_specs,
+            )
+            for blk_spec, phys_blk_id, kv_pair in zip(
+                valid_specs, valid_phys_ids, reconstructed_list
+            ):
+                if kv_pair is None:
+                    continue
+                k_recon, v_recon = kv_pair
+                self._inject_block_kv(
+                    kv_tensor,
+                    phys_blk_id,
+                    k_recon,
+                    v_recon,
+                    is_mla=is_mla,
+                    block_size=self._block_size,
+                    start_position=blk_spec.start_position,
+                )
+                if isinstance(kv_tensor, tuple) or policy.is_mamba:
+                    running_blk_id = self._resolve_running_block_id(
+                        layer_name, blk_spec
                     )
-                    if isinstance(kv_tensor, tuple) or policy.is_mamba:
-                        running_blk_id = self._resolve_running_block_id(
-                            layer_name, blk_spec
+                    if (
+                        running_blk_id is not None
+                        and 0 < running_blk_id < num_blocks
+                        and running_blk_id != phys_blk_id
+                    ):
+                        self._inject_block_kv(
+                            kv_tensor,
+                            running_blk_id,
+                            k_recon,
+                            v_recon,
+                            is_mla=is_mla,
+                            block_size=self._block_size,
+                            start_position=blk_spec.start_position,
                         )
-                        if (
-                            running_blk_id is not None
-                            and 0 < running_blk_id < num_blocks
-                            and running_blk_id != phys_blk_id
-                        ):
-                            self._inject_block_kv(
-                                kv_tensor,
-                                running_blk_id,
-                                k_recon,
-                                v_recon,
-                                is_mla=is_mla,
-                                block_size=self._block_size,
-                                start_position=blk_spec.start_position,
-                            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
@@ -3036,7 +4198,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         num_blocks = self._get_kv_layer_num_blocks(
             kv_layer, is_mla=is_mla, block_size=self._block_size
         )
-        step_new_base_hashes: set[str] = set()
+        batch_items: list[
+            tuple[DeltaBlockTransferSpec, torch.Tensor, torch.Tensor | None]
+        ] = []
         for req_meta in metadata.requests:
             if not req_meta.is_store:
                 continue
@@ -3057,19 +4221,12 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     block_size=self._block_size,
                     start_position=blk_spec.start_position,
                 )
-                rec = self.store.store_block(
-                    layer_name=layer_name,
-                    full_block_hash=blk_spec.full_block_hash,
-                    token_ids=blk_spec.token_ids,
-                    start_position=blk_spec.start_position,
-                    k_block=k_blk,
-                    v_block=v_blk,
-                    divergence_distance=blk_spec.divergence_distance,
-                    exclude_base_hashes=step_new_base_hashes,
-                    prev_token_block_hash=blk_spec.prev_token_block_hash,
-                )
-                if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
-                    step_new_base_hashes.add(blk_spec.full_block_hash)
+                batch_items.append((blk_spec, k_blk, v_blk))
+        if batch_items:
+            self.store.store_blocks_batch(
+                layer_name=layer_name,
+                items=batch_items,
+            )
 
     def wait_for_save(self) -> None:
         """Save any Mamba/GDN recurrent state layers not visited by @maybe_transfer_kv_layer."""
@@ -3110,7 +4267,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             num_blocks = self._get_kv_layer_num_blocks(
                 kv_tensor, is_mla=False, block_size=self._block_size
             )
-            step_new_base_hashes: set[str] = set()
+            batch_items: list[
+                tuple[DeltaBlockTransferSpec, torch.Tensor, torch.Tensor | None]
+            ] = []
             for req_meta in store_reqs:
                 for blk_spec in req_meta.blocks:
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
@@ -3126,18 +4285,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         is_mla=False,
                         block_size=self._block_size,
                     )
-                    rec = self.store.store_block(
-                        layer_name=layer_name,
-                        full_block_hash=blk_spec.full_block_hash,
-                        token_ids=blk_spec.token_ids,
-                        start_position=blk_spec.start_position,
-                        k_block=k_blk,
-                        v_block=v_blk,
-                        divergence_distance=blk_spec.divergence_distance,
-                        exclude_base_hashes=step_new_base_hashes,
-                        prev_token_block_hash=blk_spec.prev_token_block_hash,
-                    )
-                    if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
-                        step_new_base_hashes.add(blk_spec.full_block_hash)
+                    batch_items.append((blk_spec, k_blk, v_blk))
+            if batch_items:
+                self.store.store_blocks_batch(
+                    layer_name=layer_name,
+                    items=batch_items,
+                )
 
         self._layers_saved_in_step.clear()
