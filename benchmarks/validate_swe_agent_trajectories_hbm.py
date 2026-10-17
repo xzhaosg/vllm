@@ -28,6 +28,7 @@ import torch
 from transformers import AutoTokenizer
 
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
@@ -37,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector im
     DeltaBlockStore,
     DeltaCompressionConnector,
 )
+from vllm.v1.core.kv_cache_utils import get_group_id
 
 
 def load_nebius_passing_trajectories(
@@ -195,9 +197,45 @@ def _encode_file_viewer_bucketed(
          `token_block_hash` matches on all overlapping 10-line buckets via RoPE shift.
     """
     if block_size >= 128:
-        raw_ids = tokenizer.encode(user_obs, add_special_tokens=False)
+        obs_lines = user_obs.splitlines(keepends=True)
+        buckets_50: dict[int, list[tuple[int, str]]] = defaultdict(list)
+        line_re_50 = re.compile(r"^(\d+):")
+        for ln in obs_lines:
+            m = line_re_50.match(ln)
+            if m:
+                lno = int(m.group(1))
+                buckets_50[(lno - 1) // 50].append((lno, ln))
+        if not buckets_50:
+            raw_ids = tokenizer.encode(user_obs, add_special_tokens=False)
+            return _align_to_block(
+                raw_ids, block_size, newline_id, target_blocks=max_file_blocks
+            )
+        out_ids_50: list[int] = []
+        slot_len = block_size // 5
+        for b_id in sorted(buckets_50.keys()):
+            if (len(out_ids_50) // block_size) >= max_file_blocks:
+                break
+            sub_buckets: dict[int, list[str]] = defaultdict(list)
+            for lno, ln in buckets_50[b_id]:
+                sub_id = ((lno - 1) % 50) // 10
+                sub_buckets[sub_id].append(ln)
+            blk_ids: list[int] = []
+            for s_id in range(5):
+                stxt = "".join(sub_buckets.get(s_id, []))
+                sids = (
+                    tokenizer.encode(stxt, add_special_tokens=False)
+                    if stxt
+                    else []
+                )
+                t_slot = slot_len if s_id < 4 else (block_size - 4 * slot_len)
+                if len(sids) < t_slot:
+                    sids = sids + [newline_id] * (t_slot - len(sids))
+                else:
+                    sids = sids[:t_slot]
+                blk_ids.extend(sids)
+            out_ids_50.extend(blk_ids)
         return _align_to_block(
-            raw_ids, block_size, newline_id, target_blocks=max_file_blocks
+            out_ids_50, block_size, newline_id, target_blocks=max_file_blocks
         )
 
     obs_lines = user_obs.splitlines(keepends=True)
@@ -297,6 +335,7 @@ def build_trajectory_samples(
     for sample_idx, item in enumerate(trajectories):
         inst = item["instance_id"]
         fpath = item["file_path"]
+        sys_txt = item.get("system_prompt", "")
         issue_txt = item["issue_text"]
         patch = item["generated_patch"]
         gt_symbols = _extract_patch_symbols(patch, fpath)
@@ -304,67 +343,25 @@ def build_trajectory_samples(
         sid_b = 200000000 + sample_idx
         sid_p = 300000000 + sample_idx
 
-        # 1. Base SWE-Agent ACI Header (Block 0..edit_blk)
-        base_step_idx = item["turns"][0]["step_idx"]
-        header_text = (
-            f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | "
-            f"Step: {base_step_idx} | Open File: {fpath}\n"
-            f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
-        )
-        if block_size >= 128:
-            header_text += f"Workspace Context ({fpath}):\n{issue_txt[:1500]}\n\n"
-        header_ids_base = _align_to_block(
-            tokenizer.encode(header_text, add_special_tokens=False),
-            block_size,
-            newline_id,
-            target_blocks=edit_blk,
-        )
-        header_ids_base[4] = newline_id
-        header_ids_base[9] = newline_id
-
-        # 2. Shared Issue Description + Real Recorded `[File: ...]` Window from `turns[0]["user_obs"]`
-        turn0_obs = item["turns"][0]["user_obs"]
-        body_section_text = (
-            f"ID: {sid_h} | Active SWE-Agent File Editor Window: {sid_b}\n\n"
+        # Shared GitHub Issue & Reference Patch Context block(s)
+        issue_blocks = 1 if block_size >= 128 else 8
+        obs_blocks = 2 if block_size >= 128 else 32
+        issue_section_text = (
+            f"ID: {sid_h} | Active SWE-Agent Issue & Patch Context: {sid_b}\n\n"
             f"### GitHub Issue ({inst})\n"
-            f"{issue_txt[:1200]}\n\n"
-            f"### SWE-Agent File Viewer ({fpath})\n"
-            f"{turn0_obs[:2400]}\n\n"
+            f"{issue_txt[:2000]}\n\n"
             f"### Reference Patch Context\n"
-            f"{patch[:1000]}\n\n"
+            f"{patch[:1200]}\n\n"
         )
-        body_ids_raw = tokenizer.encode(body_section_text, add_special_tokens=False)
-        max_body_blocks = 3 if block_size >= 128 else 40
-        min_body_blocks = 2 if block_size >= 128 else 24
-        while len(body_ids_raw) < min_body_blocks * block_size:
-            body_ids_raw = body_ids_raw + body_ids_raw
-        target_body_blocks = min(
-            max_body_blocks,
-            max(min_body_blocks, (len(body_ids_raw) + block_size - 1) // block_size),
+        issue_ids_raw = tokenizer.encode(issue_section_text, add_special_tokens=False)
+        while len(issue_ids_raw) < issue_blocks * block_size:
+            issue_ids_raw = issue_ids_raw + issue_ids_raw
+        issue_ids_base = _align_to_block(
+            issue_ids_raw, block_size, newline_id, target_blocks=issue_blocks
         )
-        body_ids_base = _align_to_block(
-            body_ids_raw, block_size, newline_id, target_blocks=target_body_blocks
-        )
-        body_ids_base[4] = newline_id
-        body_ids_base[9] = newline_id
+        turn0_obs = item["turns"][0]["user_obs"]
 
-        # 3. Rolling Action Log Prepend Block (1 * block_size tokens)
-        prepend_text = (
-            f"ID: {sid_p} | Rolling Trajectory Log: {inst} | Active File: {fpath}\n"
-            f"Previous Command: {item['turns'][0]['prev_ai_resp'][:220]}\n\n"
-        )
-        if block_size >= 128:
-            prepend_text += f"Trajectory History ({inst}):\n{turn0_obs[:1600]}\n\n"
-        prepend_ids_base = _align_to_block(
-            tokenizer.encode(prepend_text, add_special_tokens=False),
-            block_size,
-            newline_id,
-            target_blocks=1,
-        )
-        prepend_ids_base[3] = newline_id
-        prepend_ids_base[7] = newline_id
-
-        # 4. Suffix prompt asking for the next SWE-agent action & patch analysis
+        # Suffix prompt asking for the next SWE-agent action & patch analysis
         prompt_question = (
             f"You are working on `{fpath}` for `{inst}`. "
             f"State the target file `{os.path.basename(fpath)}`, the function/lines to edit "
@@ -389,41 +386,68 @@ def build_trajectory_samples(
         if len(suffix_ids) % block_size == 0:
             suffix_ids = [newline_id] + suffix_ids
 
-        # Build ALL turns extracted from the real trajectory
+        # Build ALL turns directly from each turn's real `step_idx`, `prev_ai_resp`, and `user_obs`
         stateful_turns: list[list[int]] = []
         rolling_turns: list[list[int]] = []
         gt_ai_resps: list[str] = []
 
         for t_idx, turn_data in enumerate(item["turns"]):
             gt_ai_resps.append(turn_data["ai_resp"])
-            t_a = edit_toks[t_idx % len(edit_toks)]
-            t_b = edit_toks[(t_idx + 17) % len(edit_toks)]
+            cur_step_idx = turn_data["step_idx"]
+            cur_user_obs = turn_data["user_obs"]
+            cur_prev_ai = turn_data.get("prev_ai_resp", "")
+
+            # 1. Real Turn `t_idx` SWE-Agent ACI Header (Block 0..edit_blk)
+            header_text = (
+                f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | "
+                f"Step: {cur_step_idx} | Open File: {fpath}\n"
+                f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
+            )
+            if block_size >= 128:
+                header_text += (
+                    f"System & Workspace Context ({fpath}):\n"
+                    f"{sys_txt[:800]}\n{issue_txt[:1200]}\n\n"
+                )
+            h_turn = _align_to_block(
+                tokenizer.encode(header_text, add_special_tokens=False),
+                block_size,
+                newline_id,
+                target_blocks=edit_blk,
+            )
+
+            # 2. Real Turn `t_idx` `[File: ...]` Window from `turn_data["user_obs"]`
+            obs_turn_ids = _encode_file_viewer_bucketed(
+                cur_user_obs,
+                fpath,
+                tokenizer,
+                block_size,
+                newline_id,
+                max_file_blocks=obs_blocks,
+            )
+            b_turn = issue_ids_base + obs_turn_ids
+            turn_prompt = h_turn + b_turn + suffix_ids
+            stateful_turns.append(turn_prompt)
 
             if t_idx == 0:
-                base_prompt = header_ids_base + body_ids_base + suffix_ids
-                stateful_turns.append(base_prompt)
-                rolling_turns.append(list(base_prompt))
+                rolling_turns.append(list(turn_prompt))
             else:
-                # T1_stateful_aci_window_dp0:
-                # Update ACI status bar (Block 0) + in-place code edit in File Viewer block
-                h_turn = list(header_ids_base)
-                h_turn[4] = t_b
-                h_turn[9] = t_a
-
-                b_turn = list(body_ids_base)
-                b_turn[4] = t_b
-                b_turn[9] = t_a
-
-                stateful_turns.append(h_turn + b_turn + suffix_ids)
-
                 # T2_rolling_action_history_dpB:
-                # Prepend 1-block Rolling Trajectory Log (shifting all Issue + File Viewer blocks by +B)
-                p_turn = list(prepend_ids_base)
-                p_turn[3] = t_a
-                p_turn[7] = t_b
-                rolling_turns.append(
-                    p_turn + header_ids_base + body_ids_base + suffix_ids
+                # Prepend 1-block Rolling Trajectory Log built from real `cur_step_idx` and `cur_prev_ai`
+                prepend_text = (
+                    f"ID: {sid_p} | Rolling Trajectory Log: {inst} | Active File: {fpath}\n"
+                    f"Step: {cur_step_idx} | Previous Command: {cur_prev_ai[:220]}\n\n"
                 )
+                if block_size >= 128:
+                    prepend_text += (
+                        f"Trajectory History ({inst}):\n{turn0_obs[:1600]}\n\n"
+                    )
+                p_turn = _align_to_block(
+                    tokenizer.encode(prepend_text, add_special_tokens=False),
+                    block_size,
+                    newline_id,
+                    target_blocks=1,
+                )
+                rolling_turns.append(p_turn + h_turn + b_turn + suffix_ids)
 
         samples.append(
             {
@@ -581,10 +605,49 @@ def token_f1(pred_text: str, ref_text: str) -> float:
     return (2 * precision * recall) / (precision + recall)
 
 
+def _get_blockpool_byte_metrics(llm: LLM, tp_size: int) -> dict[str, Any]:
+    scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+    kv_cache_manager = scheduler.kv_cache_manager
+    block_pool = kv_cache_manager.block_pool
+    kv_cache_config = kv_cache_manager.kv_cache_config
+    num_blocks = int(kv_cache_config.num_blocks)
+    per_worker_slot_bytes = (
+        int(kv_cache_config.kv_cache_tensors[0].size) // num_blocks
+        if kv_cache_config.kv_cache_tensors and num_blocks > 0
+        else 0
+    )
+    block_slot_bytes_total_tp = per_worker_slot_bytes * tp_size
+    group_unpadded_bytes_total_tp: dict[int, int] = {}
+    for g_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        unpadded_page = getattr(spec, "real_page_size_bytes", None) or getattr(
+            spec, "unpadded_page_size_bytes", None
+        )
+        if (
+            unpadded_page is not None
+            and getattr(spec, "page_size_padded", None) is not None
+            and unpadded_page < spec.page_size_bytes
+        ):
+            unpadded_per_worker = len(group.layer_names) * int(unpadded_page)
+        else:
+            unpadded_per_worker = per_worker_slot_bytes
+        group_unpadded_bytes_total_tp[g_id] = unpadded_per_worker * tp_size
+    return {
+        "kv_cache_manager": kv_cache_manager,
+        "block_pool": block_pool,
+        "num_gpu_blocks": num_blocks,
+        "block_slot_bytes_total_tp": block_slot_bytes_total_tp,
+        "group_unpadded_bytes_total_tp": group_unpadded_bytes_total_tp,
+    }
+
+
 def _accumulate_snap(dst: dict[str, Any], src: dict[str, Any]) -> None:
     dst["hbm_store_cuda_allocated_bytes"] += int(
         src.get("hbm_store_cuda_allocated_bytes", 0)
     )
+    dst["blockpool_physical_slot_bytes"] = int(
+        dst.get("blockpool_physical_slot_bytes", 0)
+    ) + int(src.get("blockpool_physical_slot_bytes", 0))
     dst["raw_bytes_equivalent"] += int(src.get("raw_bytes_equivalent", 0))
     dst["compressed_bytes_stored"] += int(src.get("compressed_bytes_stored", 0))
     for k, v in src.get("tier_counts", {}).items():
@@ -593,15 +656,19 @@ def _accumulate_snap(dst: dict[str, Any], src: dict[str, Any]) -> None:
 
 def evaluate_swe_agent_trajectories_hbm(
     llm: LLM,
-    store: DeltaBlockStore,
+    store: DeltaBlockStore | None,
     samples: list[dict[str, Any]],
     block_size: int,
+    tp_size: int = 8,
     gen_tokens: int = 128,
     wave_size: int = 20,
+    mode: str = "both",
+    blockpool_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     regimes = ["T1_stateful_aci_window_dp0", "T2_rolling_action_history_dpB"]
     prefill_params = SamplingParams(temperature=0.0, max_tokens=1)
     eval_params = SamplingParams(temperature=0.0, max_tokens=gen_tokens)
+    bp_meta = _get_blockpool_byte_metrics(llm, tp_size) if mode == "blockpool" else None
 
     results: dict[str, Any] = {}
     for regime in regimes:
@@ -614,15 +681,16 @@ def evaluate_swe_agent_trajectories_hbm(
 
         print(f"\n{'=' * 80}")
         print(
-            f"[NEBIUS SWE-AGENT TRAJECTORIES GPU HBM] Regime: {regime} "
+            f"[NEBIUS SWE-AGENT TRAJECTORIES GPU HBM ({mode.upper()})] Regime: {regime} "
             f"({len(samples)} verified-passing trajectories, {min_turns}-{max_turns} turns/traj, "
             f"{total_trajectory_turns} total trajectory-turns, {num_waves} HBM waves)"
         )
-        print(f"{'=' * 80}")
+        print(f"{'=' * 80}", flush=True)
 
         uncomp_turn_snaps: list[dict[str, Any]] = [
             {
                 "hbm_store_cuda_allocated_bytes": 0,
+                "blockpool_physical_slot_bytes": 0,
                 "raw_bytes_equivalent": 0,
                 "compressed_bytes_stored": 0,
                 "tier_counts": {},
@@ -632,6 +700,7 @@ def evaluate_swe_agent_trajectories_hbm(
         comp_turn_snaps: list[dict[str, Any]] = [
             {
                 "hbm_store_cuda_allocated_bytes": 0,
+                "blockpool_physical_slot_bytes": 0,
                 "raw_bytes_equivalent": 0,
                 "compressed_bytes_stored": 0,
                 "tier_counts": {},
@@ -641,51 +710,149 @@ def evaluate_swe_agent_trajectories_hbm(
         uncomp_outputs: list[Any] = []
         comp_outputs: list[Any] = []
 
+        if mode == "blockpool":
+            assert bp_meta is not None
+            block_pool = bp_meta["block_pool"]
+            slot_bytes_tp = int(bp_meta["block_slot_bytes_total_tp"])
+            group_unpadded_tp = bp_meta["group_unpadded_bytes_total_tp"]
+
+            for w_idx in range(num_waves):
+                w_start = w_idx * wave_size
+                w_end = min(len(all_turns_per_sample), w_start + wave_size)
+                wave_turns = all_turns_per_sample[w_start:w_end]
+                wave_final_prompts = [s_turns[-1] for s_turns in wave_turns]
+
+                llm.reset_prefix_cache()
+                wave_cached_hashes: dict[Any, int] = {}
+                last_uncomp_snap: dict[str, Any] = {
+                    "hbm_store_cuda_allocated_bytes": 0,
+                    "blockpool_physical_slot_bytes": 0,
+                    "raw_bytes_equivalent": 0,
+                    "compressed_bytes_stored": 0,
+                    "tier_counts": {},
+                }
+                for t in range(max_turns):
+                    active_prompts = [
+                        s_turns[t] for s_turns in wave_turns if t < len(s_turns)
+                    ]
+                    if active_prompts:
+                        turn_prompts = _unique_full_block_prompts(
+                            active_prompts, block_size
+                        )
+                        _ = llm.generate(
+                            [{"prompt_token_ids": p} for p in turn_prompts],
+                            prefill_params,
+                            use_tqdm=False,
+                        )
+                        for blk in block_pool.blocks:
+                            if not blk.is_null and blk.block_hash is not None:
+                                wave_cached_hashes[blk.block_hash] = get_group_id(
+                                    blk.block_hash
+                                )
+                        unpadded_bytes = sum(
+                            int(group_unpadded_tp.get(g_id, slot_bytes_tp))
+                            for g_id in wave_cached_hashes.values()
+                        )
+                        slot_bytes = len(wave_cached_hashes) * slot_bytes_tp
+                        last_uncomp_snap = {
+                            "hbm_store_cuda_allocated_bytes": unpadded_bytes,
+                            "blockpool_physical_slot_bytes": slot_bytes,
+                            "raw_bytes_equivalent": unpadded_bytes,
+                            "compressed_bytes_stored": unpadded_bytes,
+                            "tier_counts": {
+                                "BLOCKPOOL_CACHED": len(wave_cached_hashes)
+                            },
+                        }
+                    _accumulate_snap(uncomp_turn_snaps[t], last_uncomp_snap)
+
+                wave_outs = llm.generate(
+                    [{"prompt_token_ids": p} for p in wave_final_prompts],
+                    eval_params,
+                    use_tqdm=False,
+                )
+                for o in wave_outs:
+                    uncomp_outputs.append(
+                        {
+                            "token_ids": list(o.outputs[0].token_ids),
+                            "text": o.outputs[0].text,
+                        }
+                    )
+
+                u_mb = uncomp_turn_snaps[-1]["hbm_store_cuda_allocated_bytes"] / (
+                    1024**2
+                )
+                u_slot_mb = uncomp_turn_snaps[-1]["blockpool_physical_slot_bytes"] / (
+                    1024**2
+                )
+                print(
+                    f"  [{regime}] BlockPool Wave {w_idx + 1}/{num_waves} "
+                    f"(trajectories {w_start + 1}..{w_end}/{len(samples)}) done | "
+                    f"Cumul Unpadded Tensor HBM: {u_mb:.1f} MB | "
+                    f"Physical BlockPool Slot HBM: {u_slot_mb:.1f} MB",
+                    flush=True,
+                )
+
+            results[regime] = {
+                "uncomp_turn_snaps": uncomp_turn_snaps,
+                "uncomp_outputs": uncomp_outputs,
+                "blockpool_num_gpu_blocks": bp_meta["num_gpu_blocks"],
+                "blockpool_slot_bytes_total_tp": slot_bytes_tp,
+            }
+            continue
+
+        if mode == "delta" and blockpool_data is not None:
+            reg_bp = blockpool_data["regimes"][regime]
+            uncomp_turn_snaps = reg_bp["uncomp_turn_snaps"]
+            uncomp_outputs = reg_bp["uncomp_outputs"]
+
+        assert store is not None
         for w_idx in range(num_waves):
             w_start = w_idx * wave_size
             w_end = min(len(all_turns_per_sample), w_start + wave_size)
             wave_turns = all_turns_per_sample[w_start:w_end]
             wave_final_prompts = [s_turns[-1] for s_turns in wave_turns]
 
-            # ------------------------------------------------------------------
-            # 1. UNCOMPRESSED GPU HBM MODE (`force_uncompressed=True`)
-            # ------------------------------------------------------------------
-            llm.reset_prefix_cache()
-            base_cuda_uncomp = _configure_and_clear_all(
-                llm, store, force_uncompressed=True
-            )
-            last_uncomp_snap: dict[str, Any] = {
-                "hbm_store_cuda_allocated_bytes": 0,
-                "raw_bytes_equivalent": 0,
-                "compressed_bytes_stored": 0,
-                "tier_counts": {},
-            }
-            for t in range(max_turns):
-                active_prompts = [
-                    s_turns[t] for s_turns in wave_turns if t < len(s_turns)
-                ]
-                if active_prompts:
-                    turn_prompts = _unique_full_block_prompts(
-                        active_prompts, block_size
-                    )
-                    _ = llm.generate(
-                        [{"prompt_token_ids": p} for p in turn_prompts],
-                        prefill_params,
+            if mode == "both":
+                # ------------------------------------------------------------------
+                # 1. UNCOMPRESSED GPU HBM MODE (`force_uncompressed=True`)
+                # ------------------------------------------------------------------
+                llm.reset_prefix_cache()
+                base_cuda_uncomp = _configure_and_clear_all(
+                    llm, store, force_uncompressed=True
+                )
+                last_uncomp_snap = {
+                    "hbm_store_cuda_allocated_bytes": 0,
+                    "blockpool_physical_slot_bytes": 0,
+                    "raw_bytes_equivalent": 0,
+                    "compressed_bytes_stored": 0,
+                    "tier_counts": {},
+                }
+                for t in range(max_turns):
+                    active_prompts = [
+                        s_turns[t] for s_turns in wave_turns if t < len(s_turns)
+                    ]
+                    if active_prompts:
+                        turn_prompts = _unique_full_block_prompts(
+                            active_prompts, block_size
+                        )
+                        _ = llm.generate(
+                            [{"prompt_token_ids": p} for p in turn_prompts],
+                            prefill_params,
+                            use_tqdm=False,
+                        )
+                        llm.reset_prefix_cache()
+                        last_uncomp_snap = _collect_hbm_snapshot(
+                            llm, store, base_cuda_uncomp
+                        )
+                    _accumulate_snap(uncomp_turn_snaps[t], last_uncomp_snap)
+
+                uncomp_outputs.extend(
+                    llm.generate(
+                        [{"prompt_token_ids": p} for p in wave_final_prompts],
+                        eval_params,
                         use_tqdm=False,
                     )
-                    llm.reset_prefix_cache()
-                    last_uncomp_snap = _collect_hbm_snapshot(
-                        llm, store, base_cuda_uncomp
-                    )
-                _accumulate_snap(uncomp_turn_snaps[t], last_uncomp_snap)
-
-            uncomp_outputs.extend(
-                llm.generate(
-                    [{"prompt_token_ids": p} for p in wave_final_prompts],
-                    eval_params,
-                    use_tqdm=False,
                 )
-            )
 
             # ------------------------------------------------------------------
             # 2. DELTA-COMPRESSED GPU HBM MODE (`force_uncompressed=False`)
@@ -696,6 +863,7 @@ def evaluate_swe_agent_trajectories_hbm(
             )
             last_comp_snap: dict[str, Any] = {
                 "hbm_store_cuda_allocated_bytes": 0,
+                "blockpool_physical_slot_bytes": 0,
                 "raw_bytes_equivalent": 0,
                 "compressed_bytes_stored": 0,
                 "tier_counts": {},
@@ -730,7 +898,7 @@ def evaluate_swe_agent_trajectories_hbm(
             print(
                 f"  [{regime}] Wave {w_idx + 1}/{num_waves} "
                 f"(trajectories {w_start + 1}..{w_end}/{len(samples)}) done | "
-                f"Cumul Uncomp HBM: {u_mb:.1f} MB -> Delta HBM: {c_mb:.1f} MB "
+                f"Cumul Baseline HBM: {u_mb:.1f} MB -> Delta HBM: {c_mb:.1f} MB "
                 f"({u_mb / max(c_mb, 1e-6):.2f}x)",
                 flush=True,
             )
@@ -744,6 +912,10 @@ def evaluate_swe_agent_trajectories_hbm(
         turn_progression: list[dict[str, Any]] = []
         for t in range(max_turns):
             u_cuda_mb = uncomp_turn_snaps[t]["hbm_store_cuda_allocated_bytes"] / (1024**2)
+            u_slot_mb = uncomp_turn_snaps[t].get(
+                "blockpool_physical_slot_bytes",
+                uncomp_turn_snaps[t]["hbm_store_cuda_allocated_bytes"],
+            ) / (1024**2)
             c_cuda_mb = comp_turn_snaps[t]["hbm_store_cuda_allocated_bytes"] / (1024**2)
             u_ten_mb = uncomp_turn_snaps[t]["compressed_bytes_stored"] / (1024**2)
             c_ten_mb = comp_turn_snaps[t]["compressed_bytes_stored"] / (1024**2)
@@ -754,13 +926,18 @@ def evaluate_swe_agent_trajectories_hbm(
                         1 for s_turns in all_turns_per_sample if t < len(s_turns)
                     ),
                     "uncompressed_cuda_mb": round(u_cuda_mb, 2),
+                    "blockpool_physical_slot_mb": round(u_slot_mb, 2),
                     "delta_compressed_cuda_mb": round(c_cuda_mb, 2),
                     "saved_cuda_mb": round(u_cuda_mb - c_cuda_mb, 2),
+                    "saved_blockpool_slot_mb": round(u_slot_mb - c_cuda_mb, 2),
                     "saved_cuda_pct": round(
                         100.0 * (1.0 - c_cuda_mb / max(u_cuda_mb, 1e-6)), 2
                     ),
                     "cumulative_cuda_ratio": round(
                         u_cuda_mb / max(c_cuda_mb, 1e-6), 2
+                    ),
+                    "cumulative_blockpool_slot_ratio": round(
+                        u_slot_mb / max(c_cuda_mb, 1e-6), 2
                     ),
                     "cumulative_tensor_ratio": round(
                         u_ten_mb / max(c_ten_mb, 1e-6), 2
@@ -772,6 +949,10 @@ def evaluate_swe_agent_trajectories_hbm(
         # 3. Compute GPU HBM Memory & Accuracy Metrics
         # ------------------------------------------------------------------
         uncomp_cuda_mb = uncomp_total_snap["hbm_store_cuda_allocated_bytes"] / (1024**2)
+        uncomp_slot_mb = uncomp_total_snap.get(
+            "blockpool_physical_slot_bytes",
+            uncomp_total_snap["hbm_store_cuda_allocated_bytes"],
+        ) / (1024**2)
         comp_cuda_mb = comp_total_snap["hbm_store_cuda_allocated_bytes"] / (1024**2)
         uncomp_turn1_cuda_mb = uncomp_turn1_snap["hbm_store_cuda_allocated_bytes"] / (1024**2)
         comp_turn1_cuda_mb = comp_turn1_snap["hbm_store_cuda_allocated_bytes"] / (1024**2)
@@ -789,6 +970,7 @@ def evaluate_swe_agent_trajectories_hbm(
         total_tensor_ratio = uncomp_tensor_mb / max(comp_tensor_mb, 1e-6)
         inc_tensor_ratio = inc_uncomp_tensor_mb / max(inc_comp_tensor_mb, 1e-6)
         total_cuda_ratio = uncomp_cuda_mb / max(comp_cuda_mb, 1e-6)
+        total_slot_ratio = uncomp_slot_mb / max(comp_cuda_mb, 1e-6)
         inc_cuda_ratio = inc_uncomp_cuda_mb / max(inc_comp_cuda_mb, 1e-6)
 
         hbm_budget_mb = comp_tensor_mb * 1.05
@@ -808,9 +990,13 @@ def evaluate_swe_agent_trajectories_hbm(
         comp_symbol_hits = 0
 
         for s, b_out, c_out in zip(samples, uncomp_outputs, comp_outputs):
-            b_ids = list(b_out.outputs[0].token_ids)
+            if isinstance(b_out, dict):
+                b_ids = list(b_out["token_ids"])
+                b_txt = str(b_out["text"])
+            else:
+                b_ids = list(b_out.outputs[0].token_ids)
+                b_txt = b_out.outputs[0].text
             c_ids = list(c_out.outputs[0].token_ids)
-            b_txt = b_out.outputs[0].text
             c_txt = c_out.outputs[0].text
 
             if b_ids and c_ids and b_ids[0] == c_ids[0]:
@@ -835,18 +1021,27 @@ def evaluate_swe_agent_trajectories_hbm(
                 inc_tiers[k] = max(0, inc_v)
 
         summary = {
+            "baseline_engine": "vLLM BlockPool (enable_prefix_caching=True, kv_transfer_config=None)"
+            if mode == "delta" and blockpool_data is not None
+            else "Uncompressed GPU HBM",
             "num_trajectories": len(samples),
             "min_turns_per_trajectory": min_turns,
             "max_turns_per_trajectory": max_turns,
             "avg_turns_per_trajectory": round(avg_turns, 2),
             "total_trajectory_turns": total_trajectory_turns,
             "uncompressed_hbm_cuda_allocated_mb": round(uncomp_cuda_mb, 2),
+            "blockpool_physical_slot_hbm_mb": round(uncomp_slot_mb, 2),
             "delta_compressed_hbm_cuda_allocated_mb": round(comp_cuda_mb, 2),
             "hbm_cuda_memory_saved_mb": round(uncomp_cuda_mb - comp_cuda_mb, 2),
+            "blockpool_physical_slot_saved_mb": round(uncomp_slot_mb - comp_cuda_mb, 2),
             "hbm_cuda_memory_saved_pct": round(
                 100.0 * (1.0 - comp_cuda_mb / max(uncomp_cuda_mb, 1e-6)), 2
             ),
+            "blockpool_physical_slot_saved_pct": round(
+                100.0 * (1.0 - comp_cuda_mb / max(uncomp_slot_mb, 1e-6)), 2
+            ),
             "total_allturns_hbm_cuda_ratio": round(total_cuda_ratio, 2),
+            "total_allturns_blockpool_slot_ratio": round(total_slot_ratio, 2),
             "incremental_hbm_cuda_ratio": round(inc_cuda_ratio, 2),
             "uncompressed_hbm_tensor_mb": round(uncomp_tensor_mb, 2),
             "delta_compressed_hbm_tensor_mb": round(comp_tensor_mb, 2),
@@ -878,7 +1073,7 @@ def evaluate_swe_agent_trajectories_hbm(
             "turn_progression": turn_progression,
         }
         print(f"\n--- [NEBIUS SWE-AGENT TRAJECTORIES GPU HBM] Summary for {regime} ---")
-        print(json.dumps(summary, indent=2))
+        print(json.dumps(summary, indent=2), flush=True)
         results[regime] = summary
 
     return results
@@ -888,14 +1083,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate GPU HBM savings on real verified-passing SWE-agent trajectories."
     )
-    parser.add_argument("--model", type=str, default="openai/gpt-oss-120b")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3.5-397B-A17B-FP8")
     parser.add_argument("--tensor-parallel-size", type=int, default=8)
-    parser.add_argument("--num-trajectories", type=int, default=20)
-    parser.add_argument("--min-turns", type=int, default=8)
+    parser.add_argument("--num-trajectories", type=int, default=157)
+    parser.add_argument("--min-turns", type=int, default=4)
     parser.add_argument("--max-turns", type=int, default=12)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.68)
     parser.add_argument("--gen-tokens", type=int, default=128)
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["blockpool", "delta", "both"],
+        default="both",
+    )
+    parser.add_argument("--blockpool-json", type=str, default="")
     parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
 
@@ -912,27 +1114,42 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    llm = LLM(
-        model=args.model,
-        tensor_parallel_size=args.tensor_parallel_size,
-        block_size=16,
-        enable_prefix_caching=True,
-        async_scheduling=False,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-        max_num_batched_tokens=16384,
-        enforce_eager=True,
-        kv_transfer_config=KVTransferConfig(
-            kv_connector="DeltaCompressionConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config={
-                "store_device": "cuda",
-                "force_uncompressed": False,
-            },
-        ),
-    )
+    if args.mode == "blockpool":
+        llm = LLM(
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            block_size=16,
+            enable_prefix_caching=True,
+            async_scheduling=False,
+            gpu_memory_utilization=max(args.gpu_memory_utilization, 0.88),
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=16384,
+            enforce_eager=True,
+        )
+        store = None
+    else:
+        llm = LLM(
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            block_size=16,
+            enable_prefix_caching=True,
+            async_scheduling=False,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=16384,
+            enforce_eager=True,
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config={
+                    "store_device": "cuda",
+                    "force_uncompressed": False,
+                },
+            ),
+        )
+        store = get_shared_store()
+
     resolved_block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
-    store = get_shared_store()
 
     samples = build_trajectory_samples(
         trajectories=trajectories,
@@ -949,28 +1166,39 @@ def main() -> None:
         f"avg Turn-1 prompt len={avg_len:.1f} tokens, block_size={resolved_block_size})."
     )
 
+    blockpool_data: dict[str, Any] | None = None
+    if args.mode == "delta" and args.blockpool_json:
+        with open(args.blockpool_json, encoding="utf-8") as f:
+            blockpool_data = json.load(f)
+        print(f"Loaded BlockPool baseline data from {args.blockpool_json}")
+
     traj_results = evaluate_swe_agent_trajectories_hbm(
         llm=llm,
         store=store,
         samples=samples,
         block_size=resolved_block_size,
+        tp_size=args.tensor_parallel_size,
         gen_tokens=args.gen_tokens,
+        mode=args.mode,
+        blockpool_data=blockpool_data,
     )
 
     out_payload = {
         "model": args.model,
         "dataset": "nebius/SWE-agent-trajectories (target == True, verified passing, all turns)",
-        "storage_tier": "GPU_HBM (torch.cuda.memory_allocated)",
+        "storage_tier": "GPU_HBM (vLLM BlockPool vs DeltaCompressionConnector)",
+        "mode": args.mode,
         "tensor_parallel_size": args.tensor_parallel_size,
         "block_size": resolved_block_size,
         "num_trajectories": len(samples),
         "total_trajectory_turns": total_turns,
         "regimes": traj_results,
     }
-    if args.output_json:
-        with open(args.output_json, "w", encoding="utf-8") as f:
+    target_json = args.blockpool_json if (args.mode == "blockpool" and args.blockpool_json and not args.output_json) else args.output_json
+    if target_json:
+        with open(target_json, "w", encoding="utf-8") as f:
             json.dump(out_payload, f, indent=2)
-        print(f"\nSaved SWE-agent trajectories GPU HBM results to {args.output_json}")
+        print(f"\nSaved SWE-agent trajectories GPU HBM results ({args.mode}) to {target_json}")
 
 
 if __name__ == "__main__":

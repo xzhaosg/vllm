@@ -451,6 +451,8 @@ class DeltaCompressionStats:
     total_blocks_loaded: int = 0
     raw_bytes_equivalent: int = 0
     compressed_bytes_stored: int = 0
+    evicted_blocks: int = 0
+    evicted_bytes: int = 0
     tier_counts: dict[CompressionTier, int] = field(
         default_factory=lambda: {tier: 0 for tier in CompressionTier}
     )
@@ -560,6 +562,17 @@ class DeltaBlockStore:
         # 512-byte minimum allocation rounding on small quantized scale/index tensors:
         self._gpu_slabs: dict[torch.device, list[torch.Tensor]] = {}
         self._gpu_slab_offsets: dict[torch.device, int] = {}
+        self._gpu_slabs_by_block: dict[tuple[torch.device, str], list[torch.Tensor]] = {}
+        self._gpu_slab_offsets_by_block: dict[tuple[torch.device, str], int] = {}
+        # LRU ordering (oldest first) and base->dependent reference tracking for eviction:
+        self._block_lru: dict[str, None] = {}
+        self._dependents_by_base: dict[str, set[str]] = {}
+        self._record_raw_bytes: dict[tuple[str, str], int] = {}
+        self._known_layers: set[str] = set()
+        self._known_slab_devices: set[torch.device] = set()
+        self._partial_match_cache: dict[
+            tuple[str, int], tuple[str | None, list[int]]
+        ] = {}
 
         self.stats = DeltaCompressionStats()
 
@@ -575,22 +588,76 @@ class DeltaBlockStore:
         self._known_mamba_blocks.clear()
         self._gpu_slabs.clear()
         self._gpu_slab_offsets.clear()
+        self._gpu_slabs_by_block.clear()
+        self._gpu_slab_offsets_by_block.clear()
+        self._block_lru.clear()
+        self._dependents_by_base.clear()
+        self._record_raw_bytes.clear()
+        self._known_layers.clear()
+        self._known_slab_devices.clear()
+        self._partial_match_cache.clear()
         self._clear_epoch += 1
         self.stats = DeltaCompressionStats()
         if str(self.device).startswith("cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _pack_cuda_tensor(self, t: torch.Tensor) -> torch.Tensor:
-        """Pack a CUDA tensor into a contiguous 256 KB uint8 slab arena.
+    def _touch_lru(
+        self, full_block_hash: str, ref_base_hash: str | None = None
+    ) -> None:
+        """Promote `full_block_hash` (and its `ref_base_hash` after it) to most-recently-used."""
+        self._block_lru.pop(full_block_hash, None)
+        self._block_lru[full_block_hash] = None
+        if ref_base_hash and ref_base_hash != full_block_hash:
+            self._block_lru.pop(ref_base_hash, None)
+            self._block_lru[ref_base_hash] = None
+
+    def demote_lru(self, full_block_hash: str) -> None:
+        """Move `full_block_hash` to the oldest (least-recently-used) position if it has no dependents."""
+        if full_block_hash in self._block_lru and not self._dependents_by_base.get(
+            full_block_hash
+        ):
+            self._block_lru.pop(full_block_hash, None)
+            new_lru: dict[str, None] = {full_block_hash: None}
+            new_lru.update(self._block_lru)
+            self._block_lru = new_lru
+
+    def _pack_cuda_tensor(
+        self, t: torch.Tensor, block_hash: str = ""
+    ) -> torch.Tensor:
+        """Pack a CUDA tensor into a contiguous uint8 slab arena when not 512B-aligned.
 
         Eliminates PyTorch CUDACachingAllocator's 512-byte minimum block rounding
-        for small quantized scale and sparse index tensors stored in GPU HBM.
+        for small quantized scale and sparse index tensors stored in GPU HBM while
+        allowing per-block reclamation during LRU eviction.
         """
         if not t.is_cuda or t.numel() == 0:
             return t
         dev = t.device
         elem_size = t.element_size()
         nbytes = t.numel() * elem_size
+        if nbytes >= 512 and nbytes % 512 == 0:
+            return t.contiguous()
+        if block_hash:
+            slab_size = 4096  # 4 KB per-block slab (exact multiple of 512B)
+            if nbytes >= slab_size:
+                return t.contiguous()
+            self._known_slab_devices.add(dev)
+            bkey = (dev, block_hash)
+            slabs = self._gpu_slabs_by_block.setdefault(bkey, [])
+            off = self._gpu_slab_offsets_by_block.get(bkey, slab_size)
+            aligned_off = (off + elem_size - 1) & ~(elem_size - 1)
+            if not slabs or aligned_off + nbytes > slab_size:
+                slabs.append(torch.empty(slab_size, dtype=torch.uint8, device=dev))
+                aligned_off = 0
+            slab = slabs[-1]
+            view = (
+                slab[aligned_off : aligned_off + nbytes]
+                .view(t.dtype)
+                .reshape(t.shape)
+            )
+            view.copy_(t)
+            self._gpu_slab_offsets_by_block[bkey] = aligned_off + nbytes
+            return view
         slab_size = 262144  # 256 KB (exact multiple of 512B allocator block)
         if nbytes >= slab_size:
             return t.contiguous()
@@ -624,6 +691,7 @@ class DeltaBlockStore:
         self._known_token_blocks.setdefault(token_hash, full_block_hash)
         if self.has_mamba_layers and has_mamba_state:
             self._known_mamba_blocks.add(full_block_hash)
+        self._touch_lru(full_block_hash)
 
     @staticmethod
     def _get_pigeonhole_slices(
@@ -729,6 +797,7 @@ class DeltaBlockStore:
         start_position: int | None = None,
         exclude_hashes: set[str] | None = None,
         prev_token_block_hash: str = "",
+        full_block_hash: str = "",
     ) -> tuple[CompressedKVBlockRecord | None, list[int]]:
         """Find an UNCOMPRESSED_BASE block in the same layer differing in <= M tokens."""
         policy = self.get_layer_policy(layer_name)
@@ -739,30 +808,42 @@ class DeltaBlockStore:
         )
         if max_exceptions <= 0:
             return None, []
+        cache_key = (full_block_hash, max_exceptions) if full_block_hash else None
+        if cache_key is not None and cache_key in self._partial_match_cache:
+            cached_base_hash, cached_diff_idx = self._partial_match_cache[cache_key]
+            if cached_base_hash is None:
+                return None, []
+            cached_rec = self._records.get((layer_name, cached_base_hash))
+            if (
+                cached_rec is not None
+                and cached_rec.tier == CompressionTier.UNCOMPRESSED_BASE
+                and (not exclude_hashes or cached_base_hash not in exclude_hashes)
+            ):
+                return cached_rec, cached_diff_idx
+
         num_slices = max_exceptions + 1
         seen_hashes: set[str] = set()
         candidates: list[CompressedKVBlockRecord] = []
+        matched_buckets: list[list[CompressedKVBlockRecord]] = []
         for s_idx, sub_tuple in self._get_pigeonhole_slices(token_ids, num_slices):
             bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
             if bucket:
-                for rec in bucket[-32:]:
-                    if exclude_hashes and rec.full_block_hash in exclude_hashes:
-                        continue
-                    if rec.full_block_hash not in seen_hashes:
-                        seen_hashes.add(rec.full_block_hash)
-                        candidates.append(rec)
+                matched_buckets.append(bucket)
+        matched_buckets.sort(key=len)
+        for bucket in matched_buckets:
+            for rec in bucket[-256:]:
+                if exclude_hashes and rec.full_block_hash in exclude_hashes:
+                    continue
+                if rec.full_block_hash not in seen_hashes:
+                    seen_hashes.add(rec.full_block_hash)
+                    candidates.append(rec)
 
         best_base: CompressedKVBlockRecord | None = None
         best_diff_indices: list[int] = []
-        best_score: tuple[int, int] = (999, 999)
+        best_score: tuple[int, int, int] = (999, 999, 999999)
 
         for base_rec in candidates:
             if len(base_rec.token_ids) != len(token_ids):
-                continue
-            if (
-                start_position is not None
-                and base_rec.start_position != start_position
-            ):
                 continue
             diff_idx = [
                 i
@@ -778,13 +859,23 @@ class DeltaBlockStore:
                     )
                     else 1
                 )
-                score = (prev_match, len(diff_idx))
+                pos_dist = (
+                    abs(start_position - base_rec.start_position)
+                    if start_position is not None
+                    else 0
+                )
+                score = (prev_match, len(diff_idx), pos_dist)
                 if best_base is None or score < best_score:
                     best_base = base_rec
                     best_diff_indices = diff_idx
                     best_score = score
-                    if score == (0, 1):
+                    if prev_match == 0 and len(diff_idx) <= 2 and pos_dist == 0:
                         break
+        if cache_key is not None:
+            self._partial_match_cache[cache_key] = (
+                best_base.full_block_hash if best_base is not None else None,
+                best_diff_indices,
+            )
         return best_base, best_diff_indices
 
     def store_block(
@@ -821,7 +912,9 @@ class DeltaBlockStore:
         """
         key = (layer_name, full_block_hash)
         if key in self._records:
-            return self._records[key]
+            rec = self._records[key]
+            self._touch_lru(full_block_hash, rec.ref_base_hash)
+            return rec
 
         token_tuple = tuple(int(t) for t in token_ids)
         token_hash = compute_token_block_hash(token_tuple)
@@ -904,19 +997,62 @@ class DeltaBlockStore:
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
             )
-            delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
-            k_norm = torch.linalg.norm(k_cpu.to(torch.float32)).item()
-            dk_norm = torch.linalg.norm(delta_k).item()
-            eta_k = dk_norm / max(k_norm, 1e-8)
+            k_fp32 = k_cpu.to(torch.float32)
+            delta_k = k_fp32 - k_ref_aligned.to(torch.float32)
+            eta_k_t = torch.linalg.norm(delta_k) / torch.linalg.norm(k_fp32).clamp(
+                min=1e-8
+            )
+            check_outliers = (
+                not policy.is_mamba
+                and policy.max_sparse_exceptions > 0
+                and delta_k.ndim >= 2
+                and delta_k.shape[0] >= 4
+            )
+            outlier_mask: torch.Tensor | None = None
 
             if v_cpu is not None and base_rec.raw_v is not None:
-                delta_v = v_cpu.to(torch.float32) - base_rec.raw_v.to(torch.float32)
-                v_norm = torch.linalg.norm(v_cpu.to(torch.float32)).item()
-                dv_norm = torch.linalg.norm(delta_v).item()
-                eta_v = dv_norm / max(v_norm, 1e-8)
+                v_fp32 = v_cpu.to(torch.float32)
+                delta_v = v_fp32 - base_rec.raw_v.to(torch.float32)
+                eta_v_t = torch.linalg.norm(delta_v) / torch.linalg.norm(v_fp32).clamp(
+                    min=1e-8
+                )
+                if check_outliers:
+                    b_tok = delta_k.shape[0]
+                    dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
+                    k_tok = torch.linalg.norm(k_fp32.reshape(b_tok, -1), dim=-1).clamp(
+                        min=1e-6
+                    )
+                    dv_tok = torch.linalg.norm(delta_v.reshape(b_tok, -1), dim=-1)
+                    v_tok = torch.linalg.norm(v_fp32.reshape(b_tok, -1), dim=-1).clamp(
+                        min=1e-6
+                    )
+                    tok_eta = torch.maximum(dk_tok / k_tok, dv_tok / v_tok)
+                    outlier_mask = tok_eta > 0.65
+                    eta_k, eta_v, num_outliers_f = torch.stack(
+                        [eta_k_t, eta_v_t, outlier_mask.sum().to(torch.float32)]
+                    ).tolist()
+                    num_outliers = int(num_outliers_f)
+                else:
+                    eta_k, eta_v = torch.stack([eta_k_t, eta_v_t]).tolist()
+                    num_outliers = 0
                 eta_max = max(eta_k, eta_v)
             else:
                 delta_v = None
+                v_fp32 = None
+                if check_outliers:
+                    b_tok = delta_k.shape[0]
+                    dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
+                    k_tok = torch.linalg.norm(k_fp32.reshape(b_tok, -1), dim=-1).clamp(
+                        min=1e-6
+                    )
+                    outlier_mask = (dk_tok / k_tok) > 0.65
+                    eta_k, num_outliers_f = torch.stack(
+                        [eta_k_t, outlier_mask.sum().to(torch.float32)]
+                    ).tolist()
+                    num_outliers = int(num_outliers_f)
+                else:
+                    eta_k = float(eta_k_t.item())
+                    num_outliers = 0
                 eta_v = 0.0
                 eta_max = eta_k
 
@@ -941,50 +1077,32 @@ class DeltaBlockStore:
 
             # Check for localized 1-2 token MoE/attention-sink spikes inside an
             # exact-token-match block before falling through to dense INT2/INT4:
-            if (
-                not policy.is_mamba
-                and policy.max_sparse_exceptions > 0
-                and delta_k.ndim >= 2
-                and delta_k.shape[0] >= 4
-            ):
-                b_tok = delta_k.shape[0]
-                dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
-                k_tok = torch.linalg.norm(
-                    k_cpu.to(torch.float32).reshape(b_tok, -1), dim=-1
-                ).clamp(min=1e-6)
-                tok_eta_k = dk_tok / k_tok
-                if delta_v is not None and v_cpu is not None:
-                    dv_tok = torch.linalg.norm(delta_v.reshape(b_tok, -1), dim=-1)
-                    v_tok = torch.linalg.norm(
-                        v_cpu.to(torch.float32).reshape(b_tok, -1), dim=-1
-                    ).clamp(min=1e-6)
-                    tok_eta = torch.maximum(tok_eta_k, dv_tok / v_tok)
-                else:
-                    tok_eta = tok_eta_k
+            if check_outliers and outlier_mask is not None:
                 max_sparse = min(2, policy.max_sparse_exceptions)
-                outlier_mask = tok_eta > 0.65
-                num_outliers = int(outlier_mask.sum().item())
                 if 0 < num_outliers <= max_sparse:
                     outlier_idx = torch.nonzero(outlier_mask, as_tuple=False).reshape(-1)
                     delta_k_rem = delta_k.clone()
                     delta_k_rem[outlier_idx] = 0.0
-                    k_rem = k_cpu.to(torch.float32).clone()
+                    k_rem = k_fp32.clone()
                     k_rem[outlier_idx] = 0.0
-                    rem_eta_k = torch.linalg.norm(delta_k_rem).item() / max(
-                        torch.linalg.norm(k_rem).item(), 1e-8
-                    )
-                    if delta_v is not None and v_cpu is not None:
+                    rem_eta_k_t = torch.linalg.norm(delta_k_rem) / torch.linalg.norm(
+                        k_rem
+                    ).clamp(min=1e-8)
+                    if delta_v is not None and v_fp32 is not None:
                         delta_v_rem = delta_v.clone()
                         delta_v_rem[outlier_idx] = 0.0
-                        v_rem = v_cpu.to(torch.float32).clone()
+                        v_rem = v_fp32.clone()
                         v_rem[outlier_idx] = 0.0
-                        rem_eta_v = torch.linalg.norm(delta_v_rem).item() / max(
-                            torch.linalg.norm(v_rem).item(), 1e-8
-                        )
+                        rem_eta_v_t = torch.linalg.norm(
+                            delta_v_rem
+                        ) / torch.linalg.norm(v_rem).clamp(min=1e-8)
+                        rem_eta_k, rem_eta_v = torch.stack(
+                            [rem_eta_k_t, rem_eta_v_t]
+                        ).tolist()
                         rem_eta_max = max(rem_eta_k, rem_eta_v)
                     else:
                         delta_v_rem = None
-                        rem_eta_max = rem_eta_k
+                        rem_eta_max = float(rem_eta_k_t.item())
 
                     if rem_eta_max <= policy.tau_int4:
                         sparse_k = k_cpu[outlier_idx].clone()
@@ -1082,27 +1200,30 @@ class DeltaBlockStore:
                 start_position=start_position,
                 exclude_hashes=exclude_base_hashes,
                 prev_token_block_hash=prev_token_block_hash,
+                full_block_hash=full_block_hash,
             )
         )
         if partial_base is not None and diff_indices:
             assert partial_base.raw_k is not None
             delta_pos = start_position - partial_base.start_position
             if policy.is_mamba:
-                delta_k = k_cpu.to(torch.float32) - partial_base.raw_k.to(torch.float32)
-                k_norm = torch.linalg.norm(k_cpu.to(torch.float32)).item()
-                dk_norm = torch.linalg.norm(delta_k).item()
-                eta_k = dk_norm / max(k_norm, 1e-8)
+                k_fp32 = k_cpu.to(torch.float32)
+                delta_k = k_fp32 - partial_base.raw_k.to(torch.float32)
+                eta_k_t = torch.linalg.norm(delta_k) / torch.linalg.norm(k_fp32).clamp(
+                    min=1e-8
+                )
 
                 if v_cpu is not None and partial_base.raw_v is not None:
-                    delta_v = v_cpu.to(torch.float32) - partial_base.raw_v.to(
-                        torch.float32
-                    )
-                    v_norm = torch.linalg.norm(v_cpu.to(torch.float32)).item()
-                    dv_norm = torch.linalg.norm(delta_v).item()
-                    eta_v = dv_norm / max(v_norm, 1e-8)
+                    v_fp32 = v_cpu.to(torch.float32)
+                    delta_v = v_fp32 - partial_base.raw_v.to(torch.float32)
+                    eta_v_t = torch.linalg.norm(delta_v) / torch.linalg.norm(
+                        v_fp32
+                    ).clamp(min=1e-8)
+                    eta_k, eta_v = torch.stack([eta_k_t, eta_v_t]).tolist()
                     eta_max = max(eta_k, eta_v)
                 else:
                     delta_v = None
+                    eta_k = float(eta_k_t.item())
                     eta_v = 0.0
                     eta_max = eta_k
 
@@ -1200,7 +1321,9 @@ class DeltaBlockStore:
                     for idx_i in all_sparse_indices:
                         tok_eta[idx_i] = 0.0
                     top_vals, top_idxs = torch.topk(tok_eta, k=min(rem_slots, b_tok))
-                    for val, idx_i in zip(top_vals.tolist(), top_idxs.tolist()):
+                    for val, idx_i in torch.stack(
+                        [top_vals, top_idxs.to(torch.float32)], dim=-1
+                    ).tolist():
                         if val > 0.65:
                             all_sparse_indices.append(int(idx_i))
                     all_sparse_indices.sort()
@@ -1214,19 +1337,21 @@ class DeltaBlockStore:
                 delta_k[idx_tensor] = 0.0
                 k_rem = k_cpu.to(torch.float32).clone()
                 k_rem[idx_tensor] = 0.0
-                eta_k = torch.linalg.norm(delta_k).item() / max(
-                    torch.linalg.norm(k_rem).item(), 1e-8
+                eta_k_t = torch.linalg.norm(delta_k) / torch.linalg.norm(k_rem).clamp(
+                    min=1e-8
                 )
 
                 if delta_v is not None and v_cpu is not None:
                     delta_v[idx_tensor] = 0.0
                     v_rem = v_cpu.to(torch.float32).clone()
                     v_rem[idx_tensor] = 0.0
-                    eta_v = torch.linalg.norm(delta_v).item() / max(
-                        torch.linalg.norm(v_rem).item(), 1e-8
-                    )
+                    eta_v_t = torch.linalg.norm(delta_v) / torch.linalg.norm(
+                        v_rem
+                    ).clamp(min=1e-8)
+                    eta_k, eta_v = torch.stack([eta_k_t, eta_v_t]).tolist()
                     eta_max = max(eta_k, eta_v)
                 else:
+                    eta_k = float(eta_k_t.item())
                     eta_max = eta_k
 
                 if policy.layer_idx == 0 or eta_max <= policy.tau_int4:
@@ -1302,39 +1427,182 @@ class DeltaBlockStore:
         record: CompressedKVBlockRecord,
         raw_bytes: int,
     ) -> CompressedKVBlockRecord:
+        bhash = record.full_block_hash
         if str(self.device).startswith("cuda"):
             if record.raw_k is not None:
-                record.raw_k = self._pack_cuda_tensor(record.raw_k)
+                record.raw_k = self._pack_cuda_tensor(record.raw_k, bhash)
             if record.raw_v is not None:
-                record.raw_v = self._pack_cuda_tensor(record.raw_v)
+                record.raw_v = self._pack_cuda_tensor(record.raw_v, bhash)
             if record.quant_delta_k is not None:
                 record.quant_delta_k.packed_data = self._pack_cuda_tensor(
-                    record.quant_delta_k.packed_data
+                    record.quant_delta_k.packed_data, bhash
                 )
                 record.quant_delta_k.scales = self._pack_cuda_tensor(
-                    record.quant_delta_k.scales
+                    record.quant_delta_k.scales, bhash
                 )
             if record.quant_delta_v is not None:
                 record.quant_delta_v.packed_data = self._pack_cuda_tensor(
-                    record.quant_delta_v.packed_data
+                    record.quant_delta_v.packed_data, bhash
                 )
                 record.quant_delta_v.scales = self._pack_cuda_tensor(
-                    record.quant_delta_v.scales
+                    record.quant_delta_v.scales, bhash
                 )
             if record.sparse_token_indices is not None:
                 record.sparse_token_indices = self._pack_cuda_tensor(
-                    record.sparse_token_indices
+                    record.sparse_token_indices, bhash
                 )
             if record.sparse_k_bf16 is not None:
-                record.sparse_k_bf16 = self._pack_cuda_tensor(record.sparse_k_bf16)
+                record.sparse_k_bf16 = self._pack_cuda_tensor(
+                    record.sparse_k_bf16, bhash
+                )
             if record.sparse_v_bf16 is not None:
-                record.sparse_v_bf16 = self._pack_cuda_tensor(record.sparse_v_bf16)
-        self._records[(layer_name, record.full_block_hash)] = record
+                record.sparse_v_bf16 = self._pack_cuda_tensor(
+                    record.sparse_v_bf16, bhash
+                )
+        self._known_layers.add(layer_name)
+        self._records[(layer_name, bhash)] = record
+        self._record_raw_bytes[(layer_name, bhash)] = raw_bytes
+        if record.ref_base_hash:
+            self._dependents_by_base.setdefault(record.ref_base_hash, set()).add(
+                bhash
+            )
+        self._touch_lru(bhash, record.ref_base_hash)
         self.stats.total_blocks_stored += 1
         self.stats.raw_bytes_equivalent += raw_bytes
         self.stats.compressed_bytes_stored += record.nbytes
         self.stats.tier_counts[record.tier] += 1
         return record
+
+    def evict_block(self, full_block_hash: str) -> list[str]:
+        """Evict `full_block_hash` (and any dependent delta blocks) across all layers."""
+        evicted: list[str] = []
+        deps = list(self._dependents_by_base.pop(full_block_hash, set()))
+        for dep_hash in deps:
+            if dep_hash != full_block_hash and dep_hash in self._block_lru:
+                evicted.extend(self.evict_block(dep_hash))
+
+        all_layers = set(self.layer_policies.keys()) | self._known_layers
+        for layer_name in all_layers:
+            rec = self._records.pop((layer_name, full_block_hash), None)
+            raw_b = self._record_raw_bytes.pop((layer_name, full_block_hash), 0)
+            if rec is None:
+                continue
+            self.stats.compressed_bytes_stored = max(
+                0, self.stats.compressed_bytes_stored - rec.nbytes
+            )
+            self.stats.raw_bytes_equivalent = max(
+                0, self.stats.raw_bytes_equivalent - raw_b
+            )
+            self.stats.tier_counts[rec.tier] = max(
+                0, self.stats.tier_counts.get(rec.tier, 0) - 1
+            )
+            self.stats.evicted_blocks += 1
+            self.stats.evicted_bytes += rec.nbytes
+
+            if rec.ref_base_hash and rec.ref_base_hash in self._dependents_by_base:
+                self._dependents_by_base[rec.ref_base_hash].discard(full_block_hash)
+
+            if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
+                t_key = (layer_name, rec.token_block_hash)
+                t_list = self._base_by_token_hash_list.get(t_key)
+                if t_list:
+                    self._base_by_token_hash_list[t_key] = [
+                        r for r in t_list if r.full_block_hash != full_block_hash
+                    ]
+                    if self._base_by_token_hash_list[t_key]:
+                        self._base_by_token_hash[t_key] = (
+                            self._base_by_token_hash_list[t_key][0]
+                        )
+                    else:
+                        self._base_by_token_hash_list.pop(t_key, None)
+                        self._base_by_token_hash.pop(t_key, None)
+                else:
+                    self._base_by_token_hash.pop(t_key, None)
+
+                l_list = self._base_blocks_by_layer.get(layer_name)
+                if l_list:
+                    self._base_blocks_by_layer[layer_name] = [
+                        r for r in l_list if r.full_block_hash != full_block_hash
+                    ]
+
+                policy = self.get_layer_policy(layer_name)
+                max_exceptions = (
+                    self.max_sparse_exceptions
+                    if policy.is_mamba
+                    else policy.max_sparse_exceptions
+                )
+                if max_exceptions > 0:
+                    num_slices = max_exceptions + 1
+                    for s_idx, sub_tuple in self._get_pigeonhole_slices(
+                        rec.token_ids, num_slices
+                    ):
+                        s_key = (layer_name, s_idx, sub_tuple)
+                        s_bucket = self._base_by_subchunk.get(s_key)
+                        if s_bucket:
+                            new_b = [
+                                r
+                                for r in s_bucket
+                                if r.full_block_hash != full_block_hash
+                            ]
+                            if new_b:
+                                self._base_by_subchunk[s_key] = new_b
+                            else:
+                                self._base_by_subchunk.pop(s_key, None)
+
+        tok_pos = self._known_prefix_blocks.pop(full_block_hash, None)
+        self._known_mamba_blocks.discard(full_block_hash)
+        if tok_pos is not None:
+            tok_hash = compute_token_block_hash(tok_pos[0])
+            if self._known_token_blocks.get(tok_hash) == full_block_hash:
+                self._known_token_blocks.pop(tok_hash, None)
+
+        self._block_lru.pop(full_block_hash, None)
+        self._partial_match_cache.pop(
+            (full_block_hash, self.max_sparse_exceptions), None
+        )
+        for dev in self._known_slab_devices:
+            bkey = (dev, full_block_hash)
+            self._gpu_slabs_by_block.pop(bkey, None)
+            self._gpu_slab_offsets_by_block.pop(bkey, None)
+
+        evicted.append(full_block_hash)
+        return evicted
+
+    def evict_lru_to_budget(
+        self, max_bytes: int, protected_hashes: set[str] | None = None
+    ) -> list[str]:
+        """Evict least-recently-used blocks until `compressed_bytes_stored <= max_bytes`."""
+        if max_bytes <= 0 or self.stats.compressed_bytes_stored <= max_bytes:
+            return []
+        effective_protected: set[str] = set(protected_hashes or ())
+        if effective_protected and self._dependents_by_base:
+            changed = True
+            while changed:
+                changed = False
+                for base_h, deps in self._dependents_by_base.items():
+                    if base_h not in effective_protected and (deps & effective_protected):
+                        effective_protected.add(base_h)
+                        changed = True
+
+        evicted_all: list[str] = []
+        # Pass 1: Prefer evicting leaf blocks (0 live dependents) in LRU order
+        for cand in list(self._block_lru):
+            if self.stats.compressed_bytes_stored <= max_bytes:
+                break
+            if (
+                cand in self._block_lru
+                and cand not in effective_protected
+                and not self._dependents_by_base.get(cand)
+            ):
+                evicted_all.extend(self.evict_block(cand))
+        # Pass 2: Fall back to oldest unprotected anchor block if still above budget
+        if self.stats.compressed_bytes_stored > max_bytes:
+            for cand in list(self._block_lru):
+                if self.stats.compressed_bytes_stored <= max_bytes:
+                    break
+                if cand in self._block_lru and cand not in effective_protected:
+                    evicted_all.extend(self.evict_block(cand))
+        return evicted_all
 
     def reconstruct_block(
         self,
@@ -1352,6 +1620,8 @@ class DeltaBlockStore:
         """
         policy = self.get_layer_policy(layer_name)
         rec = self._records.get((layer_name, full_block_hash))
+        if rec is not None:
+            self._touch_lru(full_block_hash, rec.ref_base_hash)
 
         # If exact full_block_hash wasn't stored, check if we can synthesize from
         # a token_block_hash match (e.g. Layer 0 or LOCAL_SLIDING zero-bit hit).

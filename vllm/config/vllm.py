@@ -1196,6 +1196,7 @@ class VllmConfig:
         if (
             self.kv_transfer_config is None
             or self.kv_transfer_config.kv_connector is None
+            or self.kv_transfer_config.kv_connector == "DeltaCompressionConnector"
         ):
             return
 
