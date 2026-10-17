@@ -127,19 +127,23 @@ def _worker_enforce_hbm_budget(
     max_bytes_per_worker: int = 0,
     touch_hashes: list[str] | None = None,
     demote_hashes: list[str] | None = None,
+    retire_hashes: list[str] | None = None,
     protected_hashes: list[str] | None = None,
     incoming_new_blocks: int = 0,
 ) -> dict[str, Any]:
     evicted: list[str] = []
     if DeltaCompressionConnector._shared_stores:
         w_store = next(iter(DeltaCompressionConnector._shared_stores.values()))
-        if demote_hashes:
-            for h in demote_hashes:
-                w_store.demote_lru(h)
         if touch_hashes:
             for h in touch_hashes:
                 if h in w_store._block_lru:
                     w_store._touch_lru(h)
+        if demote_hashes:
+            for h in demote_hashes:
+                w_store.demote_lru(h)
+        if retire_hashes:
+            for h in retire_hashes:
+                w_store.retire_lru(h)
         prot_set = set(protected_hashes) if protected_hashes else None
         if max_bytes_per_worker > 0:
             slab_overhead = 0
@@ -227,16 +231,20 @@ def _enforce_hbm_budget_all(
     max_bytes_per_worker: int,
     touch_hashes: list[str] | None = None,
     demote_hashes: list[str] | None = None,
+    retire_hashes: list[str] | None = None,
     protected_hashes: list[str] | None = None,
     incoming_new_blocks: int = 0,
 ) -> list[str]:
-    if demote_hashes:
-        for h in demote_hashes:
-            store.demote_lru(h)
     if touch_hashes:
         for h in touch_hashes:
             if h in store._block_lru:
                 store._touch_lru(h)
+    if demote_hashes:
+        for h in demote_hashes:
+            store.demote_lru(h)
+    if retire_hashes:
+        for h in retire_hashes:
+            store.retire_lru(h)
     evicted_union: set[str] = set()
     try:
         res = llm.collective_rpc(
@@ -245,6 +253,7 @@ def _enforce_hbm_budget_all(
                 "max_bytes_per_worker": max_bytes_per_worker,
                 "touch_hashes": touch_hashes or [],
                 "demote_hashes": demote_hashes or [],
+                "retire_hashes": retire_hashes or [],
                 "protected_hashes": protected_hashes or [],
                 "incoming_new_blocks": incoming_new_blocks,
             },
@@ -678,18 +687,24 @@ def _run_single_eviction_mode(
         ]
         num_waves = (len(active_indices) + wave_size - 1) // wave_size
 
+        completed_in_turn_t: set[int] = set()
         for w_idx in range(num_waves):
             wave_idxs = active_indices[w_idx * wave_size : (w_idx + 1) * wave_size]
             wave_prompts: list[list[int]] = []
             wave_prompt_owners: list[int] = []
             touch_hashes: list[str] = []
             demote_hashes: list[str] = []
+            retire_hashes: list[str] = []
             protected_hashes: list[str] = []
+            pre_protected_hashes: list[str] = []
 
-            # Keep active trajectories' base anchors and latest-completed turns warm in LRU
+            # Keep active trajectories' base anchors and latest already-stored turns warm in LRU
             for idx_all in range(num_samples):
                 sh_all = all_hashes_per_sample[idx_all]
-                latest_k = min(t, len(sh_all) - 1)
+                if t == 0 or idx_all in completed_in_turn_t or t >= len(sh_all):
+                    latest_k = min(t, len(sh_all) - 1)
+                else:
+                    latest_k = min(max(0, t - 1), len(sh_all) - 1)
                 if not force_uncompressed:
                     touch_hashes.extend(sh_all[0])
                 touch_hashes.extend(sh_all[latest_k])
@@ -704,12 +719,19 @@ def _run_single_eviction_mode(
                     wave_prompt_owners.append(i)
                     cum_total_prefill_tokens += len(s_turns[0])
                     protected_hashes.extend(base_h)
+                    pre_protected_hashes.extend(base_h)
                 else:
+                    prev_leaf_h = s_hashes[t - 1]
+                    pre_protected_hashes.extend(prev_leaf_h)
                     if not force_uncompressed and t >= 2:
-                        prev_leaf_h = s_hashes[t - 1]
                         for h in prev_leaf_h:
                             if h not in base_h and h not in s_hashes[t]:
                                 demote_hashes.append(h)
+                    if not force_uncompressed and t == len(s_turns) - 1:
+                        for prev_k in range(1, t):
+                            for h in s_hashes[prev_k]:
+                                if h not in base_h and h not in s_hashes[t]:
+                                    retire_hashes.append(h)
 
                     # Check whether the session's Turn-1 base anchor (`s_turns[0]`)
                     # is still resident in GPU HBM
@@ -721,6 +743,7 @@ def _run_single_eviction_mode(
                         cum_session_hits += 1
                         touch_hashes.extend(base_h)
                         protected_hashes.extend(base_h)
+                        pre_protected_hashes.extend(base_h)
                     else:
                         cum_session_misses += 1
                         # Re-prefill evicted session anchor (`s_turns[0]`) on GPU
@@ -730,11 +753,13 @@ def _run_single_eviction_mode(
                         cum_recomputed_tokens += len(s_turns[0])
                         cum_total_prefill_tokens += len(s_turns[0])
                         protected_hashes.extend(base_h)
+                        pre_protected_hashes.extend(base_h)
 
                     wave_prompts.append(s_turns[t])
                     wave_prompt_owners.append(i)
                     cum_total_prefill_tokens += len(s_turns[t])
                     protected_hashes.extend(s_hashes[t])
+                    pre_protected_hashes.extend(s_hashes[t])
 
             if wave_prompts:
                 t_wave_start = time.perf_counter()
@@ -758,8 +783,8 @@ def _run_single_eviction_mode(
                             store=store,
                             max_bytes_per_worker=max_bytes_per_worker,
                             touch_hashes=touch_hashes,
-                            demote_hashes=demote_hashes,
-                            protected_hashes=protected_hashes,
+                            demote_hashes=None,
+                            protected_hashes=pre_protected_hashes,
                             incoming_new_blocks=len(new_sb_hashes) + 2,
                         )
                     _ = llm.generate(
@@ -769,12 +794,25 @@ def _run_single_eviction_mode(
                     )
                     llm.reset_prefix_cache()
 
+                completed_in_turn_t.update(wave_idxs)
+                post_touch_hashes: list[str] = []
+                for idx_all in range(num_samples):
+                    sh_all = all_hashes_per_sample[idx_all]
+                    if t == 0 or idx_all in completed_in_turn_t or t >= len(sh_all):
+                        latest_k = min(t, len(sh_all) - 1)
+                    else:
+                        latest_k = min(max(0, t - 1), len(sh_all) - 1)
+                    if not force_uncompressed:
+                        post_touch_hashes.extend(sh_all[0])
+                    post_touch_hashes.extend(sh_all[latest_k])
+
                 _enforce_hbm_budget_all(
                     llm=llm,
                     store=store,
                     max_bytes_per_worker=max_bytes_per_worker,
-                    touch_hashes=touch_hashes,
+                    touch_hashes=post_touch_hashes,
                     demote_hashes=demote_hashes,
+                    retire_hashes=retire_hashes,
                     protected_hashes=protected_hashes,
                 )
                 wave_elapsed = time.perf_counter() - t_wave_start

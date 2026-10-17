@@ -566,12 +566,17 @@ class DeltaBlockStore:
         self._gpu_slab_offsets_by_block: dict[tuple[torch.device, str], int] = {}
         # LRU ordering (oldest first) and base->dependent reference tracking for eviction:
         self._block_lru: dict[str, None] = {}
+        self._demoted_blocks: set[str] = set()
+        self._retired_blocks: set[str] = set()
         self._dependents_by_base: dict[str, set[str]] = {}
         self._record_raw_bytes: dict[tuple[str, str], int] = {}
         self._known_layers: set[str] = set()
         self._known_slab_devices: set[torch.device] = set()
         self._partial_match_cache: dict[
-            tuple[str, int], tuple[str | None, list[int]]
+            tuple[str, int, tuple[str, ...]], tuple[str | None, list[int]]
+        ] = {}
+        self._pigeonhole_slice_cache: dict[
+            tuple[str, int], list[tuple[int, tuple[int, ...]]]
         ] = {}
 
         self.stats = DeltaCompressionStats()
@@ -591,11 +596,14 @@ class DeltaBlockStore:
         self._gpu_slabs_by_block.clear()
         self._gpu_slab_offsets_by_block.clear()
         self._block_lru.clear()
+        self._demoted_blocks.clear()
+        self._retired_blocks.clear()
         self._dependents_by_base.clear()
         self._record_raw_bytes.clear()
         self._known_layers.clear()
         self._known_slab_devices.clear()
         self._partial_match_cache.clear()
+        self._pigeonhole_slice_cache.clear()
         self._clear_epoch += 1
         self.stats = DeltaCompressionStats()
         if str(self.device).startswith("cuda") and torch.cuda.is_available():
@@ -605,6 +613,8 @@ class DeltaBlockStore:
         self, full_block_hash: str, ref_base_hash: str | None = None
     ) -> None:
         """Promote `full_block_hash` (and its `ref_base_hash` after it) to most-recently-used."""
+        self._demoted_blocks.discard(full_block_hash)
+        self._retired_blocks.discard(full_block_hash)
         self._block_lru.pop(full_block_hash, None)
         self._block_lru[full_block_hash] = None
         if ref_base_hash and ref_base_hash != full_block_hash:
@@ -612,14 +622,15 @@ class DeltaBlockStore:
             self._block_lru[ref_base_hash] = None
 
     def demote_lru(self, full_block_hash: str) -> None:
-        """Move `full_block_hash` to the oldest (least-recently-used) position if it has no dependents."""
-        if full_block_hash in self._block_lru and not self._dependents_by_base.get(
-            full_block_hash
-        ):
-            self._block_lru.pop(full_block_hash, None)
-            new_lru: dict[str, None] = {full_block_hash: None}
-            new_lru.update(self._block_lru)
-            self._block_lru = new_lru
+        """Mark `full_block_hash` as demoted while preserving chronological LRU order."""
+        if full_block_hash in self._block_lru:
+            self._demoted_blocks.add(full_block_hash)
+
+    def retire_lru(self, full_block_hash: str) -> None:
+        """Mark `full_block_hash` as belonging to a completed trajectory's superseded history."""
+        if full_block_hash in self._block_lru:
+            self._demoted_blocks.add(full_block_hash)
+            self._retired_blocks.add(full_block_hash)
 
     def _pack_cuda_tensor(
         self, t: torch.Tensor, block_hash: str = ""
@@ -808,7 +819,41 @@ class DeltaBlockStore:
         )
         if max_exceptions <= 0:
             return None, []
-        cache_key = (full_block_hash, max_exceptions) if full_block_hash else None
+        num_slices = max_exceptions + 1
+        slice_key = (full_block_hash, num_slices) if full_block_hash else None
+        if slice_key is not None and slice_key in self._pigeonhole_slice_cache:
+            slices = self._pigeonhole_slice_cache[slice_key]
+        else:
+            slices = self._get_pigeonhole_slices(token_ids, num_slices)
+            if slice_key is not None:
+                self._pigeonhole_slice_cache[slice_key] = slices
+
+        seen_hashes: set[str] = set()
+        candidates: list[CompressedKVBlockRecord] = []
+        matched_buckets: list[list[CompressedKVBlockRecord]] = []
+        for s_idx, sub_tuple in slices:
+            bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
+            if bucket:
+                matched_buckets.append(bucket)
+        if not matched_buckets:
+            return None, []
+        matched_buckets.sort(key=len)
+        for bucket in matched_buckets:
+            for rec in bucket[-256:]:
+                if exclude_hashes and rec.full_block_hash in exclude_hashes:
+                    continue
+                if rec.full_block_hash not in seen_hashes:
+                    seen_hashes.add(rec.full_block_hash)
+                    candidates.append(rec)
+        if not candidates:
+            return None, []
+
+        cand_sig = tuple(c.full_block_hash for c in candidates)
+        cache_key = (
+            (full_block_hash, max_exceptions, cand_sig)
+            if full_block_hash
+            else None
+        )
         if cache_key is not None and cache_key in self._partial_match_cache:
             cached_base_hash, cached_diff_idx = self._partial_match_cache[cache_key]
             if cached_base_hash is None:
@@ -820,23 +865,6 @@ class DeltaBlockStore:
                 and (not exclude_hashes or cached_base_hash not in exclude_hashes)
             ):
                 return cached_rec, cached_diff_idx
-
-        num_slices = max_exceptions + 1
-        seen_hashes: set[str] = set()
-        candidates: list[CompressedKVBlockRecord] = []
-        matched_buckets: list[list[CompressedKVBlockRecord]] = []
-        for s_idx, sub_tuple in self._get_pigeonhole_slices(token_ids, num_slices):
-            bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
-            if bucket:
-                matched_buckets.append(bucket)
-        matched_buckets.sort(key=len)
-        for bucket in matched_buckets:
-            for rec in bucket[-256:]:
-                if exclude_hashes and rec.full_block_hash in exclude_hashes:
-                    continue
-                if rec.full_block_hash not in seen_hashes:
-                    seen_hashes.add(rec.full_block_hash)
-                    candidates.append(rec)
 
         best_base: CompressedKVBlockRecord | None = None
         best_diff_indices: list[int] = []
@@ -1557,8 +1585,10 @@ class DeltaBlockStore:
                 self._known_token_blocks.pop(tok_hash, None)
 
         self._block_lru.pop(full_block_hash, None)
-        self._partial_match_cache.pop(
-            (full_block_hash, self.max_sparse_exceptions), None
+        self._demoted_blocks.discard(full_block_hash)
+        self._retired_blocks.discard(full_block_hash)
+        self._pigeonhole_slice_cache.pop(
+            (full_block_hash, self.max_sparse_exceptions + 1), None
         )
         for dev in self._known_slab_devices:
             bkey = (dev, full_block_hash)
@@ -1567,6 +1597,30 @@ class DeltaBlockStore:
 
         evicted.append(full_block_hash)
         return evicted
+
+    def _is_attention_base_block(self, full_block_hash: str) -> bool:
+        """Return True if `full_block_hash` is an UNCOMPRESSED_BASE block in any attention layer."""
+        for layer_name in self._known_layers:
+            policy = self.get_layer_policy(layer_name)
+            if not policy.is_mamba:
+                rec = self._records.get((layer_name, full_block_hash))
+                if rec is not None and rec.tier == CompressionTier.UNCOMPRESSED_BASE:
+                    return True
+        return False
+
+    def _is_pos0_base_block(self, full_block_hash: str) -> bool:
+        """Return True if `full_block_hash` is a `start_position == 0` UNCOMPRESSED_BASE block."""
+        for layer_name in self._known_layers:
+            policy = self.get_layer_policy(layer_name)
+            if not policy.is_mamba:
+                rec = self._records.get((layer_name, full_block_hash))
+                if (
+                    rec is not None
+                    and rec.tier == CompressionTier.UNCOMPRESSED_BASE
+                    and rec.start_position == 0
+                ):
+                    return True
+        return False
 
     def evict_lru_to_budget(
         self, max_bytes: int, protected_hashes: set[str] | None = None
@@ -1585,16 +1639,66 @@ class DeltaBlockStore:
                         changed = True
 
         evicted_all: list[str] = []
-        # Pass 1: Prefer evicting leaf blocks (0 live dependents) in LRU order
+        # Pass 1A: Prefer evicting demoted compressed delta leaf blocks (0 live dependents) first
         for cand in list(self._block_lru):
             if self.stats.compressed_bytes_stored <= max_bytes:
                 break
             if (
                 cand in self._block_lru
+                and cand in self._demoted_blocks
                 and cand not in effective_protected
                 and not self._dependents_by_base.get(cand)
+                and not self._is_attention_base_block(cand)
             ):
                 evicted_all.extend(self.evict_block(cand))
+        # Pass 1B: Evict demoted unreferenced start_position==0 UNCOMPRESSED_BASE blocks (superseded action headers)
+        if self.stats.compressed_bytes_stored > max_bytes:
+            for cand in list(self._block_lru):
+                if self.stats.compressed_bytes_stored <= max_bytes:
+                    break
+                if (
+                    cand in self._block_lru
+                    and cand in self._demoted_blocks
+                    and cand not in effective_protected
+                    and not self._dependents_by_base.get(cand)
+                    and self._is_pos0_base_block(cand)
+                ):
+                    evicted_all.extend(self.evict_block(cand))
+        # Pass 1C: Evict completed trajectories' remaining unreferenced intermediate UNCOMPRESSED_BASE blocks
+        if self.stats.compressed_bytes_stored > max_bytes:
+            for cand in list(self._block_lru):
+                if self.stats.compressed_bytes_stored <= max_bytes:
+                    break
+                if (
+                    cand in self._block_lru
+                    and cand in self._retired_blocks
+                    and cand not in effective_protected
+                    and not self._dependents_by_base.get(cand)
+                ):
+                    evicted_all.extend(self.evict_block(cand))
+        # Pass 1D: Evict remaining demoted unreferenced UNCOMPRESSED_BASE blocks if still above budget
+        if self.stats.compressed_bytes_stored > max_bytes:
+            for cand in list(self._block_lru):
+                if self.stats.compressed_bytes_stored <= max_bytes:
+                    break
+                if (
+                    cand in self._block_lru
+                    and cand in self._demoted_blocks
+                    and cand not in effective_protected
+                    and not self._dependents_by_base.get(cand)
+                ):
+                    evicted_all.extend(self.evict_block(cand))
+        # Pass 1E: Evict any remaining unreferenced blocks (0 live dependents) in strict LRU order
+        if self.stats.compressed_bytes_stored > max_bytes:
+            for cand in list(self._block_lru):
+                if self.stats.compressed_bytes_stored <= max_bytes:
+                    break
+                if (
+                    cand in self._block_lru
+                    and cand not in effective_protected
+                    and not self._dependents_by_base.get(cand)
+                ):
+                    evicted_all.extend(self.evict_block(cand))
         # Pass 2: Fall back to oldest unprotected anchor block if still above budget
         if self.stats.compressed_bytes_stored > max_bytes:
             for cand in list(self._block_lru):
