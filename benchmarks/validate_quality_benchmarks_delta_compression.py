@@ -68,9 +68,9 @@ def ensure_file(url: str, local_path: str) -> str:
 
 def extract_gsm8k_answer(text: str) -> int:
     """Official vLLM gsm8k_eval.py numerical answer extractor."""
-    # If '####' delimiter is present, prioritize the number right after '####'
+    # If '####' delimiter is present, prioritize the number right after the first '####'
     if "####" in text:
-        after_hash = text.split("####")[-1]
+        after_hash = text.split("####")[1]
         after_hash_clean = after_hash.replace(",", "")
         nums = re.findall(r"-?\d+\.?\d*", after_hash_clean)
         if nums:
@@ -160,79 +160,114 @@ def build_gsm8k_samples(
         for d in range(1, 10)
     ]
 
-    # Build a clean multi-shot demonstration split cleanly at edit_blk * block_size
-    edit_blk = 1 if block_size >= 128 else 2
-    part1_target = edit_blk * block_size
-    header_base = (
-        "ID: 100000000 | Mode: Math Reasoning Benchmark\n"
-        "Solve each math word problem step by step and end with #### <number>.\n\n"
-    )
-    header_ids = tokenizer.encode(header_base, add_special_tokens=False)
+    if block_size >= 128:
+        # Build a clean multi-shot demonstration split cleanly at edit_blk * block_size
+        edit_blk = 1
+        part1_target = edit_blk * block_size
+        header_base = (
+            "ID: 100000000 | Mode: Math Reasoning Benchmark\n"
+            "Solve each math word problem step by step and end with #### <number>.\n\n"
+        )
+        header_ids = tokenizer.encode(header_base, add_special_tokens=False)
 
-    part1_demos = ""
-    shot_idx = 0
-    while shot_idx < len(train_data):
-        ex = train_data[shot_idx]
-        cand = part1_demos + f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
-        cand_ids = tokenizer.encode(cand, add_special_tokens=False)
-        if len(header_ids) + len(cand_ids) <= part1_target - 4:
-            part1_demos = cand
+        part1_demos = ""
+        shot_idx = 0
+        while shot_idx < len(train_data):
+            ex = train_data[shot_idx]
+            cand = part1_demos + f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
+            cand_ids = tokenizer.encode(cand, add_special_tokens=False)
+            if len(header_ids) + len(cand_ids) <= part1_target - 4:
+                part1_demos = cand
+                shot_idx += 1
+            else:
+                break
+        part1_demo_ids = tokenizer.encode(part1_demos, add_special_tokens=False)
+        part1_pad = part1_target - len(header_ids) - len(part1_demo_ids)
+        part1_ids = header_ids + [newline_id] * part1_pad + part1_demo_ids
+        assert len(part1_ids) == part1_target
+
+        sec_header = "ID: 100000000 | Section: 200000000\n\n"
+        sec_header_ids = tokenizer.encode(sec_header, add_special_tokens=False)
+        min_prefix_tokens = max(512, 3 * block_size)
+        part2_demos = ""
+        while (
+            part1_target
+            + len(sec_header_ids)
+            + len(tokenizer.encode(part2_demos, add_special_tokens=False))
+            < min_prefix_tokens - 32
+        ):
+            ex = train_data[shot_idx]
+            part2_demos += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
             shot_idx += 1
+        part2_demo_ids = tokenizer.encode(part2_demos, add_special_tokens=False)
+
+        total_raw_prefix = part1_target + len(sec_header_ids) + len(part2_demo_ids)
+        target_blocks = max(3, (total_raw_prefix + block_size - 1) // block_size)
+        target_prefix_len = target_blocks * block_size
+        pad_needed = target_prefix_len - total_raw_prefix
+        aligned_prefix = (
+            part1_ids + sec_header_ids + [newline_id] * pad_needed + part2_demo_ids
+        )
+        assert len(aligned_prefix) == target_prefix_len
+
+        ctx_header = (
+            "ID: 100000000 | Context: 200000000\n"
+            "Read each problem carefully, verify intermediate steps, "
+            "and provide the final numerical answer after ####.\n\n"
+        )
+        ctx_ids_raw = tokenizer.encode(ctx_header, add_special_tokens=False)
+        ctx_demos = ""
+        ctx_shot_idx = len(train_data) - 1
+        while ctx_shot_idx > shot_idx:
+            ex = train_data[ctx_shot_idx]
+            cand = ctx_demos + f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
+            cand_ids = tokenizer.encode(cand, add_special_tokens=False)
+            if len(ctx_ids_raw) + len(cand_ids) <= block_size - 2:
+                ctx_demos = cand
+                ctx_shot_idx -= 1
+            else:
+                break
+        ctx_demo_ids = tokenizer.encode(ctx_demos, add_special_tokens=False)
+        ctx_pad = block_size - len(ctx_ids_raw) - len(ctx_demo_ids)
+        if ctx_pad >= 0:
+            ctx_ids = ctx_ids_raw + [newline_id] * ctx_pad + ctx_demo_ids
         else:
-            break
-    part1_demo_ids = tokenizer.encode(part1_demos, add_special_tokens=False)
-    part1_pad = part1_target - len(header_ids) - len(part1_demo_ids)
-    part1_ids = header_ids + [newline_id] * part1_pad + part1_demo_ids
-    assert len(part1_ids) == part1_target
-
-    sec_header = "ID: 100000000 | Section: 200000000\n\n"
-    sec_header_ids = tokenizer.encode(sec_header, add_special_tokens=False)
-    min_prefix_tokens = max(512, 3 * block_size)
-    part2_demos = ""
-    while (
-        part1_target
-        + len(sec_header_ids)
-        + len(tokenizer.encode(part2_demos, add_special_tokens=False))
-        < min_prefix_tokens - 32
-    ):
-        ex = train_data[shot_idx]
-        part2_demos += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
-        shot_idx += 1
-    part2_demo_ids = tokenizer.encode(part2_demos, add_special_tokens=False)
-
-    total_raw_prefix = part1_target + len(sec_header_ids) + len(part2_demo_ids)
-    target_blocks = max(3, (total_raw_prefix + block_size - 1) // block_size)
-    target_prefix_len = target_blocks * block_size
-    pad_needed = target_prefix_len - total_raw_prefix
-    aligned_prefix = (
-        part1_ids + sec_header_ids + [newline_id] * pad_needed + part2_demo_ids
-    )
-    assert len(aligned_prefix) == target_prefix_len
-
-    ctx_header = (
-        "ID: 100000000 | Context: 200000000\n"
-        "Read each problem carefully, verify intermediate steps, "
-        "and provide the final numerical answer after ####.\n\n"
-    )
-    ctx_ids_raw = tokenizer.encode(ctx_header, add_special_tokens=False)
-    ctx_demos = ""
-    ctx_shot_idx = len(train_data) - 1
-    while ctx_shot_idx > shot_idx:
-        ex = train_data[ctx_shot_idx]
-        cand = ctx_demos + f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
-        cand_ids = tokenizer.encode(cand, add_special_tokens=False)
-        if len(ctx_ids_raw) + len(cand_ids) <= block_size - 2:
-            ctx_demos = cand
-            ctx_shot_idx -= 1
-        else:
-            break
-    ctx_demo_ids = tokenizer.encode(ctx_demos, add_special_tokens=False)
-    ctx_pad = block_size - len(ctx_ids_raw) - len(ctx_demo_ids)
-    if ctx_pad >= 0:
-        ctx_ids = ctx_ids_raw + [newline_id] * ctx_pad + ctx_demo_ids
+            ctx_ids = (ctx_ids_raw + [newline_id] * block_size)[:block_size]
+        assert len(ctx_ids) == block_size
     else:
-        ctx_ids = (ctx_ids_raw + [newline_id] * block_size)[:block_size]
-    assert len(ctx_ids) == block_size
+        zero_id = tokenizer.encode("0", add_special_tokens=False)[-1]
+        nl2_ids = tokenizer.encode("\n\n", add_special_tokens=False)
+        min_prefix_tokens = max(512, 3 * block_size)
+        demos_text = ""
+        shot_idx = 0
+        while (
+            len(tokenizer.encode(demos_text, add_special_tokens=False))
+            < min_prefix_tokens - 32
+        ):
+            ex = train_data[shot_idx]
+            demos_text += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
+            shot_idx += 1
+        demo_ids = tokenizer.encode(demos_text, add_special_tokens=False)
+
+        header_prefix_ids = tokenizer.encode(
+            "Session ID: 100000000 | Mode: Math\n"
+            "Solve each math problem step by step and end with #### <number>.\n"
+            "Batch: 200000000",
+            add_special_tokens=False,
+        )
+        total_raw_prefix = len(header_prefix_ids) + len(nl2_ids) + len(demo_ids)
+        target_blocks = max(3, (total_raw_prefix + block_size - 1) // block_size)
+        target_prefix_len = target_blocks * block_size
+        pad_needed = target_prefix_len - total_raw_prefix
+        aligned_prefix = (
+            header_prefix_ids + [zero_id] * pad_needed + nl2_ids + demo_ids
+        )
+        assert len(aligned_prefix) == target_prefix_len
+
+        ctx_prefix = tokenizer.encode("Context: 300000000", add_special_tokens=False)
+        ctx_pad = max(0, block_size - len(ctx_prefix) - len(nl2_ids))
+        ctx_ids = (ctx_prefix + [zero_id] * ctx_pad + nl2_ids)[:block_size]
+        assert len(ctx_ids) == block_size
 
     is_harmony = (
         hasattr(tokenizer, "get_vocab") and "<|channel|>" in tokenizer.get_vocab()
@@ -241,6 +276,12 @@ def build_gsm8k_samples(
         hasattr(tokenizer, "get_vocab")
         and "<think>" in tokenizer.get_vocab()
         and "<|im_start|>" in tokenizer.get_vocab()
+    )
+    is_gemma4_thinking = (
+        hasattr(tokenizer, "get_vocab")
+        and "<|channel>" in tokenizer.get_vocab()
+        and "<|turn>" in tokenizer.get_vocab()
+        and "e4b" not in getattr(tokenizer, "name_or_path", "").lower()
     )
     samples: list[dict[str, Any]] = []
     for i in range(len(test_data)):
@@ -255,6 +296,12 @@ def build_gsm8k_samples(
                 f"Question: {test_data[i]['question']}\n"
                 "Solve ONLY this final question step by step and end with #### <number>."
                 "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer:"
+            )
+        elif is_gemma4_thinking:
+            q_text = (
+                f"Question: {test_data[i]['question']}\n"
+                "Solve ONLY this final question step by step and end with #### <number>."
+                "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>Answer:"
             )
         else:
             q_text = f"Question: {test_data[i]['question']}\nAnswer:"
@@ -302,26 +349,44 @@ def build_coqa_samples(
 
     # Use stories near the end of dev set as few-shot pool
     demo_pool = [s for s in raw_coqa[-60:] if len(s.get("questions", [])) >= 4]
-    edit_blk = 1 if block_size >= 128 else 2
-    part1_target = edit_blk * block_size
-    header = (
-        "ID: 200000000 | Task: Concise Reading Comprehension\n"
-        "Answer each question about the passage with a short, direct phrase.\n\n"
-    )
-    header_ids = tokenizer.encode(header, add_special_tokens=False)
-    part1_ids = header_ids + [newline_id] * (part1_target - len(header_ids))
-    assert len(part1_ids) == part1_target
+    zero_id = tokenizer.encode("0", add_special_tokens=False)[-1]
+    nl2_ids = tokenizer.encode("\n\n", add_special_tokens=False)
+    if block_size >= 128:
+        edit_blk = 1
+        part1_target = edit_blk * block_size
+        header = (
+            "ID: 200000000 | Task: Concise Reading Comprehension\n"
+            "Answer each question about the passage with a short, direct phrase.\n\n"
+        )
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+        part1_ids = header_ids + [newline_id] * (part1_target - len(header_ids))
+        assert len(part1_ids) == part1_target
 
-    sec_header = "ID: 200000000 | Section: 300000000\n\n"
-    sec_header_ids = tokenizer.encode(sec_header, add_special_tokens=False)
+        sec_header = "ID: 200000000 | Section: 300000000\n\n"
+        sec_header_ids = tokenizer.encode(sec_header, add_special_tokens=False)
 
-    ctx_header = (
-        "ID: 200000000 | Context: 300000000\n"
-        "Answer the question concisely using only facts stated in the passage above.\n\n"
-    )
-    ctx_ids_raw = tokenizer.encode(ctx_header, add_special_tokens=False)
-    ctx_ids = ctx_ids_raw + [newline_id] * (block_size - len(ctx_ids_raw))
-    assert len(ctx_ids) == block_size
+        ctx_header = (
+            "ID: 200000000 | Context: 300000000\n"
+            "Answer the question concisely using only facts stated in the passage above.\n\n"
+        )
+        ctx_ids_raw = tokenizer.encode(ctx_header, add_special_tokens=False)
+        if len(ctx_ids_raw) <= block_size:
+            ctx_ids = ctx_ids_raw + [newline_id] * (block_size - len(ctx_ids_raw))
+        else:
+            ctx_ids = ctx_ids_raw[:block_size]
+        assert len(ctx_ids) == block_size
+    else:
+        part1_ids = tokenizer.encode(
+            "Session ID: 200000000 | Task: Reading QA\n"
+            "Answer each question about the passage with a short, direct phrase.\n"
+            "Batch: 300000000",
+            add_special_tokens=False,
+        )
+        sec_header_ids = nl2_ids
+        ctx_prefix = tokenizer.encode("Context: 300000000", add_special_tokens=False)
+        ctx_pad = max(0, block_size - len(ctx_prefix) - len(nl2_ids))
+        ctx_ids = (ctx_prefix + [zero_id] * ctx_pad + nl2_ids)[:block_size]
+        assert len(ctx_ids) == block_size
 
     is_harmony = (
         hasattr(tokenizer, "get_vocab") and "<|channel|>" in tokenizer.get_vocab()
@@ -330,6 +395,12 @@ def build_coqa_samples(
         hasattr(tokenizer, "get_vocab")
         and "<think>" in tokenizer.get_vocab()
         and "<|im_start|>" in tokenizer.get_vocab()
+    )
+    is_gemma4_thinking = (
+        hasattr(tokenizer, "get_vocab")
+        and "<|channel>" in tokenizer.get_vocab()
+        and "<|turn>" in tokenizer.get_vocab()
+        and "e4b" not in getattr(tokenizer, "name_or_path", "").lower()
     )
 
     samples: list[dict[str, Any]] = []
@@ -350,7 +421,7 @@ def build_coqa_samples(
         demos_text = ""
         d_idx = 0
         while (
-            part1_target
+            len(part1_ids)
             + len(sec_header_ids)
             + len(tokenizer.encode(demos_text, add_special_tokens=False))
             + len(target_history_ids)
@@ -367,7 +438,7 @@ def build_coqa_samples(
 
         demo_ids = tokenizer.encode(demos_text, add_special_tokens=False)
         raw_len = (
-            part1_target
+            len(part1_ids)
             + len(sec_header_ids)
             + len(demo_ids)
             + len(target_history_ids)
@@ -375,12 +446,23 @@ def build_coqa_samples(
         target_blocks = max(3, (raw_len + block_size - 1) // block_size)
         target_prefix_len = target_blocks * block_size
         pad_needed = target_prefix_len - raw_len
+        pad_tok = newline_id if block_size >= 128 else zero_id
         aligned_prefix = (
-            part1_ids
-            + sec_header_ids
-            + [newline_id] * pad_needed
-            + demo_ids
-            + target_history_ids
+            (
+                part1_ids
+                + sec_header_ids
+                + [pad_tok] * pad_needed
+                + demo_ids
+                + target_history_ids
+            )
+            if block_size >= 128
+            else (
+                part1_ids
+                + [pad_tok] * pad_needed
+                + sec_header_ids
+                + demo_ids
+                + target_history_ids
+            )
         )
         assert len(aligned_prefix) == target_prefix_len
 
@@ -398,6 +480,13 @@ def build_coqa_samples(
                 "Reply with ONLY the short direct answer phrase to this final question "
                 "(no heading or explanation)."
                 "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA:"
+            )
+        elif is_gemma4_thinking:
+            suffix_text = (
+                f"Q: {q4_str}\n"
+                "Reply with ONLY the short direct answer phrase to this final question "
+                "(no heading or explanation)."
+                "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>A:"
             )
         else:
             suffix_text = f"Q: {q4_str}\nA:"
@@ -818,7 +907,7 @@ def main() -> None:
         ),
     }
     if args.batch_size > 1:
-        llm_kwargs["max_num_batched_tokens"] = 16384
+        llm_kwargs["max_num_batched_tokens"] = max(16384, args.batch_size * 4096)
     if args.mamba_ssm_cache_dtype != "auto":
         llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
     if args.disable_mm:
@@ -867,12 +956,13 @@ def main() -> None:
 
     gsm8k_params = SamplingParams(
         temperature=0.0,
-        max_tokens=512,
+        max_tokens=384 if "gemma-4" in args.model.lower() else 512,
         stop=[
             "Question:",
             "\nQuestion",
             "<|im_end|>",
             "<end_of_turn>",
+            "<turn|>",
             "<|end|>",
             "<|return|>",
         ],
@@ -886,6 +976,7 @@ def main() -> None:
             "Passage:",
             "<|im_end|>",
             "<end_of_turn>",
+            "<turn|>",
             "<|end|>",
             "<|return|>",
         ],

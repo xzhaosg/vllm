@@ -1215,7 +1215,14 @@ class DeltaBlockStore:
 
         cand_sig = tuple(c.full_block_hash for c in candidates)
         cache_key = (
-            (full_block_hash, max_exceptions, cand_sig)
+            (
+                layer_name,
+                full_block_hash,
+                start_position,
+                prev_token_block_hash,
+                max_exceptions,
+                cand_sig,
+            )
             if full_block_hash
             else None
         )
@@ -1237,6 +1244,15 @@ class DeltaBlockStore:
 
         for base_rec in candidates:
             if len(base_rec.token_ids) != len(token_ids):
+                continue
+            if (
+                start_position is not None
+                and base_rec.start_position != start_position
+                and not (
+                    prev_token_block_hash
+                    and base_rec.prev_token_block_hash == prev_token_block_hash
+                )
+            ):
                 continue
             diff_idx = [
                 i
@@ -1905,6 +1921,8 @@ class DeltaBlockStore:
         token_tuples: list[tuple[int, ...]] = []
         token_hashes: list[str] = []
         records: list[CompressedKVBlockRecord | None] = [None] * n
+        already_committed: list[bool] = [False] * n
+        seen_in_batch: dict[str, int] = {}
 
         # (item_idx, base_rec, delta_pos)
         exact_group: list[tuple[int, CompressedKVBlockRecord, int]] = []
@@ -1916,9 +1934,14 @@ class DeltaBlockStore:
         for i, (blk_spec, k_blk, v_blk) in enumerate(items):
             token_tuple = tuple(int(t) for t in blk_spec.token_ids)
             token_hash = compute_token_block_hash(token_tuple)
-            k_cpu = k_blk.detach().to(self.device)
-            v_cpu = v_blk.detach().to(self.device) if v_blk is not None else None
-            is_mla = v_cpu is None
+            target_dev = (
+                k_blk.device
+                if str(self.device).startswith("cuda")
+                else self.device
+            )
+            k_cpu = k_blk.detach().to(target_dev)
+            v_cpu = v_blk.detach().to(target_dev) if v_blk is not None else None
+            is_mla = v_cpu is None and not policy.is_mamba
             raw_b = k_cpu.numel() * k_cpu.element_size() + (
                 v_cpu.numel() * v_cpu.element_size() if v_cpu is not None else 0
             )
@@ -1927,6 +1950,21 @@ class DeltaBlockStore:
             raw_bytes_list.append(raw_b)
             token_tuples.append(token_tuple)
             token_hashes.append(token_hash)
+
+            existing_rec = self._records.get(
+                (layer_name, blk_spec.full_block_hash)
+            )
+            if existing_rec is not None:
+                self._touch_lru(
+                    blk_spec.full_block_hash, existing_rec.ref_base_hash
+                )
+                records[i] = existing_rec
+                already_committed[i] = True
+                continue
+            if blk_spec.full_block_hash in seen_in_batch:
+                already_committed[i] = True
+                continue
+            seen_in_batch[blk_spec.full_block_hash] = i
 
             self._known_prefix_blocks[blk_spec.full_block_hash] = (
                 token_tuple,
@@ -2401,6 +2439,14 @@ class DeltaBlockStore:
         out_records: list[CompressedKVBlockRecord] = []
         for i in range(n):
             rec = records[i]
+            if already_committed[i]:
+                if rec is None:
+                    first_i = seen_in_batch.get(items[i][0].full_block_hash)
+                    if first_i is not None:
+                        rec = records[first_i]
+                if rec is not None:
+                    out_records.append(rec)
+                continue
             if rec is None:
                 blk_spec = items[i][0]
                 token_tuple = token_tuples[i]
@@ -3502,6 +3548,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 matched_positions.pop()
 
         matched_tokens = matched_positions[-1][0] if matched_positions else 0
+        sched_bs = self._scheduler_block_size
+        if sched_bs > self._block_size:
+            matched_tokens = (matched_tokens // sched_bs) * sched_bs
         new_matched = max(0, matched_tokens - num_computed_tokens)
         return new_matched, False
 
