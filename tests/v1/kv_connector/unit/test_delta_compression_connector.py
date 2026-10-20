@@ -27,15 +27,21 @@ from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector import (
+    DEFAULT_PAD_TOKEN,
     CompressionTier,
     DeltaBlockStore,
     DeltaBlockTransferSpec,
     DeltaCompressionConnector,
     LayerCompressionPolicy,
+    align_structural_prompt_server,
+    align_tokens_to_block,
     apply_relative_rope_rotation,
     compute_full_prefix_block_hash,
+    compute_token_block_hash,
     dequantize_residual_packed,
+    encode_file_viewer_bucketed_server,
     quantize_residual_packed,
+    resolve_pad_token_id,
 )
 
 
@@ -1138,7 +1144,7 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             req_50,  # type: ignore[arg-type]
             num_computed_tokens=0,
         )
-        self.assertEqual(matched_toks, 48)
+        self.assertEqual(matched_toks, 32)
 
     def test_large_head_dim_subhead_quant_and_tier3_threshold(self) -> None:
         """Verifies sub-head group_size=32 on head_dim=512 and TIER3 residual threshold fallback."""
@@ -1447,6 +1453,313 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             self.assertTrue(torch.allclose(ks, kb, atol=1e-3, rtol=1e-3))
             assert vs is not None and vb is not None
             self.assertTrue(torch.allclose(vs, vb, atol=1e-3, rtol=1e-3))
+
+    def test_approach1_cross_block_reference_stitching_unaligned_shift(self) -> None:
+        """Verifies Approach 1 server-side cross-block reference stitching for delta_p != 0 (mod B)."""
+        torch.manual_seed(2026)
+        block_size = 16
+        store_single = DeltaBlockStore(block_size=block_size)
+        store_batch = DeltaBlockStore(block_size=block_size)
+
+        l0 = "model.layers.0.self_attn.attn"
+        l5 = "model.layers.5.self_attn.attn"
+        for s in (store_single, store_batch):
+            s.register_layer_policy(
+                l0, LayerCompressionPolicy(layer_idx=0, rope_theta=10000.0)
+            )
+            s.register_layer_policy(
+                l5,
+                LayerCompressionPolicy(
+                    layer_idx=5,
+                    rope_theta=10000.0,
+                    tau_zero_bit=0.05,
+                    tau_int2=0.18,
+                    tau_int4=0.70,
+                ),
+            )
+
+        # Turn 1: two consecutive 16-token base blocks B0 (pos 16..31) and B1 (pos 32..47)
+        tok_b0 = tuple(range(1000, 1016))
+        tok_b1 = tuple(range(1016, 1032))
+        h_b0 = compute_full_prefix_block_hash("T1_PREFIX", tok_b0)
+        h_b1 = compute_full_prefix_block_hash(h_b0, tok_b1)
+        t_hash_b0 = compute_token_block_hash(tok_b0)
+
+        # Underlying unrotated K/V for the 32 contiguous tokens
+        k_raw_32 = torch.randn(32, 4, 128, dtype=torch.bfloat16)
+        v_raw_32 = torch.randn(32, 4, 128, dtype=torch.bfloat16)
+        k_b0_l0 = apply_relative_rope_rotation(
+            k_raw_32[:16], delta_pos=torch.arange(16, 32), rope_theta=10000.0
+        )
+        k_b1_l0 = apply_relative_rope_rotation(
+            k_raw_32[16:], delta_pos=torch.arange(32, 48), rope_theta=10000.0
+        )
+        v_b0_l0 = v_raw_32[:16].clone()
+        v_b1_l0 = v_raw_32[16:].clone()
+
+        for s in (store_single, store_batch):
+            s.store_block(l0, h_b0, tok_b0, 16, k_b0_l0, v_b0_l0)
+            s.store_block(
+                l0,
+                h_b1,
+                tok_b1,
+                32,
+                k_b1_l0,
+                v_b1_l0,
+                prev_token_block_hash=t_hash_b0,
+            )
+            s.store_block(l5, h_b0, tok_b0, 16, k_b0_l0, v_b0_l0)
+            s.store_block(
+                l5,
+                h_b1,
+                tok_b1,
+                32,
+                k_b1_l0,
+                v_b1_l0,
+                prev_token_block_hash=t_hash_b0,
+            )
+
+        # Turn 2: prefix grows by +5 tokens (unaligned shift!).
+        # A block starting at pos=32 now contains tok_b0[11:16] + tok_b1[0:11] (stitch_offset s=11).
+        # Its original tokens were at RoPE positions [16 + 11 .. 16 + 11 + 15] = [27 .. 42],
+        # so delta_pos = 32 - (16 + 11) = +5!
+        stitch_s = 11
+        tok_stitched = tok_b0[stitch_s:] + tok_b1[:stitch_s]
+        self.assertTrue(store_single.has_stitched_token_block(tok_stitched))
+        h_stitched = compute_full_prefix_block_hash("T2_UNALIGNED_PREFIX", tok_stitched)
+        k_stitched_l0 = apply_relative_rope_rotation(
+            k_raw_32[stitch_s : stitch_s + 16],
+            delta_pos=torch.arange(32, 48),
+            rope_theta=10000.0,
+        )
+        v_stitched_l0 = v_raw_32[stitch_s : stitch_s + 16].clone()
+
+        # 1. Layer 0 unaligned shift -> TIER0_ZERO_BIT via stitched (B0, B1)
+        rec_l0 = store_single.store_block(
+            l0, h_stitched, tok_stitched, 32, k_stitched_l0, v_stitched_l0
+        )
+        self.assertEqual(rec_l0.tier, CompressionTier.TIER0_ZERO_BIT)
+        self.assertEqual(rec_l0.ref_base_hash, h_b0)
+        self.assertEqual(rec_l0.ref_base_hash_2, h_b1)
+        self.assertEqual(rec_l0.stitch_offset, stitch_s)
+        self.assertEqual(rec_l0.delta_pos, 5)
+        k_rec_l0, v_rec_l0 = store_single.reconstruct_block(l0, h_stitched)
+        assert v_rec_l0 is not None
+        self.assertTrue(torch.equal(v_rec_l0, v_stitched_l0))
+        self.assertGreater(_compute_sqnr_db(k_stitched_l0, k_rec_l0), 50.0)
+
+        # 2. Layer 5 unaligned shift + cross-prefix residual -> TIER2_INT4_DELTA via stitched (B0, B1)
+        k_stitched_l5 = k_stitched_l0 + 0.16 * torch.randn_like(k_stitched_l0)
+        v_stitched_l5 = v_stitched_l0 + 0.16 * torch.randn_like(v_stitched_l0)
+        rec_l5 = store_single.store_block(
+            l5, h_stitched, tok_stitched, 32, k_stitched_l5, v_stitched_l5
+        )
+        self.assertEqual(rec_l5.tier, CompressionTier.TIER2_INT4_DELTA)
+        self.assertEqual(rec_l5.ref_base_hash, h_b0)
+        self.assertEqual(rec_l5.ref_base_hash_2, h_b1)
+        self.assertEqual(rec_l5.stitch_offset, stitch_s)
+        self.assertEqual(rec_l5.delta_pos, 5)
+        k_rec_l5, v_rec_l5 = store_single.reconstruct_block(l5, h_stitched)
+        assert v_rec_l5 is not None
+        self.assertGreater(_compute_sqnr_db(k_stitched_l5, k_rec_l5), 34.0)
+
+        # 3. Layer 5 unaligned shift + 2 intra-block token edits -> TIER3_SPARSE_BF16_INT4_DELTA
+        tok_stitched_edit = list(tok_stitched)
+        tok_stitched_edit[2] = 88881
+        tok_stitched_edit[13] = 88882
+        tok_stitched_edit_t = tuple(tok_stitched_edit)
+        h_stitched_edit = compute_full_prefix_block_hash(
+            "T2_UNALIGNED_EDIT", tok_stitched_edit_t
+        )
+        k_stitched_edit = k_stitched_l5.clone()
+        v_stitched_edit = v_stitched_l5.clone()
+        k_stitched_edit[2] = torch.randn(4, 128, dtype=torch.bfloat16) * 2.5
+        v_stitched_edit[2] = torch.randn(4, 128, dtype=torch.bfloat16) * 2.5
+        k_stitched_edit[13] = torch.randn(4, 128, dtype=torch.bfloat16) * 2.5
+        v_stitched_edit[13] = torch.randn(4, 128, dtype=torch.bfloat16) * 2.5
+        rec_l5_edit = store_single.store_block(
+            l5,
+            h_stitched_edit,
+            tok_stitched_edit_t,
+            32,
+            k_stitched_edit,
+            v_stitched_edit,
+        )
+        self.assertEqual(
+            rec_l5_edit.tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA
+        )
+        self.assertEqual(rec_l5_edit.ref_base_hash, h_b0)
+        self.assertEqual(rec_l5_edit.ref_base_hash_2, h_b1)
+        self.assertEqual(rec_l5_edit.stitch_offset, stitch_s)
+        assert rec_l5_edit.sparse_token_indices is not None
+        self.assertEqual(rec_l5_edit.sparse_token_indices.tolist(), [2, 13])
+        k_rec_edit, v_rec_edit = store_single.reconstruct_block(l5, h_stitched_edit)
+        assert v_rec_edit is not None
+        self.assertTrue(torch.equal(k_rec_edit[2], k_stitched_edit[2]))
+        self.assertTrue(torch.equal(k_rec_edit[13], k_stitched_edit[13]))
+        self.assertTrue(torch.equal(v_rec_edit[2], v_stitched_edit[2]))
+        self.assertTrue(torch.equal(v_rec_edit[13], v_stitched_edit[13]))
+
+        # 4. Verify batched store & reconstruct equivalence on stitched blocks
+        batch_specs = [
+            DeltaBlockTransferSpec(
+                physical_block_id=10,
+                full_block_hash=h_stitched,
+                token_ids=tok_stitched,
+                start_position=32,
+            ),
+            DeltaBlockTransferSpec(
+                physical_block_id=11,
+                full_block_hash=h_stitched_edit,
+                token_ids=tok_stitched_edit_t,
+                start_position=32,
+            ),
+        ]
+        batch_recs = store_batch.store_blocks_batch(
+            l5,
+            [
+                (batch_specs[0], k_stitched_l5, v_stitched_l5),
+                (batch_specs[1], k_stitched_edit, v_stitched_edit),
+            ],
+        )
+        self.assertEqual(batch_recs[0].tier, rec_l5.tier)
+        self.assertEqual(batch_recs[0].stitch_offset, stitch_s)
+        self.assertEqual(batch_recs[1].tier, rec_l5_edit.tier)
+        self.assertEqual(batch_recs[1].stitch_offset, stitch_s)
+        batch_recons = store_batch.reconstruct_blocks_batch(l5, batch_specs)
+        self.assertTrue(
+            torch.allclose(batch_recons[0][0], k_rec_l5, atol=1e-3, rtol=1e-3)
+        )
+        self.assertTrue(
+            torch.allclose(batch_recons[1][0], k_rec_edit, atol=1e-3, rtol=1e-3)
+        )
+
+        # 5. Verify LRU dependency tracking & protection for BOTH ref_base_hash (h_b0) and ref_base_hash_2 (h_b1)
+        self.assertIn(h_stitched, store_single._dependents_by_base[h_b0])
+        self.assertIn(h_stitched, store_single._dependents_by_base[h_b1])
+        self.assertIn(h_stitched_edit, store_single._dependents_by_base[h_b0])
+        self.assertIn(h_stitched_edit, store_single._dependents_by_base[h_b1])
+        # Protecting h_stitched during budget eviction transitively protects both h_b0 and h_b1!
+        evicted_under_protect = store_single.evict_lru_to_budget(
+            max_bytes=1, protected_hashes={h_stitched}
+        )
+        self.assertIn(h_stitched_edit, evicted_under_protect)
+        self.assertNotIn(h_b0, evicted_under_protect)
+        self.assertNotIn(h_b1, evicted_under_protect)
+        self.assertTrue(store_single.has_full_block(h_b0))
+        self.assertTrue(store_single.has_full_block(h_b1))
+        # Cascading evict of h_b0 also evicts remaining dependent h_stitched
+        cascaded = store_single.evict_block(h_b0)
+        self.assertIn(h_stitched, cascaded)
+        self.assertIn(h_b0, cascaded)
+
+    def test_approach2_configurable_padding_token_and_server_alignment(self) -> None:
+        """Verifies Approach 2 configurable padding token (default '\\n', map, ID) and server bucket alignment."""
+        class MockCharTokenizer:
+            def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+                return [ord(ch) for ch in text]
+
+        tok = MockCharTokenizer()
+        # 1. Default pad_token is "\n" (ord('\n') == 10)
+        self.assertEqual(DEFAULT_PAD_TOKEN, "\n")
+        self.assertEqual(resolve_pad_token_id(tok), ord("\n"))
+        self.assertEqual(resolve_pad_token_id(tok, pad_token=" "), ord(" "))
+        self.assertEqual(resolve_pad_token_id(tok, pad_token_id=777), 777)
+
+        # 2. Content-dependent pad_token_map selection
+        pad_map = {
+            "[File:": "\n",
+            r"^\s*\{": " ",
+            "SELECT ": " ",
+            "/*": "\t",
+        }
+        self.assertEqual(
+            resolve_pad_token_id(
+                tok, content_text="[File: app.py (100 lines total)]\n1:x=1\n", pad_token_map=pad_map
+            ),
+            ord("\n"),
+        )
+        self.assertEqual(
+            resolve_pad_token_id(
+                tok, content_text='  {"key": "value"}', pad_token_map=pad_map
+            ),
+            ord(" "),
+        )
+        self.assertEqual(
+            resolve_pad_token_id(
+                tok, content_text="SELECT * FROM users;", pad_token_map=pad_map
+            ),
+            ord(" "),
+        )
+        self.assertEqual(
+            resolve_pad_token_id(
+                tok, content_text="/* C block comment */", pad_token_map=pad_map
+            ),
+            ord("\t"),
+        )
+
+        # 3. Connector & Store initialization with custom pad_token and pad_token_map
+        DeltaCompressionConnector.reset_shared_stores()
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16, enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                engine_id="pad-cfg-test",
+                kv_connector_extra_config={
+                    "pad_token": "\n",
+                    "pad_token_map": pad_map,
+                },
+            ),
+        )
+        conn = DeltaCompressionConnector(
+            vllm_config=vllm_config,  # type: ignore[arg-type]
+            role=KVConnectorRole.SCHEDULER,
+            kv_cache_config=None,
+        )
+        self.assertEqual(conn.store.pad_token, "\n")
+        self.assertEqual(conn.resolve_pad_token_id(tok), ord("\n"))
+        self.assertEqual(
+            conn.resolve_pad_token_id(tok, content_text='{"a": 1}'), ord(" ")
+        )
+
+        # Verify align_structural_prompt uses content-specific padding per segment
+        seg_tokens = conn.align_structural_prompt(
+            tok,
+            segments=[
+                ('{"a": 1}', True),
+                ("def foo():\n", True),
+                ("tail", False),
+            ],
+        )
+        # First segment (8 chars) padded to 16 with ' ' (32)
+        self.assertEqual(seg_tokens[:16], [ord(c) for c in '{"a": 1}'] + [ord(" ")] * 8)
+        # Second segment (11 chars) padded to 16 with '\n' (10)
+        self.assertEqual(
+            seg_tokens[16:32], [ord(c) for c in "def foo():\n"] + [ord("\n")] * 5
+        )
+        # Final suffix segment unpadded (4 chars)
+        self.assertEqual(seg_tokens[32:], [ord(c) for c in "tail"])
+
+        # 4. Verify encode_file_viewer_bucketed_server isolates multi-token edits to their 10-line bucket
+        lines_v1 = ["[File: foo.py (30 lines total)]\n"]
+        lines_v2 = ["[File: foo.py (30 lines total)]\n"]
+        for lno in range(1, 31):
+            if lno == 5:
+                lines_v1.append(f"{lno}:x = 1\n")
+                lines_v2.append(f"{lno}:x = 1000 + 2000 + 3000\n")  # +16 chars in bucket 0 (lines 1..10)
+            else:
+                lines_v1.append(f"{lno}:y_{lno} = {lno}\n")
+                lines_v2.append(f"{lno}:y_{lno} = {lno}\n")
+
+        ids_v1 = conn.encode_aligned_segment(tok, "".join(lines_v1))
+        ids_v2 = conn.encode_aligned_segment(tok, "".join(lines_v2))
+        self.assertEqual(len(ids_v1), len(ids_v2))
+        self.assertEqual(len(ids_v1) % 16, 0)
+        # Banner is 1 block (0..16), Bucket 0 (lines 1..10) is 6 blocks (16..112),
+        # Bucket 1 (lines 11..20) and Bucket 2 (lines 21..30) start at token 112 and must be identical!
+        self.assertEqual(ids_v1[112:], ids_v2[112:])
 
 
 if __name__ == "__main__":

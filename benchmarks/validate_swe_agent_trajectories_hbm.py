@@ -34,9 +34,13 @@ from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector import (
+    DEFAULT_PAD_TOKEN,
     CompressionTier,
     DeltaBlockStore,
     DeltaCompressionConnector,
+    align_tokens_to_block,
+    encode_file_viewer_bucketed_server,
+    resolve_pad_token_id,
 )
 from vllm.v1.core.kv_cache_utils import get_group_id
 
@@ -150,16 +154,13 @@ def _align_to_block(
     newline_id: int,
     target_blocks: int | None = None,
 ) -> list[int]:
-    """Pad or truncate `token_ids` to an exact multiple of `block_size`."""
-    if target_blocks is not None:
-        target_len = target_blocks * block_size
-        if len(token_ids) < target_len:
-            return token_ids + [newline_id] * (target_len - len(token_ids))
-        return token_ids[:target_len]
-    rem = len(token_ids) % block_size
-    if rem == 0:
-        return token_ids
-    return token_ids + [newline_id] * (block_size - rem)
+    """Pad or truncate `token_ids` to an exact multiple of `block_size` via server-side helper."""
+    return align_tokens_to_block(
+        token_ids=token_ids,
+        block_size=block_size,
+        pad_token_id=newline_id,
+        target_blocks=target_blocks,
+    )
 
 
 def _extract_patch_symbols(patch: str, file_path: str) -> list[str]:
@@ -187,110 +188,15 @@ def _encode_file_viewer_bucketed(
     newline_id: int,
     max_file_blocks: int,
 ) -> list[int]:
-    """Encode a SWE-agent `[File: ...]` observation using 10-line block-aligned buckets.
-
-    Grouping numbered file-viewer lines (`1:...`, `2:...`) by `(line_no - 1) // 10`
-    and aligning each 10-line bucket to `block_size` ensures that:
-      1. Multi-token edits inside one 10-line region do not shift token-chunk
-         boundaries in downstream unchanged regions of the file.
-      2. Scrolling the 100-line file window (`goto` / `scroll_down`) preserves exact
-         `token_block_hash` matches on all overlapping 10-line buckets via RoPE shift.
-    """
-    if block_size >= 128:
-        obs_lines = user_obs.splitlines(keepends=True)
-        buckets_50: dict[int, list[tuple[int, str]]] = defaultdict(list)
-        line_re_50 = re.compile(r"^(\d+):")
-        for ln in obs_lines:
-            m = line_re_50.match(ln)
-            if m:
-                lno = int(m.group(1))
-                buckets_50[(lno - 1) // 50].append((lno, ln))
-        if not buckets_50:
-            raw_ids = tokenizer.encode(user_obs, add_special_tokens=False)
-            return _align_to_block(
-                raw_ids, block_size, newline_id, target_blocks=max_file_blocks
-            )
-        out_ids_50: list[int] = []
-        slot_len = block_size // 5
-        for b_id in sorted(buckets_50.keys()):
-            if (len(out_ids_50) // block_size) >= max_file_blocks:
-                break
-            sub_buckets: dict[int, list[str]] = defaultdict(list)
-            for lno, ln in buckets_50[b_id]:
-                sub_id = ((lno - 1) % 50) // 10
-                sub_buckets[sub_id].append(ln)
-            blk_ids: list[int] = []
-            for s_id in range(5):
-                stxt = "".join(sub_buckets.get(s_id, []))
-                sids = (
-                    tokenizer.encode(stxt, add_special_tokens=False)
-                    if stxt
-                    else []
-                )
-                t_slot = slot_len if s_id < 4 else (block_size - 4 * slot_len)
-                if len(sids) < t_slot:
-                    sids = sids + [newline_id] * (t_slot - len(sids))
-                else:
-                    sids = sids[:t_slot]
-                blk_ids.extend(sids)
-            out_ids_50.extend(blk_ids)
-        return _align_to_block(
-            out_ids_50, block_size, newline_id, target_blocks=max_file_blocks
-        )
-
-    obs_lines = user_obs.splitlines(keepends=True)
-    header_lines: list[str] = []
-    buckets: dict[int, list[str]] = defaultdict(list)
-    footer_lines: list[str] = []
-
-    line_re = re.compile(r"^(\d+):")
-    seen_code = False
-    for ln in obs_lines:
-        m = line_re.match(ln)
-        if m:
-            seen_code = True
-            line_no = int(m.group(1))
-            bucket_id = (line_no - 1) // 10
-            buckets[bucket_id].append(ln)
-        elif not seen_code:
-            header_lines.append(ln)
-        else:
-            footer_lines.append(ln)
-
-    out_ids: list[int] = []
-    # 1 block for `[File: ... (N lines total)]` banner
-    banner_txt = "".join(header_lines) if header_lines else f"[File: {fpath}]\n"
-    out_ids.extend(
-        _align_to_block(
-            tokenizer.encode(banner_txt, add_special_tokens=False),
-            block_size,
-            newline_id,
-            target_blocks=1,
-        )
+    """Encode a SWE-agent `[File: ...]` observation using server-side 10-line block-aligned buckets."""
+    return encode_file_viewer_bucketed_server(
+        tokenizer=tokenizer,
+        text=user_obs,
+        block_size=block_size,
+        pad_token_id=newline_id,
+        max_file_blocks=max_file_blocks,
+        file_path_hint=fpath,
     )
-
-    # Align each 10-line bucket to 6 blocks (96 tokens) so edits stay local to their bucket
-    blocks_per_bucket = 6
-    for b_id in sorted(buckets.keys()):
-        if (len(out_ids) // block_size) + blocks_per_bucket > max_file_blocks:
-            break
-        b_txt = "".join(buckets[b_id])
-        b_ids = tokenizer.encode(b_txt, add_special_tokens=False)
-        out_ids.extend(
-            _align_to_block(
-                b_ids, block_size, newline_id, target_blocks=blocks_per_bucket
-            )
-        )
-
-    if len(out_ids) < max_file_blocks * block_size and footer_lines:
-        rem_blocks = max_file_blocks - (len(out_ids) // block_size)
-        f_ids = tokenizer.encode("".join(footer_lines), add_special_tokens=False)
-        out_ids.extend(
-            _align_to_block(
-                f_ids, block_size, newline_id, target_blocks=min(2, rem_blocks)
-            )
-        )
-    return out_ids
 
 
 def _classify_swe_action(text: str) -> str:
@@ -309,9 +215,10 @@ def build_trajectory_samples(
     trajectories: list[dict[str, Any]],
     tokenizer: Any,
     block_size: int,
+    pad_token: str = DEFAULT_PAD_TOKEN,
 ) -> list[dict[str, Any]]:
     """Build all-turn token sequences from real `nebius/SWE-agent-trajectories` turns."""
-    newline_id = tokenizer.encode("\n", add_special_tokens=False)[0]
+    newline_id = resolve_pad_token_id(tokenizer=tokenizer, pad_token=pad_token)
     raw_edit_toks = [
         tokenizer.encode(str(d), add_special_tokens=False)[-1]
         for d in range(1, 250)
@@ -1097,6 +1004,12 @@ def main() -> None:
         choices=["blockpool", "delta", "both"],
         default="both",
     )
+    parser.add_argument(
+        "--pad-token",
+        type=str,
+        default=DEFAULT_PAD_TOKEN,
+        help="Server-side structural alignment padding token (default: '\\n').",
+    )
     parser.add_argument("--blockpool-json", type=str, default="")
     parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
@@ -1144,6 +1057,7 @@ def main() -> None:
                 kv_connector_extra_config={
                     "store_device": "cuda",
                     "force_uncompressed": False,
+                    "pad_token": args.pad_token,
                 },
             ),
         )
@@ -1155,6 +1069,7 @@ def main() -> None:
         trajectories=trajectories,
         tokenizer=tokenizer,
         block_size=resolved_block_size,
+        pad_token=args.pad_token,
     )
     avg_len = sum(
         len(s["regimes"]["T1_stateful_aci_window_dp0"][0]) for s in samples

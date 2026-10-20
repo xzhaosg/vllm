@@ -38,6 +38,7 @@ from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector import (
+    DEFAULT_PAD_TOKEN,
     DeltaBlockStore,
     DeltaCompressionConnector,
     compute_full_prefix_block_hash,
@@ -357,6 +358,7 @@ def _run_blockpool_eviction_mode(
     prefill_params: SamplingParams,
     eval_params: SamplingParams,
     wave_size: int = 20,
+    eval_all_turns: bool = False,
 ) -> dict[str, Any]:
     """Run all 157 trajectories across Turn 1..12 on native vLLM BlockPool under a fixed HBM budget."""
     num_samples = len(all_turns_per_sample)
@@ -401,10 +403,14 @@ def _run_blockpool_eviction_mode(
     cum_recomputed_turns = 0
     cum_recomputed_tokens = 0
     cum_total_prefill_tokens = 0
+    per_turn_eval_sec = 0.0
 
     traj_turn_loop_sec = [0.0 for _ in range(num_samples)]
     traj_final_eval_sec = [0.0 for _ in range(num_samples)]
     turn_snaps: list[dict[str, Any]] = []
+    all_turn_outputs: list[list[dict[str, Any] | None]] = [
+        [None for _ in range(len(s_turns))] for s_turns in all_turns_per_sample
+    ]
 
     for t in range(max_turns):
         active_indices = [
@@ -474,7 +480,7 @@ def _run_blockpool_eviction_mode(
             int(group_unpadded_tp.get(get_group_id(blk.block_hash), slot_bytes_tp))
             for blk in live_blks
         )
-        elapsed_turn = time.perf_counter() - t0_mode
+        elapsed_turn = max(0.0, time.perf_counter() - t0_mode - per_turn_eval_sec)
 
         resident_latest_sessions = 0
         resident_full_history_sessions = 0
@@ -532,7 +538,7 @@ def _run_blockpool_eviction_mode(
             flush=True,
         )
 
-    turn_loop_sec = time.perf_counter() - t0_mode
+    turn_loop_sec = max(0.0, time.perf_counter() - t0_mode - per_turn_eval_sec)
 
     # ------------------------------------------------------------------
     # Final-Turn (`s_turns[-1]`) Evaluation across all 157 trajectories
@@ -611,7 +617,7 @@ def _run_blockpool_eviction_mode(
             traj_final_eval_sec[i] += decode_elapsed / max(1, len(batch_idxs))
 
     final_eval_sec = time.perf_counter() - t0_eval
-    total_mode_sec = time.perf_counter() - t0_mode
+    total_mode_sec = max(0.0, time.perf_counter() - t0_mode - per_turn_eval_sec)
     ordered_outputs = [outputs_by_idx[i] for i in range(num_samples)]
     traj_total_sec = [
         round(traj_turn_loop_sec[i] + traj_final_eval_sec[i], 4)
@@ -624,9 +630,46 @@ def _run_blockpool_eviction_mode(
         block_pool.free_block_queue.append_n(pinned_cap_blocks)
         pinned_cap_blocks.clear()
 
+    if eval_all_turns:
+        t_teval = time.perf_counter()
+        llm.reset_prefix_cache()
+        turn_eval_batch = 80
+        for t in range(max_turns):
+            active_t = [
+                i
+                for i, s_turns in enumerate(all_turns_per_sample)
+                if t < len(s_turns)
+            ]
+            for b_start in range(0, len(active_t), turn_eval_batch):
+                b_idxs = active_t[b_start : b_start + turn_eval_batch]
+                b_prompts = [all_turns_per_sample[i][t] for i in b_idxs]
+                _ = llm.generate(
+                    [{"prompt_token_ids": p} for p in b_prompts],
+                    prefill_params,
+                    use_tqdm=False,
+                )
+                b_outs = llm.generate(
+                    [{"prompt_token_ids": p} for p in b_prompts],
+                    eval_params,
+                    use_tqdm=False,
+                )
+                for i, out in zip(b_idxs, b_outs):
+                    all_turn_outputs[i][t] = {
+                        "token_ids": list(out.outputs[0].token_ids),
+                        "text": out.outputs[0].text,
+                    }
+            print(
+                f"  [BLOCKPOOL PER-TURN EVAL] Turn {t + 1:2d}/{max_turns} "
+                f"({len(active_t)} turns decoded, elapsed={time.perf_counter() - t_teval:.1f}s)",
+                flush=True,
+            )
+        per_turn_eval_sec = time.perf_counter() - t_teval
+
     return {
         "turn_snaps": turn_snaps,
         "outputs": ordered_outputs,
+        "all_turn_outputs": all_turn_outputs if eval_all_turns else None,
+        "per_turn_eval_sec": round(per_turn_eval_sec, 2),
         "final_eval_hits": final_eval_hits,
         "final_eval_misses": final_eval_misses,
         "cum_session_hits": cum_session_hits,
@@ -655,6 +698,7 @@ def _run_single_eviction_mode(
     prefill_params: SamplingParams,
     eval_params: SamplingParams,
     wave_size: int = 20,
+    eval_all_turns: bool = False,
 ) -> dict[str, Any]:
     """Run all 157 trajectories across Turn 1..12 under a fixed GPU HBM budget."""
     num_samples = len(all_turns_per_sample)
@@ -675,11 +719,15 @@ def _run_single_eviction_mode(
     cum_recomputed_turns = 0
     cum_recomputed_tokens = 0
     cum_total_prefill_tokens = 0
+    per_turn_eval_sec = 0.0
 
     traj_turn_loop_sec = [0.0 for _ in range(num_samples)]
     traj_final_eval_sec = [0.0 for _ in range(num_samples)]
 
     turn_snaps: list[dict[str, Any]] = []
+    all_turn_outputs: list[list[dict[str, Any] | None]] = [
+        [None for _ in range(len(s_turns))] for s_turns in all_turns_per_sample
+    ]
 
     for t in range(max_turns):
         active_indices = [
@@ -822,7 +870,7 @@ def _run_single_eviction_mode(
                     traj_turn_loop_sec[owner_i] += wave_elapsed * (w_cnt / total_w)
 
         snap = _collect_hbm_snapshot(llm, store, base_cuda_bytes)
-        elapsed_turn = time.perf_counter() - t0_mode
+        elapsed_turn = max(0.0, time.perf_counter() - t0_mode - per_turn_eval_sec)
 
         # Count how many of the 157 trajectories currently have their latest turn
         # (`min(t, len(s_turns) - 1)`) and base turn (`0`) resident in GPU HBM
@@ -872,7 +920,33 @@ def _run_single_eviction_mode(
             flush=True,
         )
 
-    turn_loop_sec = time.perf_counter() - t0_mode
+        if eval_all_turns:
+            t_teval = time.perf_counter()
+            turn_eval_batch = max(1, wave_size)
+            for b_start in range(0, len(active_indices), turn_eval_batch):
+                b_idxs = active_indices[b_start : b_start + turn_eval_batch]
+                b_outs = llm.generate(
+                    [
+                        {"prompt_token_ids": all_turns_per_sample[i][t]}
+                        for i in b_idxs
+                    ],
+                    eval_params,
+                    use_tqdm=False,
+                )
+                llm.reset_prefix_cache()
+                for i, out in zip(b_idxs, b_outs):
+                    all_turn_outputs[i][t] = {
+                        "token_ids": list(out.outputs[0].token_ids),
+                        "text": out.outputs[0].text,
+                    }
+            per_turn_eval_sec += time.perf_counter() - t_teval
+            print(
+                f"  [{mode_label} PER-TURN EVAL] Turn {t + 1:2d}/{max_turns} "
+                f"({len(active_indices)} turns decoded, cum_eval={per_turn_eval_sec:.1f}s)",
+                flush=True,
+            )
+
+    turn_loop_sec = max(0.0, time.perf_counter() - t0_mode - per_turn_eval_sec)
 
     # ------------------------------------------------------------------
     # Final-Turn (`s_turns[-1]`) Evaluation across all 157 trajectories
@@ -993,7 +1067,7 @@ def _run_single_eviction_mode(
             traj_final_eval_sec[i] += decode_elapsed / max(1, len(batch_idxs))
 
     final_eval_sec = time.perf_counter() - t0_eval
-    total_mode_sec = time.perf_counter() - t0_mode
+    total_mode_sec = max(0.0, time.perf_counter() - t0_mode - per_turn_eval_sec)
     ordered_outputs = [outputs_by_idx[i] for i in range(num_samples)]
     traj_total_sec = [
         round(traj_turn_loop_sec[i] + traj_final_eval_sec[i], 4)
@@ -1003,6 +1077,8 @@ def _run_single_eviction_mode(
     return {
         "turn_snaps": turn_snaps,
         "outputs": ordered_outputs,
+        "all_turn_outputs": all_turn_outputs if eval_all_turns else None,
+        "per_turn_eval_sec": round(per_turn_eval_sec, 2),
         "final_eval_hits": final_eval_hits,
         "final_eval_misses": final_eval_misses,
         "cum_session_hits": cum_session_hits,
@@ -1032,6 +1108,7 @@ def evaluate_swe_agent_eviction_hbm(
     regime_filter: str = "all",
     mode: str = "both",
     blockpool_data: dict[str, Any] | None = None,
+    eval_all_turns: bool = False,
 ) -> dict[str, Any]:
     all_regimes = [
         ("T1_stateful_aci_window_dp0", budget_t1_mb),
@@ -1116,6 +1193,7 @@ def evaluate_swe_agent_eviction_hbm(
                 prefill_params=prefill_params,
                 eval_params=eval_params,
                 wave_size=wave_size,
+                eval_all_turns=eval_all_turns,
             )
             results[regime] = {
                 "fixed_hbm_budget_mb": round(hbm_budget_mb, 2),
@@ -1145,6 +1223,7 @@ def evaluate_swe_agent_eviction_hbm(
                 prefill_params=prefill_params,
                 eval_params=eval_params,
                 wave_size=wave_size,
+                eval_all_turns=eval_all_turns,
             )
 
         # 2. Run Delta-Compressed (`force_uncompressed=False`) under fixed HBM budget
@@ -1160,6 +1239,7 @@ def evaluate_swe_agent_eviction_hbm(
             prefill_params=prefill_params,
             eval_params=eval_params,
             wave_size=wave_size,
+            eval_all_turns=eval_all_turns,
         )
 
         uncomp_snaps = uncomp_res["turn_snaps"]
@@ -1203,7 +1283,7 @@ def evaluate_swe_agent_eviction_hbm(
                 }
             )
 
-        # Accuracy & Output Agreement
+        # Accuracy & Output Agreement (Final Turn)
         top1_matches = 0
         f1_scores: list[float] = []
         action_matches = 0
@@ -1237,6 +1317,148 @@ def evaluate_swe_agent_eviction_hbm(
                 base_symbol_hits += 1
             if any(sym in c_txt.lower() for sym in gt_syms):
                 comp_symbol_hits += 1
+
+        # Per-Turn Accuracy & Output Agreement across all 1,045 turns (`Turns 1..12`)
+        per_turn_accuracy_metrics: dict[str, Any] = {}
+        u_all_turns = uncomp_res.get("all_turn_outputs")
+        c_all_turns = comp_res.get("all_turn_outputs")
+        if u_all_turns and c_all_turns:
+            all_top1 = 0
+            all_f1s: list[float] = []
+            all_act = 0
+            all_base_sym = 0
+            all_comp_sym = 0
+            all_count = 0
+
+            fu_top1 = 0
+            fu_f1s: list[float] = []
+            fu_act = 0
+            fu_base_sym = 0
+            fu_comp_sym = 0
+            fu_count = 0
+
+            per_turn_breakdown: list[dict[str, Any]] = []
+            for t in range(max_turns):
+                t_top1 = 0
+                t_f1s: list[float] = []
+                t_act = 0
+                t_base_sym = 0
+                t_comp_sym = 0
+                t_count = 0
+                for s_idx, s in enumerate(samples):
+                    if t >= len(u_all_turns[s_idx]) or t >= len(c_all_turns[s_idx]):
+                        continue
+                    bo = u_all_turns[s_idx][t]
+                    co = c_all_turns[s_idx][t]
+                    if bo is None or co is None:
+                        continue
+                    b_ids_t = list(bo["token_ids"])
+                    b_txt_t = str(bo["text"])
+                    c_ids_t = list(co["token_ids"])
+                    c_txt_t = str(co["text"])
+
+                    is_top1 = bool(b_ids_t and c_ids_t and b_ids_t[0] == c_ids_t[0])
+                    f1_val = token_f1(c_txt_t, b_txt_t)
+                    is_act = _classify_swe_action(b_txt_t) == _classify_swe_action(
+                        c_txt_t
+                    )
+                    gt_syms = [sym.lower() for sym in s["gt_symbols"]]
+                    is_b_sym = any(sym in b_txt_t.lower() for sym in gt_syms)
+                    is_c_sym = any(sym in c_txt_t.lower() for sym in gt_syms)
+
+                    t_count += 1
+                    all_count += 1
+                    if is_top1:
+                        t_top1 += 1
+                        all_top1 += 1
+                    t_f1s.append(f1_val)
+                    all_f1s.append(f1_val)
+                    if is_act:
+                        t_act += 1
+                        all_act += 1
+                    if is_b_sym:
+                        t_base_sym += 1
+                        all_base_sym += 1
+                    if is_c_sym:
+                        t_comp_sym += 1
+                        all_comp_sym += 1
+
+                    if t >= 1:
+                        fu_count += 1
+                        if is_top1:
+                            fu_top1 += 1
+                        fu_f1s.append(f1_val)
+                        if is_act:
+                            fu_act += 1
+                        if is_b_sym:
+                            fu_base_sym += 1
+                        if is_c_sym:
+                            fu_comp_sym += 1
+
+                if t_count > 0:
+                    per_turn_breakdown.append(
+                        {
+                            "turn": t + 1,
+                            "active_trajectories": t_count,
+                            "top1_token_match_pct": round(
+                                100.0 * t_top1 / t_count, 2
+                            ),
+                            "response_f1_agreement_pct": round(
+                                100.0 * sum(t_f1s) / len(t_f1s), 2
+                            ),
+                            "swe_action_agreement_pct": round(
+                                100.0 * t_act / t_count, 2
+                            ),
+                            "baseline_gt_patch_symbol_accuracy_pct": round(
+                                100.0 * t_base_sym / t_count, 2
+                            ),
+                            "delta_compressed_gt_patch_symbol_accuracy_pct": round(
+                                100.0 * t_comp_sym / t_count, 2
+                            ),
+                        }
+                    )
+
+            all_c = max(1, all_count)
+            fu_c = max(1, fu_count)
+            per_turn_accuracy_metrics = {
+                "all_turns_evaluated": all_count,
+                "all_turns_top1_token_match_pct": round(100.0 * all_top1 / all_c, 2),
+                "all_turns_response_f1_agreement_pct": round(
+                    100.0 * sum(all_f1s) / max(1, len(all_f1s)), 2
+                ),
+                "all_turns_swe_action_agreement_pct": round(
+                    100.0 * all_act / all_c, 2
+                ),
+                "all_turns_baseline_gt_patch_symbol_accuracy_pct": round(
+                    100.0 * all_base_sym / all_c, 2
+                ),
+                "all_turns_delta_compressed_gt_patch_symbol_accuracy_pct": round(
+                    100.0 * all_comp_sym / all_c, 2
+                ),
+                "followup_turns_evaluated": fu_count,
+                "followup_turns_top1_token_match_pct": round(
+                    100.0 * fu_top1 / fu_c, 2
+                ),
+                "followup_turns_response_f1_agreement_pct": round(
+                    100.0 * sum(fu_f1s) / max(1, len(fu_f1s)), 2
+                ),
+                "followup_turns_swe_action_agreement_pct": round(
+                    100.0 * fu_act / fu_c, 2
+                ),
+                "followup_turns_baseline_gt_patch_symbol_accuracy_pct": round(
+                    100.0 * fu_base_sym / fu_c, 2
+                ),
+                "followup_turns_delta_compressed_gt_patch_symbol_accuracy_pct": round(
+                    100.0 * fu_comp_sym / fu_c, 2
+                ),
+                "uncompressed_per_turn_eval_sec": uncomp_res.get(
+                    "per_turn_eval_sec", 0.0
+                ),
+                "delta_compressed_per_turn_eval_sec": comp_res.get(
+                    "per_turn_eval_sec", 0.0
+                ),
+                "per_turn_accuracy_breakdown": per_turn_breakdown,
+            }
 
         n_s = max(1, len(samples))
         u_followup_total = max(
@@ -1403,6 +1625,7 @@ def evaluate_swe_agent_eviction_hbm(
             "delta_compressed_gt_patch_symbol_accuracy_pct": round(
                 100.0 * comp_symbol_hits / n_s, 2
             ),
+            **per_turn_accuracy_metrics,
             "turn_progression": turn_progression,
         }
         print(f"\n--- [SWE-AGENT GPU HBM EVICTION BENCHMARK] Summary for {regime} ---")
@@ -1433,6 +1656,13 @@ def main() -> None:
         type=str,
         choices=["blockpool", "delta", "both"],
         default="both",
+    )
+    parser.add_argument("--eval-all-turns", action="store_true")
+    parser.add_argument(
+        "--pad-token",
+        type=str,
+        default=DEFAULT_PAD_TOKEN,
+        help="Default structural padding token for Approach 2 block alignment (default: '\\n')",
     )
     parser.add_argument("--blockpool-json", type=str, default="")
     parser.add_argument("--output-json", type=str, default="")
@@ -1482,6 +1712,8 @@ def main() -> None:
                 kv_connector_extra_config={
                     "store_device": "cuda",
                     "force_uncompressed": False,
+                    "enable_structural_alignment": True,
+                    "pad_token": args.pad_token,
                 },
             ),
         )
@@ -1493,6 +1725,7 @@ def main() -> None:
         trajectories=trajectories,
         tokenizer=tokenizer,
         block_size=resolved_block_size,
+        pad_token=args.pad_token,
     )
     total_turns = sum(s["num_turns"] for s in samples)
     print(
@@ -1521,6 +1754,7 @@ def main() -> None:
         regime_filter=args.regime,
         mode=args.mode,
         blockpool_data=blockpool_data,
+        eval_all_turns=args.eval_all_turns,
     )
 
     total_job_sec = time.perf_counter() - t_job_start

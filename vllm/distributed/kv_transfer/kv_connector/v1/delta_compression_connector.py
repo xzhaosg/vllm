@@ -78,6 +78,354 @@ def compute_full_prefix_block_hash(
     return safe_hash(raw_bytes, usedforsecurity=False).hexdigest()
 
 
+DEFAULT_PAD_TOKEN = "\n"
+
+
+def _encode_text_without_special_tokens(tokenizer: Any, text: str) -> list[int]:
+    """Encode `text` into token IDs without special tokens using a vLLM or HF tokenizer."""
+    if hasattr(tokenizer, "encode"):
+        try:
+            res = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            res = tokenizer.encode(text)
+    elif callable(tokenizer):
+        try:
+            out = tokenizer(text, add_special_tokens=False)
+        except TypeError:
+            out = tokenizer(text)
+        res = out["input_ids"] if isinstance(out, dict) and "input_ids" in out else out
+    else:
+        raise TypeError(f"Unsupported tokenizer object: {type(tokenizer)!r}")
+    if isinstance(res, torch.Tensor):
+        return [int(x) for x in res.flatten().tolist()]
+    return [int(x) for x in res]
+
+
+def resolve_pad_token_id(
+    tokenizer: Any,
+    pad_token: str = DEFAULT_PAD_TOKEN,
+    pad_token_id: int | None = None,
+    content_text: str | None = None,
+    pad_token_map: dict[str, str] | None = None,
+) -> int:
+    """Resolve the padding token ID for server-side block alignment (Approach 2).
+
+    Supports:
+      1. Explicit `pad_token_id` override if provided.
+      2. Content-aware padding token selection via `pad_token_map` (mapping a substring
+         or regex pattern in `content_text` to a padding string such as `" "` for JSON/SQL
+         or `"\\n"` for source code / Markdown / SWE-agent observations).
+      3. Configurable default `pad_token` string (defaults to `"\\n"`).
+    """
+    if pad_token_id is not None:
+        return int(pad_token_id)
+
+    effective_pad_str = pad_token if pad_token else DEFAULT_PAD_TOKEN
+    if content_text and pad_token_map:
+        for pattern, mapped_pad in pad_token_map.items():
+            matched = pattern in content_text
+            if not matched and (pattern.startswith("^") or pattern.startswith("re:")):
+                rx = pattern[3:] if pattern.startswith("re:") else pattern
+                try:
+                    matched = bool(re.search(rx, content_text))
+                except re.error:
+                    matched = False
+            if matched and mapped_pad:
+                effective_pad_str = mapped_pad
+                break
+
+    if tokenizer is None:
+        raise ValueError(
+            "Either `tokenizer` or explicit `pad_token_id` must be provided to resolve_pad_token_id."
+        )
+    ids = _encode_text_without_special_tokens(tokenizer, effective_pad_str)
+    if not ids:
+        ids = _encode_text_without_special_tokens(tokenizer, DEFAULT_PAD_TOKEN)
+    if not ids:
+        raise ValueError(
+            f"Tokenizer produced empty token IDs for pad_token={effective_pad_str!r}"
+        )
+    return int(ids[-1])
+
+
+def align_tokens_to_block(
+    token_ids: list[int] | tuple[int, ...],
+    block_size: int,
+    pad_token_id: int,
+    target_blocks: int | None = None,
+) -> list[int]:
+    """Pad `token_ids` to an exact multiple of `block_size` using `pad_token_id`."""
+    ids = [int(t) for t in token_ids]
+    if block_size <= 0:
+        return ids
+    if target_blocks is not None:
+        target_len = target_blocks * block_size
+        if len(ids) < target_len:
+            return ids + [int(pad_token_id)] * (target_len - len(ids))
+        return ids[:target_len]
+    rem = len(ids) % block_size
+    if rem != 0:
+        return ids + [int(pad_token_id)] * (block_size - rem)
+    return ids
+
+
+def encode_file_viewer_bucketed_server(
+    tokenizer: Any,
+    text: str,
+    block_size: int,
+    pad_token: str = DEFAULT_PAD_TOKEN,
+    pad_token_id: int | None = None,
+    pad_token_map: dict[str, str] | None = None,
+    line_step: int = 10,
+    blocks_per_bucket: int = 6,
+    max_file_blocks: int | None = None,
+    file_path_hint: str = "",
+) -> list[int]:
+    """Server-side SWE-agent `[File: ...]` viewer encoder with configurable padding token.
+
+    Buckets numbered file viewer lines into `line_step`-line (default 10-line)
+    block-aligned chunks (`blocks_per_bucket` blocks per 10-line bucket) so that:
+      1. Multi-token edits inside one 10-line region do not shift token-chunk
+         boundaries in downstream unchanged regions of the file.
+      2. Scrolling the 100-line file window (`goto` / `scroll_down`) preserves exact
+         `token_block_hash` matches on all overlapping 10-line buckets via RoPE shift.
+    """
+    resolved_pad_id = resolve_pad_token_id(
+        tokenizer,
+        pad_token=pad_token,
+        pad_token_id=pad_token_id,
+        content_text=text,
+        pad_token_map=pad_token_map,
+    )
+    if line_step <= 0 or ("[File:" not in text and not file_path_hint):
+        return align_tokens_to_block(
+            _encode_text_without_special_tokens(tokenizer, text),
+            block_size,
+            resolved_pad_id,
+            target_blocks=max_file_blocks,
+        )
+
+    if block_size >= 128:
+        obs_lines = text.splitlines(keepends=True)
+        buckets_50: dict[int, list[tuple[int, str]]] = {}
+        line_re_50 = re.compile(r"^(\d+):")
+        for ln in obs_lines:
+            m50 = line_re_50.match(ln)
+            if m50:
+                lno = int(m50.group(1))
+                buckets_50.setdefault((lno - 1) // 50, []).append((lno, ln))
+        if not buckets_50:
+            return align_tokens_to_block(
+                _encode_text_without_special_tokens(tokenizer, text),
+                block_size,
+                resolved_pad_id,
+                target_blocks=max_file_blocks,
+            )
+        out_ids_50: list[int] = []
+        slot_len = block_size // 5
+        for b_id in sorted(buckets_50.keys()):
+            if (
+                max_file_blocks is not None
+                and (len(out_ids_50) // block_size) >= max_file_blocks
+            ):
+                break
+            sub_buckets: dict[int, list[str]] = {}
+            for lno, ln in buckets_50[b_id]:
+                sub_id = ((lno - 1) % 50) // 10
+                sub_buckets.setdefault(sub_id, []).append(ln)
+            blk_ids: list[int] = []
+            for s_id in range(5):
+                stxt = "".join(sub_buckets.get(s_id, []))
+                sids = (
+                    _encode_text_without_special_tokens(tokenizer, stxt)
+                    if stxt
+                    else []
+                )
+                t_slot = slot_len if s_id < 4 else (block_size - 4 * slot_len)
+                if len(sids) < t_slot:
+                    sids = sids + [resolved_pad_id] * (t_slot - len(sids))
+                else:
+                    sids = sids[:t_slot]
+                blk_ids.extend(sids)
+            out_ids_50.extend(blk_ids)
+        return align_tokens_to_block(
+            out_ids_50,
+            block_size,
+            resolved_pad_id,
+            target_blocks=max_file_blocks,
+        )
+
+    lines = text.splitlines(keepends=True)
+    header_lines: list[str] = []
+    numbered_lines: list[tuple[int, str]] = []
+    footer_lines: list[str] = []
+    in_body = False
+    in_footer = False
+
+    for line in lines:
+        if not in_body and not in_footer:
+            m = re.match(r"^(\d+):", line)
+            if m:
+                in_body = True
+                numbered_lines.append((int(m.group(1)), line))
+            else:
+                header_lines.append(line)
+        elif in_body and not in_footer:
+            m = re.match(r"^(\d+):", line)
+            if m:
+                numbered_lines.append((int(m.group(1)), line))
+            else:
+                in_footer = True
+                footer_lines.append(line)
+        else:
+            footer_lines.append(line)
+
+    if not numbered_lines:
+        return align_tokens_to_block(
+            _encode_text_without_special_tokens(tokenizer, text),
+            block_size,
+            resolved_pad_id,
+            target_blocks=max_file_blocks,
+        )
+
+    out_ids: list[int] = []
+    hdr_str = (
+        "".join(header_lines)
+        if header_lines
+        else (f"[File: {file_path_hint}]\n" if file_path_hint else "")
+    )
+    if hdr_str:
+        hdr_pad_id = resolve_pad_token_id(
+            tokenizer,
+            pad_token=pad_token,
+            pad_token_id=pad_token_id,
+            content_text=hdr_str,
+            pad_token_map=pad_token_map,
+        )
+        out_ids.extend(
+            align_tokens_to_block(
+                _encode_text_without_special_tokens(tokenizer, hdr_str),
+                block_size,
+                hdr_pad_id,
+                target_blocks=1,
+            )
+        )
+
+    buckets: dict[int, list[str]] = {}
+    for line_no, line_str in numbered_lines:
+        b_key = (line_no - 1) // line_step
+        buckets.setdefault(b_key, []).append(line_str)
+
+    for b_key in sorted(buckets.keys()):
+        if (
+            max_file_blocks is not None
+            and (len(out_ids) // block_size) + blocks_per_bucket > max_file_blocks
+        ):
+            break
+        b_str = "".join(buckets[b_key])
+        b_pad_id = resolve_pad_token_id(
+            tokenizer,
+            pad_token=pad_token,
+            pad_token_id=pad_token_id,
+            content_text=b_str,
+            pad_token_map=pad_token_map,
+        )
+        out_ids.extend(
+            align_tokens_to_block(
+                _encode_text_without_special_tokens(tokenizer, b_str),
+                block_size,
+                b_pad_id,
+                target_blocks=blocks_per_bucket,
+            )
+        )
+
+    if footer_lines and (
+        max_file_blocks is None
+        or len(out_ids) < max_file_blocks * block_size
+    ):
+        rem_blocks = (
+            min(2, max_file_blocks - (len(out_ids) // block_size))
+            if max_file_blocks is not None
+            else None
+        )
+        ftr_str = "".join(footer_lines)
+        ftr_pad_id = resolve_pad_token_id(
+            tokenizer,
+            pad_token=pad_token,
+            pad_token_id=pad_token_id,
+            content_text=ftr_str,
+            pad_token_map=pad_token_map,
+        )
+        out_ids.extend(
+            align_tokens_to_block(
+                _encode_text_without_special_tokens(tokenizer, ftr_str),
+                block_size,
+                ftr_pad_id,
+                target_blocks=rem_blocks,
+            )
+        )
+    return out_ids
+
+
+def align_structural_prompt_server(
+    tokenizer: Any,
+    segments: list[tuple[str, bool]] | list[str],
+    block_size: int,
+    pad_token: str = DEFAULT_PAD_TOKEN,
+    pad_token_id: int | None = None,
+    pad_token_map: dict[str, str] | None = None,
+    bucket_file_viewer: bool = True,
+) -> list[int]:
+    """Server-side structural prompt tokenizer and block aligner (Approach 2).
+
+    Each segment in `segments` can be either:
+      - `(segment_text, align_this_segment)` where `align_this_segment=False` is used
+        for the final open generation prefix (e.g. `<|im_start|>assistant\\n`) so
+        next-token decoding starts at the exact unpadded generation boundary, OR
+      - `segment_text` (a plain `str`), in which case all segments except the last
+        open generation prefix are block-aligned to `block_size`.
+    """
+    out_ids: list[int] = []
+    num_segs = len(segments)
+    for idx, item in enumerate(segments):
+        if isinstance(item, tuple):
+            seg_text, should_align = item
+        else:
+            seg_text = str(item)
+            should_align = idx < (num_segs - 1)
+        if not seg_text:
+            continue
+        if not should_align:
+            out_ids.extend(_encode_text_without_special_tokens(tokenizer, seg_text))
+        elif bucket_file_viewer and "[File: " in seg_text:
+            out_ids.extend(
+                encode_file_viewer_bucketed_server(
+                    tokenizer=tokenizer,
+                    text=seg_text,
+                    block_size=block_size,
+                    pad_token=pad_token,
+                    pad_token_id=pad_token_id,
+                    pad_token_map=pad_token_map,
+                )
+            )
+        else:
+            seg_pad_id = resolve_pad_token_id(
+                tokenizer,
+                pad_token=pad_token,
+                pad_token_id=pad_token_id,
+                content_text=seg_text,
+                pad_token_map=pad_token_map,
+            )
+            out_ids.extend(
+                align_tokens_to_block(
+                    _encode_text_without_special_tokens(tokenizer, seg_text),
+                    block_size,
+                    seg_pad_id,
+                )
+            )
+    return out_ids
+
+
 _ROPE_COS_SIN_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 _INT2_SPARSE_CODEBOOK_CACHE: dict[torch.device, torch.Tensor] = {}
 
@@ -768,9 +1116,14 @@ class CompressedKVBlockRecord:
     raw_v: torch.Tensor | None = None
 
     # For TIER0 / TIER1 / TIER2 / TIER3:
-    # Single-hop reference pointer to an UNCOMPRESSED_BASE block's full_block_hash
+    # Single-hop reference pointer(s) to UNCOMPRESSED_BASE block(s).
+    # When `ref_base_hash_2` is set and `0 < stitch_offset < block_size`,
+    # the reference KV is stitched across `ref_base_hash[stitch_offset:]`
+    # and `ref_base_hash_2[:stitch_offset]` (Approach 1 cross-block stitching).
     ref_base_hash: str | None = None
     delta_pos: int = 0
+    ref_base_hash_2: str | None = None
+    stitch_offset: int = 0
 
     # For TIER1 (INT2) and TIER2 (INT4) and TIER3 (Sparse + INT4):
     quant_delta_k: PackedQuantizedTensor | None = None
@@ -875,6 +1228,10 @@ class DeltaBlockStore:
         max_sparse_exceptions: int = 4,
         device: str = "cpu",
         force_uncompressed: bool = False,
+        pad_token: str = DEFAULT_PAD_TOKEN,
+        pad_token_id: int | None = None,
+        pad_token_map: dict[str, str] | None = None,
+        enable_server_block_align: bool = False,
     ):
         self.block_size = block_size
         self.default_rope_theta = default_rope_theta
@@ -887,6 +1244,11 @@ class DeltaBlockStore:
         self.max_sparse_exceptions = max_sparse_exceptions
         self.device = device
         self.force_uncompressed = force_uncompressed
+        # Approach 2: Configurable server-side block alignment padding parameters
+        self.pad_token = pad_token if pad_token else DEFAULT_PAD_TOKEN
+        self.pad_token_id = int(pad_token_id) if pad_token_id is not None else None
+        self.pad_token_map = dict(pad_token_map) if pad_token_map else None
+        self.enable_server_block_align = bool(enable_server_block_align)
 
         # Layer name -> LayerCompressionPolicy
         self.layer_policies: dict[str, LayerCompressionPolicy] = {}
@@ -914,6 +1276,18 @@ class DeltaBlockStore:
         self._base_by_subchunk: dict[
             tuple[str, int, tuple[int, ...]], list[CompressedKVBlockRecord]
         ] = {}
+        # Approach 1: O(1) boundary w-gram and position indices for cross-block reference
+        # stitching across unaligned token shifts (delta_p != 0 mod block_size):
+        self._base_by_layer_pos: dict[
+            tuple[str, int], list[CompressedKVBlockRecord]
+        ] = {}
+        self._base_by_suffix_wgram: dict[
+            tuple[str, tuple[int, ...]], list[CompressedKVBlockRecord]
+        ] = {}
+        self._base_by_prefix_wgram: dict[
+            tuple[str, tuple[int, ...]], list[CompressedKVBlockRecord]
+        ] = {}
+        self._layers_with_unaligned_bases: set[str] = set()
 
         # Prefix hash registry at scheduler level: full_block_hash -> (token_ids, start_pos)
         self._known_prefix_blocks: dict[str, tuple[tuple[int, ...], int]] = {}
@@ -938,7 +1312,10 @@ class DeltaBlockStore:
         self._known_layers: set[str] = set()
         self._known_slab_devices: set[torch.device] = set()
         self._partial_match_cache: dict[
-            tuple[str, int, tuple[str, ...]], tuple[str | None, list[int]]
+            tuple[Any, ...], tuple[str | None, list[int]]
+        ] = {}
+        self._stitched_match_cache: dict[
+            tuple[Any, ...], tuple[str | None, str | None, int, list[int]]
         ] = {}
         self._pigeonhole_slice_cache: dict[
             tuple[str, int], list[tuple[int, tuple[int, ...]]]
@@ -953,6 +1330,10 @@ class DeltaBlockStore:
         self._base_by_token_hash_list.clear()
         self._base_blocks_by_layer.clear()
         self._base_by_subchunk.clear()
+        self._base_by_layer_pos.clear()
+        self._base_by_suffix_wgram.clear()
+        self._base_by_prefix_wgram.clear()
+        self._layers_with_unaligned_bases.clear()
         self._known_prefix_blocks.clear()
         self._known_token_blocks.clear()
         self._known_mamba_blocks.clear()
@@ -968,6 +1349,7 @@ class DeltaBlockStore:
         self._known_layers.clear()
         self._known_slab_devices.clear()
         self._partial_match_cache.clear()
+        self._stitched_match_cache.clear()
         self._pigeonhole_slice_cache.clear()
         self._clear_epoch += 1
         self.stats = DeltaCompressionStats()
@@ -975,9 +1357,12 @@ class DeltaBlockStore:
             torch.cuda.empty_cache()
 
     def _touch_lru(
-        self, full_block_hash: str, ref_base_hash: str | None = None
+        self,
+        full_block_hash: str,
+        ref_base_hash: str | None = None,
+        ref_base_hash_2: str | None = None,
     ) -> None:
-        """Promote `full_block_hash` (and its `ref_base_hash` after it) to most-recently-used."""
+        """Promote `full_block_hash` (and its `ref_base_hash` / `ref_base_hash_2` after it) to most-recently-used."""
         self._demoted_blocks.discard(full_block_hash)
         self._retired_blocks.discard(full_block_hash)
         self._block_lru.pop(full_block_hash, None)
@@ -985,6 +1370,113 @@ class DeltaBlockStore:
         if ref_base_hash and ref_base_hash != full_block_hash:
             self._block_lru.pop(ref_base_hash, None)
             self._block_lru[ref_base_hash] = None
+        if (
+            ref_base_hash_2
+            and ref_base_hash_2 != full_block_hash
+            and ref_base_hash_2 != ref_base_hash
+        ):
+            self._block_lru.pop(ref_base_hash_2, None)
+            self._block_lru[ref_base_hash_2] = None
+
+    def resolve_pad_token_id(
+        self,
+        tokenizer: Any = None,
+        content_text: str | None = None,
+        pad_token: str | None = None,
+        pad_token_id: int | None = None,
+    ) -> int:
+        """Resolve the padding token ID using this store's configured `pad_token` / `pad_token_map`."""
+        return resolve_pad_token_id(
+            tokenizer=tokenizer,
+            pad_token=pad_token if pad_token is not None else self.pad_token,
+            pad_token_id=(
+                pad_token_id if pad_token_id is not None else self.pad_token_id
+            ),
+            content_text=content_text,
+            pad_token_map=self.pad_token_map,
+        )
+
+    def align_tokens(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        pad_token_id: int | None = None,
+        tokenizer: Any = None,
+        content_text: str | None = None,
+        target_blocks: int | None = None,
+    ) -> list[int]:
+        """Pad `token_ids` to an exact multiple of `self.block_size` (Approach 2)."""
+        resolved_pad_id = (
+            int(pad_token_id)
+            if pad_token_id is not None
+            else self.resolve_pad_token_id(
+                tokenizer=tokenizer, content_text=content_text
+            )
+        )
+        return align_tokens_to_block(
+            token_ids=token_ids,
+            block_size=self.block_size,
+            pad_token_id=resolved_pad_id,
+            target_blocks=target_blocks,
+        )
+
+    def encode_aligned_segment(
+        self,
+        tokenizer: Any,
+        text: str,
+        bucket_file_viewer: bool = True,
+        target_blocks: int | None = None,
+        pad_token: str | None = None,
+        pad_token_id: int | None = None,
+        line_step: int = 10,
+    ) -> list[int]:
+        """Encode and block-align a structural prompt segment on the server side (Approach 2)."""
+        eff_pad_token = pad_token if pad_token is not None else self.pad_token
+        eff_pad_id = (
+            pad_token_id if pad_token_id is not None else self.pad_token_id
+        )
+        if bucket_file_viewer and "[File: " in text and target_blocks is None:
+            return encode_file_viewer_bucketed_server(
+                tokenizer=tokenizer,
+                text=text,
+                block_size=self.block_size,
+                pad_token=eff_pad_token,
+                pad_token_id=eff_pad_id,
+                pad_token_map=self.pad_token_map,
+                line_step=line_step,
+            )
+        resolved_pad_id = self.resolve_pad_token_id(
+            tokenizer=tokenizer,
+            content_text=text,
+            pad_token=eff_pad_token,
+            pad_token_id=eff_pad_id,
+        )
+        return align_tokens_to_block(
+            token_ids=_encode_text_without_special_tokens(tokenizer, text),
+            block_size=self.block_size,
+            pad_token_id=resolved_pad_id,
+            target_blocks=target_blocks,
+        )
+
+    def align_structural_prompt(
+        self,
+        tokenizer: Any,
+        segments: list[tuple[str, bool]] | list[str],
+        bucket_file_viewer: bool = True,
+        pad_token: str | None = None,
+        pad_token_id: int | None = None,
+    ) -> list[int]:
+        """Tokenize and block-align a sequence of structural prompt segments (Approach 2)."""
+        return align_structural_prompt_server(
+            tokenizer=tokenizer,
+            segments=segments,
+            block_size=self.block_size,
+            pad_token=pad_token if pad_token is not None else self.pad_token,
+            pad_token_id=(
+                pad_token_id if pad_token_id is not None else self.pad_token_id
+            ),
+            pad_token_map=self.pad_token_map,
+            bucket_file_viewer=bucket_file_viewer,
+        )
 
     def demote_lru(self, full_block_hash: str) -> None:
         """Mark `full_block_hash` as demoted while preserving chronological LRU order."""
@@ -1166,6 +1658,47 @@ class DeltaBlockStore:
             ),
         )
 
+    @staticmethod
+    def _diff_indices_bounded(
+        tok_a: tuple[int, ...],
+        tok_b: tuple[int, ...],
+        max_diffs: int,
+    ) -> list[int] | None:
+        """Return indices where `tok_a != tok_b` if `0 < diffs <= max_diffs`, else None.
+
+        Uses C-level tuple slice equality to skip identical regions and abort early
+        when more than `max_diffs` chunks differ.
+        """
+        n = len(tok_a)
+        if n != len(tok_b) or max_diffs <= 0 or tok_a == tok_b:
+            return None
+        if n >= 32:
+            num_chunks = min(8, max(max_diffs + 2, 4))
+            chunk_spans: list[tuple[int, int]] = []
+            for c_idx in range(num_chunks):
+                c_start = (c_idx * n) // num_chunks
+                c_end = ((c_idx + 1) * n) // num_chunks
+                if tok_a[c_start:c_end] != tok_b[c_start:c_end]:
+                    chunk_spans.append((c_start, c_end))
+                    if len(chunk_spans) > max_diffs:
+                        return None
+            diffs: list[int] = []
+            for c_start, c_end in chunk_spans:
+                for i in range(c_start, c_end):
+                    if tok_a[i] != tok_b[i]:
+                        diffs.append(i)
+                        if len(diffs) > max_diffs:
+                            return None
+            return diffs if diffs else None
+
+        diffs = []
+        for i, (ta, tb) in enumerate(zip(tok_a, tok_b)):
+            if ta != tb:
+                diffs.append(i)
+                if len(diffs) > max_diffs:
+                    return None
+        return diffs if diffs else None
+
     def _find_partial_match_base_block(
         self,
         layer_name: str,
@@ -1184,6 +1717,33 @@ class DeltaBlockStore:
         )
         if max_exceptions <= 0:
             return None, []
+        layer_bases = self._base_blocks_by_layer.get(layer_name)
+        if not layer_bases:
+            return None, []
+
+        fast_cache_key = (
+            (
+                full_block_hash,
+                start_position,
+                prev_token_block_hash,
+                max_exceptions,
+                len(layer_bases),
+            )
+            if full_block_hash
+            else None
+        )
+        if fast_cache_key is not None and fast_cache_key in self._partial_match_cache:
+            cached_base_hash, cached_diff_idx = self._partial_match_cache[fast_cache_key]
+            if cached_base_hash is None:
+                return None, []
+            cached_rec = self._records.get((layer_name, cached_base_hash))
+            if (
+                cached_rec is not None
+                and cached_rec.tier == CompressionTier.UNCOMPRESSED_BASE
+                and (not exclude_hashes or cached_base_hash not in exclude_hashes)
+            ):
+                return cached_rec, cached_diff_idx
+
         num_slices = max_exceptions + 1
         slice_key = (full_block_hash, num_slices) if full_block_hash else None
         if slice_key is not None and slice_key in self._pigeonhole_slice_cache:
@@ -1197,10 +1757,19 @@ class DeltaBlockStore:
         candidates: list[CompressedKVBlockRecord] = []
         matched_buckets: list[list[CompressedKVBlockRecord]] = []
         for s_idx, sub_tuple in slices:
+            if len(sub_tuple) >= 16 and len(set(sub_tuple)) <= 1:
+                continue
             bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
             if bucket:
                 matched_buckets.append(bucket)
         if not matched_buckets:
+            for s_idx, sub_tuple in slices:
+                bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
+                if bucket:
+                    matched_buckets.append(bucket)
+        if not matched_buckets:
+            if fast_cache_key is not None:
+                self._partial_match_cache[fast_cache_key] = (None, [])
             return None, []
         matched_buckets.sort(key=len)
         for bucket in matched_buckets:
@@ -1254,12 +1823,10 @@ class DeltaBlockStore:
                 )
             ):
                 continue
-            diff_idx = [
-                i
-                for i, (t_a, t_b) in enumerate(zip(token_ids, base_rec.token_ids))
-                if t_a != t_b
-            ]
-            if 0 < len(diff_idx) <= max_exceptions:
+            diff_idx = self._diff_indices_bounded(
+                token_ids, base_rec.token_ids, max_exceptions
+            )
+            if diff_idx is not None:
                 prev_match = (
                     0
                     if (
@@ -1280,12 +1847,335 @@ class DeltaBlockStore:
                     best_score = score
                     if prev_match == 0 and len(diff_idx) <= 2 and pos_dist == 0:
                         break
+        res_pair = (
+            best_base.full_block_hash if best_base is not None else None,
+            best_diff_indices,
+        )
         if cache_key is not None:
-            self._partial_match_cache[cache_key] = (
-                best_base.full_block_hash if best_base is not None else None,
-                best_diff_indices,
-            )
+            self._partial_match_cache[cache_key] = res_pair
+        if fast_cache_key is not None:
+            self._partial_match_cache[fast_cache_key] = res_pair
         return best_base, best_diff_indices
+
+    @staticmethod
+    def _get_boundary_wgram_size(block_len: int) -> int:
+        return min(4, max(1, block_len // 4))
+
+    def _index_base_block(
+        self,
+        layer_name: str,
+        base_record: CompressedKVBlockRecord,
+        max_exceptions: int,
+    ) -> None:
+        """Index an UNCOMPRESSED_BASE block for exact, partial, and stitched lookups."""
+        token_hash = base_record.token_block_hash
+        token_tuple = base_record.token_ids
+        self._base_by_token_hash.setdefault((layer_name, token_hash), base_record)
+        self._base_by_token_hash_list.setdefault((layer_name, token_hash), []).append(
+            base_record
+        )
+        self._base_blocks_by_layer.setdefault(layer_name, []).append(base_record)
+        if max_exceptions > 0:
+            num_slices = max_exceptions + 1
+            for s_idx, sub_tuple in self._get_pigeonhole_slices(
+                token_tuple, num_slices
+            ):
+                self._base_by_subchunk.setdefault(
+                    (layer_name, s_idx, sub_tuple), []
+                ).append(base_record)
+        b_len = len(token_tuple)
+        if b_len >= 2:
+            w = self._get_boundary_wgram_size(b_len)
+            self._base_by_layer_pos.setdefault(
+                (layer_name, base_record.start_position), []
+            ).append(base_record)
+            suf_w = token_tuple[-w:]
+            if b_len < 16 or len(set(suf_w)) > 1:
+                self._base_by_suffix_wgram.setdefault(
+                    (layer_name, suf_w), []
+                ).append(base_record)
+                self._layers_with_unaligned_bases.add(layer_name)
+            pre_w = token_tuple[:w]
+            if b_len < 16 or len(set(pre_w)) > 1:
+                self._base_by_prefix_wgram.setdefault(
+                    (layer_name, pre_w), []
+                ).append(base_record)
+
+    @staticmethod
+    def _get_record_base_kv(
+        base_rec_1: CompressedKVBlockRecord,
+        base_rec_2: CompressedKVBlockRecord | None = None,
+        stitch_offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return (raw_k, raw_v) from a single base block or stitched across two consecutive base blocks."""
+        assert base_rec_1.raw_k is not None
+        if base_rec_2 is None or stitch_offset <= 0:
+            return base_rec_1.raw_k, base_rec_1.raw_v
+        assert base_rec_2.raw_k is not None
+        s = stitch_offset
+        k_stitched = torch.cat([base_rec_1.raw_k[s:], base_rec_2.raw_k[:s]], dim=0)
+        if base_rec_1.raw_v is not None and base_rec_2.raw_v is not None:
+            v_stitched: torch.Tensor | None = torch.cat(
+                [base_rec_1.raw_v[s:], base_rec_2.raw_v[:s]], dim=0
+            )
+        else:
+            v_stitched = None
+        return k_stitched, v_stitched
+
+    def _find_stitched_base_blocks(
+        self,
+        layer_name: str,
+        token_ids: tuple[int, ...],
+        start_position: int | None = None,
+        exclude_hashes: set[str] | None = None,
+        max_edits: int = 0,
+        full_block_hash: str = "",
+    ) -> tuple[
+        CompressedKVBlockRecord | None,
+        CompressedKVBlockRecord | None,
+        int,
+        list[int],
+    ]:
+        """Find two consecutive UNCOMPRESSED_BASE blocks (B0, B1) whose stitched
+        tokens `B0.token_ids[s:] + B1.token_ids[:s]` match `token_ids` within `max_edits`.
+
+        Used by Approach 1 (Cross-Block Reference Stitching) when an unaligned
+        token shift `delta_p != 0 (mod B)` causes blocks to straddle two adjacent
+        reference blocks from an earlier turn.
+        """
+        b_len = len(token_ids)
+        if b_len < 2 or layer_name not in self._layers_with_unaligned_bases:
+            return None, None, 0, []
+        layer_bases = self._base_blocks_by_layer.get(layer_name)
+        if not layer_bases or len(layer_bases) < 2:
+            return None, None, 0, []
+
+        cache_key = (
+            (
+                full_block_hash,
+                start_position,
+                max_edits,
+                len(layer_bases),
+            )
+            if full_block_hash
+            else None
+        )
+        if cache_key is not None and cache_key in self._stitched_match_cache:
+            c_h1, c_h2, c_s, c_diffs = self._stitched_match_cache[cache_key]
+            if c_h1 is None or c_h2 is None or c_s <= 0:
+                return None, None, 0, []
+            r1 = self._records.get((layer_name, c_h1))
+            r2 = self._records.get((layer_name, c_h2))
+            if (
+                r1 is not None
+                and r2 is not None
+                and r1.tier == CompressionTier.UNCOMPRESSED_BASE
+                and r2.tier == CompressionTier.UNCOMPRESSED_BASE
+                and (
+                    not exclude_hashes
+                    or (c_h1 not in exclude_hashes and c_h2 not in exclude_hashes)
+                )
+            ):
+                return r1, r2, c_s, c_diffs
+
+        w = self._get_boundary_wgram_size(b_len)
+        seen_pairs: set[tuple[str, str, int]] = set()
+        candidates: list[
+            tuple[CompressedKVBlockRecord, CompressedKVBlockRecord, int]
+        ] = []
+        require_both_seam_sides = max_edits == 0 or b_len > 64
+
+        # O(1) seam lookup using boundary w-grams on either side of seam k = B - s:
+        for k in range(1, b_len):
+            if len(candidates) >= 16:
+                break
+            s = b_len - k
+            if k >= w:
+                suf_wgram = token_ids[k - w : k]
+                if not (b_len >= 16 and len(set(suf_wgram)) <= 1):
+                    b0_bucket = self._base_by_suffix_wgram.get((layer_name, suf_wgram))
+                    if b0_bucket:
+                        for b0 in b0_bucket[-16:]:
+                            if exclude_hashes and b0.full_block_hash in exclude_hashes:
+                                continue
+                            if len(b0.token_ids) != b_len:
+                                continue
+                            if max_edits == 0 and token_ids[0] != b0.token_ids[s]:
+                                continue
+                            b1_list = self._base_by_layer_pos.get(
+                                (layer_name, b0.start_position + b_len)
+                            )
+                            if not b1_list:
+                                continue
+                            for b1 in b1_list[-8:]:
+                                if (
+                                    exclude_hashes
+                                    and b1.full_block_hash in exclude_hashes
+                                ):
+                                    continue
+                                if len(b1.token_ids) != b_len:
+                                    continue
+                                if (
+                                    b1.prev_token_block_hash
+                                    and b0.token_block_hash
+                                    and b1.prev_token_block_hash != b0.token_block_hash
+                                ):
+                                    continue
+                                if (
+                                    require_both_seam_sides
+                                    and s >= w
+                                    and token_ids[k : k + w] != b1.token_ids[:w]
+                                ):
+                                    continue
+                                if (
+                                    max_edits == 0
+                                    and token_ids[-1] != b1.token_ids[s - 1]
+                                ):
+                                    continue
+                                pkey = (b0.full_block_hash, b1.full_block_hash, s)
+                                if pkey not in seen_pairs:
+                                    seen_pairs.add(pkey)
+                                    candidates.append((b0, b1, s))
+                                    if len(candidates) >= 16:
+                                        break
+            if len(candidates) >= 16:
+                break
+            if s >= w and (not require_both_seam_sides or k < w):
+                pre_wgram = token_ids[k : k + w]
+                if not (b_len >= 16 and len(set(pre_wgram)) <= 1):
+                    b1_bucket = self._base_by_prefix_wgram.get((layer_name, pre_wgram))
+                    if b1_bucket:
+                        for b1 in b1_bucket[-16:]:
+                            if exclude_hashes and b1.full_block_hash in exclude_hashes:
+                                continue
+                            if len(b1.token_ids) != b_len:
+                                continue
+                            if max_edits == 0 and token_ids[-1] != b1.token_ids[s - 1]:
+                                continue
+                            b0_list = self._base_by_layer_pos.get(
+                                (layer_name, b1.start_position - b_len)
+                            )
+                            if not b0_list:
+                                continue
+                            for b0 in b0_list[-8:]:
+                                if (
+                                    exclude_hashes
+                                    and b0.full_block_hash in exclude_hashes
+                                ):
+                                    continue
+                                if len(b0.token_ids) != b_len:
+                                    continue
+                                if (
+                                    b1.prev_token_block_hash
+                                    and b0.token_block_hash
+                                    and b1.prev_token_block_hash != b0.token_block_hash
+                                ):
+                                    continue
+                                if max_edits == 0 and token_ids[0] != b0.token_ids[s]:
+                                    continue
+                                pkey = (b0.full_block_hash, b1.full_block_hash, s)
+                                if pkey not in seen_pairs:
+                                    seen_pairs.add(pkey)
+                                    candidates.append((b0, b1, s))
+                                    if len(candidates) >= 16:
+                                        break
+
+        # Fallback scan over recent adjacent base blocks when intra-block edits hit both
+        # sides of the seam w-gram in a small base store:
+        if not candidates and max_edits > 0 and b_len <= 64 and len(layer_bases) <= 64:
+            for b0 in layer_bases[-16:]:
+                if exclude_hashes and b0.full_block_hash in exclude_hashes:
+                    continue
+                if len(b0.token_ids) != b_len:
+                    continue
+                b1_list = self._base_by_layer_pos.get(
+                    (layer_name, b0.start_position + b_len)
+                )
+                if not b1_list:
+                    continue
+                for b1 in b1_list[-4:]:
+                    if exclude_hashes and b1.full_block_hash in exclude_hashes:
+                        continue
+                    if len(b1.token_ids) != b_len:
+                        continue
+                    if (
+                        b1.prev_token_block_hash
+                        and b0.token_block_hash
+                        and b1.prev_token_block_hash != b0.token_block_hash
+                    ):
+                        continue
+                    for s in range(1, b_len):
+                        pkey = (b0.full_block_hash, b1.full_block_hash, s)
+                        if pkey not in seen_pairs:
+                            seen_pairs.add(pkey)
+                            candidates.append((b0, b1, s))
+
+        best_b0: CompressedKVBlockRecord | None = None
+        best_b1: CompressedKVBlockRecord | None = None
+        best_s: int = 0
+        best_diffs: list[int] = []
+        best_score: tuple[int, int, int] = (999, 999, 999999)
+
+        for b0, b1, s in candidates:
+            k = b_len - s
+            if max_edits == 0:
+                if (
+                    token_ids[:k] != b0.token_ids[s:]
+                    or token_ids[k:] != b1.token_ids[:s]
+                ):
+                    continue
+                diff_idx: list[int] = []
+            else:
+                stitched_toks = b0.token_ids[s:] + b1.token_ids[:s]
+                bounded_diffs = self._diff_indices_bounded(
+                    token_ids, stitched_toks, max_edits
+                )
+                if bounded_diffs is None:
+                    continue
+                diff_idx = bounded_diffs
+
+            chain_ok = (
+                0
+                if (
+                    b1.prev_token_block_hash
+                    and b1.prev_token_block_hash == b0.token_block_hash
+                )
+                else 1
+            )
+            pos_dist = (
+                abs(start_position - (b0.start_position + s))
+                if start_position is not None
+                else 0
+            )
+            score = (chain_ok, len(diff_idx), pos_dist)
+            if best_b0 is None or score < best_score:
+                best_b0 = b0
+                best_b1 = b1
+                best_s = s
+                best_diffs = diff_idx
+                best_score = score
+                if chain_ok == 0 and len(diff_idx) == 0 and pos_dist == 0:
+                    break
+
+        if cache_key is not None:
+            self._stitched_match_cache[cache_key] = (
+                best_b0.full_block_hash if best_b0 is not None else None,
+                best_b1.full_block_hash if best_b1 is not None else None,
+                best_s,
+                best_diffs,
+            )
+        return best_b0, best_b1, best_s, best_diffs
+
+    def has_stitched_token_block(self, token_ids: tuple[int, ...]) -> bool:
+        """Return True if `token_ids` matches a stitched pair of consecutive base blocks."""
+        for layer_name in self._known_layers:
+            policy = self.get_layer_policy(layer_name)
+            if not policy.is_mamba:
+                b0, b1, s, _ = self._find_stitched_base_blocks(
+                    layer_name, token_ids, max_edits=0
+                )
+                return b0 is not None and b1 is not None and s > 0
+        return False
 
     def store_block(
         self,
@@ -1322,7 +2212,9 @@ class DeltaBlockStore:
         key = (layer_name, full_block_hash)
         if key in self._records:
             rec = self._records[key]
-            self._touch_lru(full_block_hash, rec.ref_base_hash)
+            self._touch_lru(
+                full_block_hash, rec.ref_base_hash, rec.ref_base_hash_2
+            )
             return rec
 
         token_tuple = tuple(int(t) for t in token_ids)
@@ -1347,7 +2239,8 @@ class DeltaBlockStore:
         if policy.is_mamba:
             self._known_mamba_blocks.add(full_block_hash)
 
-        # 1. Check for an UNCOMPRESSED_BASE block with the exact same token_block_hash
+        # 1. Check for an UNCOMPRESSED_BASE block with the exact same token_block_hash,
+        # or (Approach 1) a 0-edit cross-block stitched match across two consecutive base blocks:
         base_rec = (
             None
             if self.force_uncompressed
@@ -1359,8 +2252,33 @@ class DeltaBlockStore:
                 prev_token_block_hash=prev_token_block_hash,
             )
         )
+        base_rec_2: CompressedKVBlockRecord | None = None
+        stitch_offset: int = 0
+        if (
+            base_rec is None
+            and not self.force_uncompressed
+            and not policy.is_mamba
+        ):
+            b0, b1, s_off, _ = self._find_stitched_base_blocks(
+                layer_name,
+                token_tuple,
+                start_position=start_position,
+                exclude_hashes=exclude_base_hashes,
+                max_edits=0,
+                full_block_hash=full_block_hash,
+            )
+            if b0 is not None and b1 is not None and s_off > 0:
+                base_rec = b0
+                base_rec_2 = b1
+                stitch_offset = s_off
+
         if base_rec is not None:
-            delta_pos = start_position - base_rec.start_position
+            ref_hash_2 = (
+                base_rec_2.full_block_hash if base_rec_2 is not None else None
+            )
+            delta_pos = start_position - (
+                base_rec.start_position + stitch_offset
+            )
 
             # Case 1A: Layer 0 non-recurrent attention -> Always Tier 0 Zero-Bit Reuse!
             if policy.layer_idx == 0 and not policy.is_mamba:
@@ -1374,6 +2292,8 @@ class DeltaBlockStore:
                     is_mla=is_mla,
                     ref_base_hash=base_rec.full_block_hash,
                     delta_pos=delta_pos,
+                    ref_base_hash_2=ref_hash_2,
+                    stitch_offset=stitch_offset,
                 )
                 return self._commit_record(layer_name, record, raw_bytes)
 
@@ -1393,13 +2313,17 @@ class DeltaBlockStore:
                     is_mla=is_mla,
                     ref_base_hash=base_rec.full_block_hash,
                     delta_pos=delta_pos,
+                    ref_base_hash_2=ref_hash_2,
+                    stitch_offset=stitch_offset,
                 )
                 return self._commit_record(layer_name, record, raw_bytes)
 
-            # Case 1C: Exact token block match (Regimes R1a, R1b, R3, or Mamba/GDN)
-            assert base_rec.raw_k is not None
+            # Case 1C: Exact (or 0-edit stitched) token block match (Regimes R1a, R1b, R3, or Mamba/GDN)
+            base_raw_k, base_raw_v = self._get_record_base_kv(
+                base_rec, base_rec_2, stitch_offset
+            )
             k_ref_aligned = apply_relative_rope_rotation(
-                base_rec.raw_k,
+                base_raw_k,
                 delta_pos=delta_pos,
                 rope_theta=policy.rope_theta,
                 rotary_dim=0 if policy.is_mamba else policy.rotary_dim,
@@ -1419,9 +2343,9 @@ class DeltaBlockStore:
             )
             outlier_mask: torch.Tensor | None = None
 
-            if v_cpu is not None and base_rec.raw_v is not None:
+            if v_cpu is not None and base_raw_v is not None:
                 v_fp32 = v_cpu.to(torch.float32)
-                delta_v = v_fp32 - base_rec.raw_v.to(torch.float32)
+                delta_v = v_fp32 - base_raw_v.to(torch.float32)
                 eta_v_t = torch.linalg.norm(delta_v) / torch.linalg.norm(v_fp32).clamp(
                     min=1e-8
                 )
@@ -1481,6 +2405,8 @@ class DeltaBlockStore:
                     is_mla=is_mla,
                     ref_base_hash=base_rec.full_block_hash,
                     delta_pos=delta_pos,
+                    ref_base_hash_2=ref_hash_2,
+                    stitch_offset=stitch_offset,
                 )
                 return self._commit_record(layer_name, record, raw_bytes)
 
@@ -1538,6 +2464,8 @@ class DeltaBlockStore:
                             is_mla=is_mla,
                             ref_base_hash=base_rec.full_block_hash,
                             delta_pos=delta_pos,
+                            ref_base_hash_2=ref_hash_2,
+                            stitch_offset=stitch_offset,
                             quant_delta_k=q_dk,
                             quant_delta_v=q_dv,
                             sparse_token_indices=outlier_idx.to(torch.int16),
@@ -1572,6 +2500,8 @@ class DeltaBlockStore:
                     is_mla=is_mla,
                     ref_base_hash=base_rec.full_block_hash,
                     delta_pos=delta_pos,
+                    ref_base_hash_2=ref_hash_2,
+                    stitch_offset=stitch_offset,
                     quant_delta_k=q_dk,
                     quant_delta_v=q_dv,
                 )
@@ -1594,12 +2524,15 @@ class DeltaBlockStore:
                     is_mla=is_mla,
                     ref_base_hash=base_rec.full_block_hash,
                     delta_pos=delta_pos,
+                    ref_base_hash_2=ref_hash_2,
+                    stitch_offset=stitch_offset,
                     quant_delta_k=q_dk,
                     quant_delta_v=q_dv,
                 )
                 return self._commit_record(layer_name, record, raw_bytes)
 
         # 2. Check for Regime R2: Intra-block partial token edit (<= M tokens changed)
+        # or (Approach 1) stitched cross-block match with <= M intra-block token edits:
         partial_base, diff_indices = (
             (None, [])
             if self.force_uncompressed
@@ -1612,9 +2545,38 @@ class DeltaBlockStore:
                 full_block_hash=full_block_hash,
             )
         )
+        partial_base_2: CompressedKVBlockRecord | None = None
+        partial_stitch_offset: int = 0
+        if (
+            partial_base is None
+            and not self.force_uncompressed
+            and not policy.is_mamba
+            and policy.max_sparse_exceptions > 0
+        ):
+            sb0, sb1, s_off, s_diffs = self._find_stitched_base_blocks(
+                layer_name,
+                token_tuple,
+                start_position=start_position,
+                exclude_hashes=exclude_base_hashes,
+                max_edits=policy.max_sparse_exceptions,
+                full_block_hash=full_block_hash,
+            )
+            if sb0 is not None and sb1 is not None and s_off > 0 and s_diffs:
+                partial_base = sb0
+                partial_base_2 = sb1
+                partial_stitch_offset = s_off
+                diff_indices = s_diffs
+
         if partial_base is not None and diff_indices:
             assert partial_base.raw_k is not None
-            delta_pos = start_position - partial_base.start_position
+            partial_ref_hash_2 = (
+                partial_base_2.full_block_hash
+                if partial_base_2 is not None
+                else None
+            )
+            delta_pos = start_position - (
+                partial_base.start_position + partial_stitch_offset
+            )
             if policy.is_mamba:
                 k_fp32 = k_cpu.to(torch.float32)
                 delta_k = k_fp32 - partial_base.raw_k.to(torch.float32)
@@ -1694,8 +2656,11 @@ class DeltaBlockStore:
                     )
                     return self._commit_record(layer_name, record, raw_bytes)
             else:
+                partial_raw_k, partial_raw_v = self._get_record_base_kv(
+                    partial_base, partial_base_2, partial_stitch_offset
+                )
                 k_ref_aligned = apply_relative_rope_rotation(
-                    partial_base.raw_k,
+                    partial_raw_k,
                     delta_pos=delta_pos,
                     rope_theta=policy.rope_theta,
                     rotary_dim=policy.rotary_dim,
@@ -1704,8 +2669,8 @@ class DeltaBlockStore:
                 )
                 delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
                 delta_v = (
-                    (v_cpu.to(torch.float32) - partial_base.raw_v.to(torch.float32))
-                    if (v_cpu is not None and partial_base.raw_v is not None)
+                    (v_cpu.to(torch.float32) - partial_raw_v.to(torch.float32))
+                    if (v_cpu is not None and partial_raw_v is not None)
                     else None
                 )
 
@@ -1791,6 +2756,8 @@ class DeltaBlockStore:
                         is_mla=is_mla,
                         ref_base_hash=partial_base.full_block_hash,
                         delta_pos=delta_pos,
+                        ref_base_hash_2=partial_ref_hash_2,
+                        stitch_offset=partial_stitch_offset,
                         quant_delta_k=q_dk,
                         quant_delta_v=q_dv,
                         sparse_token_indices=idx_tensor.to(torch.int16),
@@ -1812,22 +2779,12 @@ class DeltaBlockStore:
             raw_k=k_cpu.clone(),
             raw_v=v_cpu.clone() if v_cpu is not None else None,
         )
-        self._base_by_token_hash.setdefault((layer_name, token_hash), base_record)
-        self._base_by_token_hash_list.setdefault((layer_name, token_hash), []).append(
-            base_record
-        )
-        self._base_blocks_by_layer.setdefault(layer_name, []).append(base_record)
         max_exceptions = (
             self.max_sparse_exceptions
             if policy.is_mamba
             else policy.max_sparse_exceptions
         )
-        if max_exceptions > 0:
-            num_slices = max_exceptions + 1
-            for s_idx, sub_tuple in self._get_pigeonhole_slices(token_tuple, num_slices):
-                self._base_by_subchunk.setdefault(
-                    (layer_name, s_idx, sub_tuple), []
-                ).append(base_record)
+        self._index_base_block(layer_name, base_record, max_exceptions)
         return self._commit_record(layer_name, base_record, raw_bytes)
 
     def _commit_record(
@@ -1875,7 +2832,11 @@ class DeltaBlockStore:
             self._dependents_by_base.setdefault(record.ref_base_hash, set()).add(
                 bhash
             )
-        self._touch_lru(bhash, record.ref_base_hash)
+        if record.ref_base_hash_2:
+            self._dependents_by_base.setdefault(
+                record.ref_base_hash_2, set()
+            ).add(bhash)
+        self._touch_lru(bhash, record.ref_base_hash, record.ref_base_hash_2)
         self.stats.total_blocks_stored += 1
         self.stats.raw_bytes_equivalent += raw_bytes
         self.stats.compressed_bytes_stored += record.nbytes
@@ -1924,11 +2885,26 @@ class DeltaBlockStore:
         already_committed: list[bool] = [False] * n
         seen_in_batch: dict[str, int] = {}
 
-        # (item_idx, base_rec, delta_pos)
-        exact_group: list[tuple[int, CompressedKVBlockRecord, int]] = []
-        # (item_idx, partial_base, delta_pos, diff_indices)
+        # (item_idx, base_rec_1, base_rec_2, stitch_offset, delta_pos)
+        exact_group: list[
+            tuple[
+                int,
+                CompressedKVBlockRecord,
+                CompressedKVBlockRecord | None,
+                int,
+                int,
+            ]
+        ] = []
+        # (item_idx, partial_base_1, partial_base_2, stitch_offset, delta_pos, diff_indices)
         attn_partial_group: list[
-            tuple[int, CompressedKVBlockRecord, int, list[int]]
+            tuple[
+                int,
+                CompressedKVBlockRecord,
+                CompressedKVBlockRecord | None,
+                int,
+                int,
+                list[int],
+            ]
         ] = []
 
         for i, (blk_spec, k_blk, v_blk) in enumerate(items):
@@ -1956,7 +2932,9 @@ class DeltaBlockStore:
             )
             if existing_rec is not None:
                 self._touch_lru(
-                    blk_spec.full_block_hash, existing_rec.ref_base_hash
+                    blk_spec.full_block_hash,
+                    existing_rec.ref_base_hash,
+                    existing_rec.ref_base_hash_2,
                 )
                 records[i] = existing_rec
                 already_committed[i] = True
@@ -1982,8 +2960,25 @@ class DeltaBlockStore:
                 start_position=blk_spec.start_position,
                 prev_token_block_hash=blk_spec.prev_token_block_hash,
             )
+            base_rec_2: CompressedKVBlockRecord | None = None
+            stitch_offset: int = 0
+            if base_rec is None and not policy.is_mamba:
+                b0, b1, s_off, _ = self._find_stitched_base_blocks(
+                    layer_name,
+                    token_tuple,
+                    start_position=blk_spec.start_position,
+                    max_edits=0,
+                    full_block_hash=blk_spec.full_block_hash,
+                )
+                if b0 is not None and b1 is not None and s_off > 0:
+                    base_rec = b0
+                    base_rec_2 = b1
+                    stitch_offset = s_off
+
             if base_rec is not None:
-                delta_pos = blk_spec.start_position - base_rec.start_position
+                delta_pos = blk_spec.start_position - (
+                    base_rec.start_position + stitch_offset
+                )
                 if (policy.layer_idx == 0 and not policy.is_mamba) or (
                     policy.is_sliding_window
                     and blk_spec.divergence_distance is not None
@@ -2000,9 +2995,17 @@ class DeltaBlockStore:
                         is_mla=is_mla,
                         ref_base_hash=base_rec.full_block_hash,
                         delta_pos=delta_pos,
+                        ref_base_hash_2=(
+                            base_rec_2.full_block_hash
+                            if base_rec_2 is not None
+                            else None
+                        ),
+                        stitch_offset=stitch_offset,
                     )
                 else:
-                    exact_group.append((i, base_rec, delta_pos))
+                    exact_group.append(
+                        (i, base_rec, base_rec_2, stitch_offset, delta_pos)
+                    )
                 continue
 
             partial_base, diff_indices = self._find_partial_match_base_block(
@@ -2012,23 +3015,64 @@ class DeltaBlockStore:
                 prev_token_block_hash=blk_spec.prev_token_block_hash,
                 full_block_hash=blk_spec.full_block_hash,
             )
+            partial_base_2: CompressedKVBlockRecord | None = None
+            partial_stitch_offset: int = 0
+            if (
+                partial_base is None
+                and not policy.is_mamba
+                and policy.max_sparse_exceptions > 0
+            ):
+                sb0, sb1, s_off, s_diffs = self._find_stitched_base_blocks(
+                    layer_name,
+                    token_tuple,
+                    start_position=blk_spec.start_position,
+                    max_edits=policy.max_sparse_exceptions,
+                    full_block_hash=blk_spec.full_block_hash,
+                )
+                if sb0 is not None and sb1 is not None and s_off > 0 and s_diffs:
+                    partial_base = sb0
+                    partial_base_2 = sb1
+                    partial_stitch_offset = s_off
+                    diff_indices = s_diffs
+
             if partial_base is not None and diff_indices:
-                delta_pos = blk_spec.start_position - partial_base.start_position
+                delta_pos = blk_spec.start_position - (
+                    partial_base.start_position + partial_stitch_offset
+                )
                 if policy.is_mamba:
-                    exact_group.append((i, partial_base, delta_pos))
+                    exact_group.append(
+                        (
+                            i,
+                            partial_base,
+                            partial_base_2,
+                            partial_stitch_offset,
+                            delta_pos,
+                        )
+                    )
                 else:
                     attn_partial_group.append(
-                        (i, partial_base, delta_pos, diff_indices)
+                        (
+                            i,
+                            partial_base,
+                            partial_base_2,
+                            partial_stitch_offset,
+                            delta_pos,
+                            diff_indices,
+                        )
                     )
 
-        # Pass 2A: Batched GPU evaluation for exact token matches + Mamba partial matches
+        # Pass 2A: Batched GPU evaluation for exact (or 0-edit stitched) token matches + Mamba partial matches
         if exact_group:
             m = len(exact_group)
-            k_stack = torch.stack([k_cpus[idx] for idx, _, _ in exact_group], dim=0)
-            base_k_stack = torch.stack(
-                [b_rec.raw_k for _, b_rec, _ in exact_group], dim=0
+            k_stack = torch.stack(
+                [k_cpus[idx] for idx, _, _, _, _ in exact_group], dim=0
             )
-            dpos_list = [dpos for _, _, dpos in exact_group]
+            base_kv_pairs = [
+                self._get_record_base_kv(b1, b2, s_off)
+                for _, b1, b2, s_off, _ in exact_group
+            ]
+            base_k_stack = torch.stack([kv[0] for kv in base_kv_pairs], dim=0)
+            dpos_list = [dpos for _, _, _, _, dpos in exact_group]
             k_ref_aligned = apply_relative_rope_rotation_batch(
                 base_k_stack,
                 dpos_list,
@@ -2045,14 +3089,14 @@ class DeltaBlockStore:
 
             has_v = (
                 v_cpus[exact_group[0][0]] is not None
-                and exact_group[0][1].raw_v is not None
+                and base_kv_pairs[0][1] is not None
             )
             if has_v:
                 v_stack = torch.stack(
-                    [v_cpus[idx] for idx, _, _ in exact_group], dim=0
+                    [v_cpus[idx] for idx, _, _, _, _ in exact_group], dim=0
                 )
                 base_v_stack = torch.stack(
-                    [b_rec.raw_v for _, b_rec, _ in exact_group], dim=0
+                    [kv[1] for kv in base_kv_pairs], dim=0  # type: ignore[misc]
                 )
                 v_fp32 = v_stack.to(torch.float32)
                 delta_v = v_fp32 - base_v_stack.to(torch.float32)
@@ -2103,7 +3147,13 @@ class DeltaBlockStore:
             tier1_g_idxs: list[int] = []
             tier2_g_idxs: list[int] = []
 
-            for g_idx, (item_idx, base_rec, delta_pos) in enumerate(exact_group):
+            for g_idx, (
+                item_idx,
+                base_rec,
+                base_rec_2,
+                stitch_offset,
+                delta_pos,
+            ) in enumerate(exact_group):
                 row = metrics_rows[g_idx]
                 eta_k = float(row[0])
                 eta_v = float(row[1])
@@ -2111,6 +3161,11 @@ class DeltaBlockStore:
                 eta_max = max(eta_k, eta_v)
                 blk_spec = items[item_idx][0]
                 is_mla = v_cpus[item_idx] is None
+                ref_hash_2 = (
+                    base_rec_2.full_block_hash
+                    if base_rec_2 is not None
+                    else None
+                )
 
                 if (
                     policy.is_sliding_window and eta_max <= policy.tau_zero_bit
@@ -2128,6 +3183,8 @@ class DeltaBlockStore:
                         is_mla=is_mla,
                         ref_base_hash=base_rec.full_block_hash,
                         delta_pos=delta_pos,
+                        ref_base_hash_2=ref_hash_2,
+                        stitch_offset=stitch_offset,
                     )
                     continue
 
@@ -2189,6 +3246,8 @@ class DeltaBlockStore:
                             is_mla=is_mla,
                             ref_base_hash=base_rec.full_block_hash,
                             delta_pos=delta_pos,
+                            ref_base_hash_2=ref_hash_2,
+                            stitch_offset=stitch_offset,
                             quant_delta_k=q_dk,
                             quant_delta_v=q_dv,
                             sparse_token_indices=outlier_idx.to(torch.int16),
@@ -2220,7 +3279,13 @@ class DeltaBlockStore:
                     else [None] * len(tier1_g_idxs)
                 )
                 for sub_i, g_idx in enumerate(tier1_g_idxs):
-                    item_idx, base_rec, delta_pos = exact_group[g_idx]
+                    (
+                        item_idx,
+                        base_rec,
+                        base_rec_2,
+                        stitch_offset,
+                        delta_pos,
+                    ) = exact_group[g_idx]
                     blk_spec = items[item_idx][0]
                     records[item_idx] = CompressedKVBlockRecord(
                         tier=CompressionTier.TIER1_INT2_DELTA,
@@ -2232,6 +3297,12 @@ class DeltaBlockStore:
                         is_mla=v_cpus[item_idx] is None,
                         ref_base_hash=base_rec.full_block_hash,
                         delta_pos=delta_pos,
+                        ref_base_hash_2=(
+                            base_rec_2.full_block_hash
+                            if base_rec_2 is not None
+                            else None
+                        ),
+                        stitch_offset=stitch_offset,
                         quant_delta_k=q_dk_list[sub_i],
                         quant_delta_v=q_dv_list[sub_i],
                     )
@@ -2248,7 +3319,13 @@ class DeltaBlockStore:
                     else [None] * len(tier2_g_idxs)
                 )
                 for sub_i, g_idx in enumerate(tier2_g_idxs):
-                    item_idx, base_rec, delta_pos = exact_group[g_idx]
+                    (
+                        item_idx,
+                        base_rec,
+                        base_rec_2,
+                        stitch_offset,
+                        delta_pos,
+                    ) = exact_group[g_idx]
                     blk_spec = items[item_idx][0]
                     records[item_idx] = CompressedKVBlockRecord(
                         tier=CompressionTier.TIER2_INT4_DELTA,
@@ -2260,20 +3337,31 @@ class DeltaBlockStore:
                         is_mla=v_cpus[item_idx] is None,
                         ref_base_hash=base_rec.full_block_hash,
                         delta_pos=delta_pos,
+                        ref_base_hash_2=(
+                            base_rec_2.full_block_hash
+                            if base_rec_2 is not None
+                            else None
+                        ),
+                        stitch_offset=stitch_offset,
                         quant_delta_k=q_dk_list2[sub_i],
                         quant_delta_v=q_dv_list2[sub_i],
                     )
 
-        # Pass 2B: Batched GPU evaluation for full-attention partial matches
+        # Pass 2B: Batched GPU evaluation for full-attention partial (and stitched partial) matches
         if attn_partial_group:
             p = len(attn_partial_group)
             k_stack = torch.stack(
-                [k_cpus[idx] for idx, _, _, _ in attn_partial_group], dim=0
+                [k_cpus[idx] for idx, _, _, _, _, _ in attn_partial_group],
+                dim=0,
             )
+            partial_kv_pairs = [
+                self._get_record_base_kv(b1, b2, s_off)
+                for _, b1, b2, s_off, _, _ in attn_partial_group
+            ]
             base_k_stack = torch.stack(
-                [b_rec.raw_k for _, b_rec, _, _ in attn_partial_group], dim=0
+                [kv[0] for kv in partial_kv_pairs], dim=0
             )
-            dpos_list = [dpos for _, _, dpos, _ in attn_partial_group]
+            dpos_list = [dpos for _, _, _, _, dpos, _ in attn_partial_group]
             k_ref_aligned = apply_relative_rope_rotation_batch(
                 base_k_stack,
                 dpos_list,
@@ -2286,14 +3374,15 @@ class DeltaBlockStore:
             delta_k = k_fp32 - k_ref_aligned.to(torch.float32)
             has_v = (
                 v_cpus[attn_partial_group[0][0]] is not None
-                and attn_partial_group[0][1].raw_v is not None
+                and partial_kv_pairs[0][1] is not None
             )
             if has_v:
                 v_stack = torch.stack(
-                    [v_cpus[idx] for idx, _, _, _ in attn_partial_group], dim=0
+                    [v_cpus[idx] for idx, _, _, _, _, _ in attn_partial_group],
+                    dim=0,
                 )
                 base_v_stack = torch.stack(
-                    [b_rec.raw_v for _, b_rec, _, _ in attn_partial_group], dim=0
+                    [kv[1] for kv in partial_kv_pairs], dim=0  # type: ignore[misc]
                 )
                 v_fp32 = v_stack.to(torch.float32)
                 delta_v = v_fp32 - base_v_stack.to(torch.float32)
@@ -2304,7 +3393,7 @@ class DeltaBlockStore:
 
             b_tok = delta_k.shape[1]
             all_sparse_per_p: list[list[int]] = [
-                list(d_idx) for _, _, _, d_idx in attn_partial_group
+                list(d_idx) for _, _, _, _, _, d_idx in attn_partial_group
             ]
             max_rem_slots = max(
                 0,
@@ -2398,9 +3487,14 @@ class DeltaBlockStore:
                     q_dv_p = [None] * len(valid_p_idxs)
 
                 for sub_i, p_i in enumerate(valid_p_idxs):
-                    item_idx, partial_base, delta_pos, _ = attn_partial_group[
-                        p_i
-                    ]
+                    (
+                        item_idx,
+                        partial_base,
+                        partial_base_2,
+                        partial_stitch_offset,
+                        delta_pos,
+                        _,
+                    ) = attn_partial_group[p_i]
                     blk_spec = items[item_idx][0]
                     k_c = k_cpus[item_idx]
                     v_c = v_cpus[item_idx]
@@ -2423,6 +3517,12 @@ class DeltaBlockStore:
                         is_mla=v_c is None,
                         ref_base_hash=partial_base.full_block_hash,
                         delta_pos=delta_pos,
+                        ref_base_hash_2=(
+                            partial_base_2.full_block_hash
+                            if partial_base_2 is not None
+                            else None
+                        ),
+                        stitch_offset=partial_stitch_offset,
                         quant_delta_k=q_dk_p[sub_i],
                         quant_delta_v=q_dv_p[sub_i],
                         sparse_token_indices=idx_tensor.to(torch.int16),
@@ -2465,23 +3565,7 @@ class DeltaBlockStore:
                     raw_k=k_c.clone(),
                     raw_v=v_c.clone() if v_c is not None else None,
                 )
-                self._base_by_token_hash.setdefault(
-                    (layer_name, token_hash), rec
-                )
-                self._base_by_token_hash_list.setdefault(
-                    (layer_name, token_hash), []
-                ).append(rec)
-                self._base_blocks_by_layer.setdefault(layer_name, []).append(
-                    rec
-                )
-                if max_exceptions > 0:
-                    num_slices = max_exceptions + 1
-                    for s_idx, sub_tuple in self._get_pigeonhole_slices(
-                        token_tuple, num_slices
-                    ):
-                        self._base_by_subchunk.setdefault(
-                            (layer_name, s_idx, sub_tuple), []
-                        ).append(rec)
+                self._index_base_block(layer_name, rec, max_exceptions)
             out_records.append(
                 self._commit_record(layer_name, rec, raw_bytes_list[i])
             )
@@ -2515,6 +3599,13 @@ class DeltaBlockStore:
 
             if rec.ref_base_hash and rec.ref_base_hash in self._dependents_by_base:
                 self._dependents_by_base[rec.ref_base_hash].discard(full_block_hash)
+            if (
+                rec.ref_base_hash_2
+                and rec.ref_base_hash_2 in self._dependents_by_base
+            ):
+                self._dependents_by_base[rec.ref_base_hash_2].discard(
+                    full_block_hash
+                )
 
             if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
                 t_key = (layer_name, rec.token_block_hash)
@@ -2538,6 +3629,48 @@ class DeltaBlockStore:
                     self._base_blocks_by_layer[layer_name] = [
                         r for r in l_list if r.full_block_hash != full_block_hash
                     ]
+
+                b_len = len(rec.token_ids)
+                if b_len >= 2:
+                    w = self._get_boundary_wgram_size(b_len)
+                    pos_key = (layer_name, rec.start_position)
+                    pos_list = self._base_by_layer_pos.get(pos_key)
+                    if pos_list:
+                        new_pos = [
+                            r
+                            for r in pos_list
+                            if r.full_block_hash != full_block_hash
+                        ]
+                        if new_pos:
+                            self._base_by_layer_pos[pos_key] = new_pos
+                        else:
+                            self._base_by_layer_pos.pop(pos_key, None)
+
+                    suf_key = (layer_name, rec.token_ids[-w:])
+                    suf_list = self._base_by_suffix_wgram.get(suf_key)
+                    if suf_list:
+                        new_suf = [
+                            r
+                            for r in suf_list
+                            if r.full_block_hash != full_block_hash
+                        ]
+                        if new_suf:
+                            self._base_by_suffix_wgram[suf_key] = new_suf
+                        else:
+                            self._base_by_suffix_wgram.pop(suf_key, None)
+
+                    pre_key = (layer_name, rec.token_ids[:w])
+                    pre_list = self._base_by_prefix_wgram.get(pre_key)
+                    if pre_list:
+                        new_pre = [
+                            r
+                            for r in pre_list
+                            if r.full_block_hash != full_block_hash
+                        ]
+                        if new_pre:
+                            self._base_by_prefix_wgram[pre_key] = new_pre
+                        else:
+                            self._base_by_prefix_wgram.pop(pre_key, None)
 
                 policy = self.get_layer_policy(layer_name)
                 max_exceptions = (
@@ -2706,36 +3839,60 @@ class DeltaBlockStore:
         Supports:
           1. Direct lookup by (layer_name, full_block_hash).
           2. Zero-bit cross-prefix synthesis for Layer 0 (or LOCAL_SLIDING layers)
-             when only a token_block_hash match exists in _base_by_token_hash.
+             when only a token_block_hash match or stitched consecutive-base match exists.
         """
         policy = self.get_layer_policy(layer_name)
         rec = self._records.get((layer_name, full_block_hash))
         if rec is not None:
-            self._touch_lru(full_block_hash, rec.ref_base_hash)
+            self._touch_lru(
+                full_block_hash, rec.ref_base_hash, rec.ref_base_hash_2
+            )
 
         # If exact full_block_hash wasn't stored, check if we can synthesize from
-        # a token_block_hash match (e.g. Layer 0 or LOCAL_SLIDING zero-bit hit).
+        # a token_block_hash match or stitched base pair (e.g. Layer 0 or LOCAL_SLIDING zero-bit hit).
         if rec is None and token_ids is not None:
-            token_hash = compute_token_block_hash(token_ids)
+            token_tuple = tuple(int(t) for t in token_ids)
+            token_hash = compute_token_block_hash(token_tuple)
             base_rec = self._find_exact_base_block(
                 layer_name, token_hash, start_position=target_start_position
             )
+            base_rec_2: CompressedKVBlockRecord | None = None
+            stitch_offset: int = 0
+            if base_rec is None and not policy.is_mamba:
+                b0, b1, s_off, _ = self._find_stitched_base_blocks(
+                    layer_name,
+                    token_tuple,
+                    start_position=target_start_position,
+                    max_edits=0,
+                )
+                if b0 is not None and b1 is not None and s_off > 0:
+                    base_rec = b0
+                    base_rec_2 = b1
+                    stitch_offset = s_off
+
             if base_rec is not None:
-                assert base_rec.raw_k is not None
+                raw_k_ref, raw_v_ref = self._get_record_base_kv(
+                    base_rec, base_rec_2, stitch_offset
+                )
                 delta_pos = (
-                    (target_start_position - base_rec.start_position)
+                    (
+                        target_start_position
+                        - (base_rec.start_position + stitch_offset)
+                    )
                     if target_start_position is not None
                     else 0
                 )
                 k_recon = apply_relative_rope_rotation(
-                    base_rec.raw_k,
+                    raw_k_ref,
                     delta_pos=delta_pos,
                     rope_theta=policy.rope_theta,
                     rotary_dim=policy.rotary_dim,
                     is_neox_style=policy.is_neox_style,
                     rope_scaling=policy.rope_scaling,
                 )
-                v_recon = base_rec.raw_v.clone() if base_rec.raw_v is not None else None
+                v_recon = (
+                    raw_v_ref.clone() if raw_v_ref is not None else None
+                )
                 self.stats.total_blocks_loaded += 1
                 return k_recon, v_recon
 
@@ -2753,21 +3910,29 @@ class DeltaBlockStore:
                 rec.raw_v.clone() if rec.raw_v is not None else None,
             )
 
-        # Single-hop base lookup
+        # Single-hop base lookup (or stitched pair lookup for Approach 1)
         assert rec.ref_base_hash is not None
         base_rec = self._records[(layer_name, rec.ref_base_hash)]
         assert base_rec.tier == CompressionTier.UNCOMPRESSED_BASE
         assert base_rec.raw_k is not None
+        base_rec_2 = (
+            self._records[(layer_name, rec.ref_base_hash_2)]
+            if rec.ref_base_hash_2
+            else None
+        )
+        raw_k_ref, raw_v_ref = self._get_record_base_kv(
+            base_rec, base_rec_2, rec.stitch_offset
+        )
 
         k_aligned = apply_relative_rope_rotation(
-            base_rec.raw_k,
+            raw_k_ref,
             delta_pos=rec.delta_pos,
             rope_theta=policy.rope_theta,
             rotary_dim=policy.rotary_dim,
             is_neox_style=policy.is_neox_style,
             rope_scaling=policy.rope_scaling,
         )
-        v_base = base_rec.raw_v.clone() if base_rec.raw_v is not None else None
+        v_base = raw_v_ref.clone() if raw_v_ref is not None else None
 
         if rec.tier == CompressionTier.TIER0_ZERO_BIT:
             return k_aligned, v_base
@@ -2844,35 +4009,76 @@ class DeltaBlockStore:
         ] * n
 
         # Group indices by tier for batched RoPE rotation + dequantization
-        tier0_items: list[tuple[int, CompressedKVBlockRecord, int]] = []
+        tier0_items: list[
+            tuple[int, torch.Tensor, torch.Tensor | None, int]
+        ] = []
         tier1_items: list[
-            tuple[int, CompressedKVBlockRecord, CompressedKVBlockRecord]
+            tuple[
+                int,
+                CompressedKVBlockRecord,
+                torch.Tensor,
+                torch.Tensor | None,
+            ]
         ] = []
         tier2_items: list[
-            tuple[int, CompressedKVBlockRecord, CompressedKVBlockRecord]
+            tuple[
+                int,
+                CompressedKVBlockRecord,
+                torch.Tensor,
+                torch.Tensor | None,
+            ]
         ] = []
         tier3_items: list[
-            tuple[int, CompressedKVBlockRecord, CompressedKVBlockRecord]
+            tuple[
+                int,
+                CompressedKVBlockRecord,
+                torch.Tensor,
+                torch.Tensor | None,
+            ]
         ] = []
 
         for i, blk_spec in enumerate(specs):
             rec = self._records.get((layer_name, blk_spec.full_block_hash))
             if rec is not None:
-                self._touch_lru(blk_spec.full_block_hash, rec.ref_base_hash)
+                self._touch_lru(
+                    blk_spec.full_block_hash,
+                    rec.ref_base_hash,
+                    rec.ref_base_hash_2,
+                )
             else:
-                token_hash = compute_token_block_hash(blk_spec.token_ids)
+                token_tuple = tuple(int(t) for t in blk_spec.token_ids)
+                token_hash = compute_token_block_hash(token_tuple)
                 base_rec = self._find_exact_base_block(
                     layer_name,
                     token_hash,
                     start_position=blk_spec.start_position,
                 )
+                base_rec_2: CompressedKVBlockRecord | None = None
+                stitch_offset: int = 0
+                if base_rec is None and not policy.is_mamba:
+                    b0, b1, s_off, _ = self._find_stitched_base_blocks(
+                        layer_name,
+                        token_tuple,
+                        start_position=blk_spec.start_position,
+                        max_edits=0,
+                    )
+                    if b0 is not None and b1 is not None and s_off > 0:
+                        base_rec = b0
+                        base_rec_2 = b1
+                        stitch_offset = s_off
+
                 if base_rec is not None and base_rec.raw_k is not None:
                     self.stats.total_blocks_loaded += 1
+                    rk, rv = self._get_record_base_kv(
+                        base_rec, base_rec_2, stitch_offset
+                    )
                     tier0_items.append(
                         (
                             i,
-                            base_rec,
-                            blk_spec.start_position - base_rec.start_position,
+                            rk,
+                            rv,
+                            blk_spec.start_position
+                            - (base_rec.start_position + stitch_offset),
                         )
                     )
                 continue
@@ -2890,21 +4096,33 @@ class DeltaBlockStore:
             base_rec = self._records.get((layer_name, rec.ref_base_hash))
             if base_rec is None or base_rec.raw_k is None:
                 continue
+            base_rec_2 = (
+                self._records.get((layer_name, rec.ref_base_hash_2))
+                if rec.ref_base_hash_2
+                else None
+            )
+            if rec.ref_base_hash_2 and (
+                base_rec_2 is None or base_rec_2.raw_k is None
+            ):
+                continue
+            rk, rv = self._get_record_base_kv(
+                base_rec, base_rec_2, rec.stitch_offset
+            )
 
             if rec.tier == CompressionTier.TIER0_ZERO_BIT:
-                tier0_items.append((i, base_rec, rec.delta_pos))
+                tier0_items.append((i, rk, rv, rec.delta_pos))
             elif rec.tier == CompressionTier.TIER1_INT2_DELTA:
-                tier1_items.append((i, rec, base_rec))
+                tier1_items.append((i, rec, rk, rv))
             elif rec.tier == CompressionTier.TIER2_INT4_DELTA:
-                tier2_items.append((i, rec, base_rec))
+                tier2_items.append((i, rec, rk, rv))
             elif rec.tier == CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA:
-                tier3_items.append((i, rec, base_rec))
+                tier3_items.append((i, rec, rk, rv))
 
         if tier0_items:
             base_k_s = torch.stack(
-                [b.raw_k for _, b, _ in tier0_items], dim=0
+                [rk for _, rk, _, _ in tier0_items], dim=0
             )
-            dpos_s = [d for _, _, d in tier0_items]
+            dpos_s = [d for _, _, _, d in tier0_items]
             k_aligned_s = apply_relative_rope_rotation_batch(
                 base_k_s,
                 dpos_s,
@@ -2913,19 +4131,19 @@ class DeltaBlockStore:
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
             )
-            for sub_i, (item_idx, b_rec, _) in enumerate(tier0_items):
+            for sub_i, (item_idx, _, rv, _) in enumerate(tier0_items):
                 results[item_idx] = (
                     k_aligned_s[sub_i],
-                    b_rec.raw_v.clone() if b_rec.raw_v is not None else None,
+                    rv.clone() if rv is not None else None,
                 )
 
         for dense_group in (tier1_items, tier2_items):
             if not dense_group:
                 continue
             base_k_s = torch.stack(
-                [b.raw_k for _, _, b in dense_group], dim=0
+                [rk for _, _, rk, _ in dense_group], dim=0
             )
-            dpos_s = [r.delta_pos for _, r, _ in dense_group]
+            dpos_s = [r.delta_pos for _, r, _, _ in dense_group]
             k_aligned_s = apply_relative_rope_rotation_batch(
                 base_k_s,
                 dpos_s,
@@ -2935,40 +4153,40 @@ class DeltaBlockStore:
                 rope_scaling=policy.rope_scaling,
             )
             dk_batch = dequantize_residual_packed_batch(
-                [r.quant_delta_k for _, r, _ in dense_group]  # type: ignore[misc]
+                [r.quant_delta_k for _, r, _, _ in dense_group]  # type: ignore[misc]
             )
             k_out_s = (
                 k_aligned_s.to(torch.float32) + dk_batch.to(torch.float32)
             ).to(k_aligned_s.dtype)
 
             has_v = (
-                dense_group[0][2].raw_v is not None
+                dense_group[0][3] is not None
                 and dense_group[0][1].quant_delta_v is not None
             )
             if has_v:
                 base_v_s = torch.stack(
-                    [b.raw_v for _, _, b in dense_group], dim=0  # type: ignore[misc]
+                    [rv for _, _, _, rv in dense_group], dim=0  # type: ignore[misc]
                 )
                 dv_batch = dequantize_residual_packed_batch(
-                    [r.quant_delta_v for _, r, _ in dense_group]  # type: ignore[misc]
+                    [r.quant_delta_v for _, r, _, _ in dense_group]  # type: ignore[misc]
                 )
                 v_out_s = (
                     base_v_s.to(torch.float32) + dv_batch.to(torch.float32)
                 ).to(base_v_s.dtype)
-                for sub_i, (item_idx, _, _) in enumerate(dense_group):
+                for sub_i, (item_idx, _, _, _) in enumerate(dense_group):
                     results[item_idx] = (k_out_s[sub_i], v_out_s[sub_i])
             else:
-                for sub_i, (item_idx, _, b_rec) in enumerate(dense_group):
+                for sub_i, (item_idx, _, _, rv) in enumerate(dense_group):
                     results[item_idx] = (
                         k_out_s[sub_i],
-                        b_rec.raw_v.clone() if b_rec.raw_v is not None else None,
+                        rv.clone() if rv is not None else None,
                     )
 
         if tier3_items:
             base_k_s = torch.stack(
-                [b.raw_k for _, _, b in tier3_items], dim=0
+                [rk for _, _, rk, _ in tier3_items], dim=0
             )
-            dpos_s = [r.delta_pos for _, r, _ in tier3_items]
+            dpos_s = [r.delta_pos for _, r, _, _ in tier3_items]
             k_aligned_s = apply_relative_rope_rotation_batch(
                 base_k_s,
                 dpos_s,
@@ -2979,10 +4197,10 @@ class DeltaBlockStore:
             )
             has_q_dk = tier3_items[0][1].quant_delta_k is not None
             if has_q_dk and all(
-                r.quant_delta_k is not None for _, r, _ in tier3_items
+                r.quant_delta_k is not None for _, r, _, _ in tier3_items
             ):
                 dk_batch3 = dequantize_residual_packed_batch(
-                    [r.quant_delta_k for _, r, _ in tier3_items]  # type: ignore[misc]
+                    [r.quant_delta_k for _, r, _, _ in tier3_items]  # type: ignore[misc]
                 )
                 k_out_s = (
                     k_aligned_s.to(torch.float32) + dk_batch3.to(torch.float32)
@@ -2990,16 +4208,16 @@ class DeltaBlockStore:
             else:
                 k_out_s = k_aligned_s.clone()
 
-            has_v = tier3_items[0][2].raw_v is not None
+            has_v = tier3_items[0][3] is not None
             if has_v:
                 base_v_s = torch.stack(
-                    [b.raw_v for _, _, b in tier3_items], dim=0  # type: ignore[misc]
+                    [rv for _, _, _, rv in tier3_items], dim=0  # type: ignore[misc]
                 )
                 if has_q_dk and all(
-                    r.quant_delta_v is not None for _, r, _ in tier3_items
+                    r.quant_delta_v is not None for _, r, _, _ in tier3_items
                 ):
                     dv_batch3 = dequantize_residual_packed_batch(
-                        [r.quant_delta_v for _, r, _ in tier3_items]  # type: ignore[misc]
+                        [r.quant_delta_v for _, r, _, _ in tier3_items]  # type: ignore[misc]
                     )
                     v_out_s: torch.Tensor | None = (
                         base_v_s.to(torch.float32)
@@ -3010,7 +4228,7 @@ class DeltaBlockStore:
             else:
                 v_out_s = None
 
-            for sub_i, (item_idx, rec, _) in enumerate(tier3_items):
+            for sub_i, (item_idx, rec, _, _) in enumerate(tier3_items):
                 k_item = k_out_s[sub_i]
                 v_item = v_out_s[sub_i] if v_out_s is not None else None
                 if (
@@ -3097,6 +4315,21 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         max_sparse_exceptions = int(extra_config.get("max_sparse_exceptions", 4))
         store_device = str(extra_config.get("store_device", "cpu"))
         force_uncompressed = bool(extra_config.get("force_uncompressed", False))
+        # Approach 2: Configurable server-side block alignment padding options
+        pad_token = str(extra_config.get("pad_token", DEFAULT_PAD_TOKEN))
+        raw_pad_token_id = extra_config.get("pad_token_id", None)
+        pad_token_id = (
+            int(raw_pad_token_id) if raw_pad_token_id is not None else None
+        )
+        raw_pad_token_map = extra_config.get("pad_token_map", None)
+        pad_token_map = (
+            dict(raw_pad_token_map)
+            if isinstance(raw_pad_token_map, dict)
+            else None
+        )
+        enable_server_block_align = bool(
+            extra_config.get("enable_server_block_align", False)
+        )
 
         if engine_id not in self._shared_stores:
             self._shared_stores[engine_id] = DeltaBlockStore(
@@ -3109,7 +4342,23 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 max_sparse_exceptions=max_sparse_exceptions,
                 device=store_device,
                 force_uncompressed=force_uncompressed,
+                pad_token=pad_token,
+                pad_token_id=pad_token_id,
+                pad_token_map=pad_token_map,
+                enable_server_block_align=enable_server_block_align,
             )
+        else:
+            existing_store = self._shared_stores[engine_id]
+            if "pad_token" in extra_config:
+                existing_store.pad_token = pad_token
+            if "pad_token_id" in extra_config:
+                existing_store.pad_token_id = pad_token_id
+            if "pad_token_map" in extra_config:
+                existing_store.pad_token_map = pad_token_map
+            if "enable_server_block_align" in extra_config:
+                existing_store.enable_server_block_align = (
+                    enable_server_block_align
+                )
         self.store: DeltaBlockStore = self._shared_stores[engine_id]
         self._requests_need_load: dict[str, tuple["Request", int, int]] = {}
         self._req_local_computed_tokens: dict[str, int] = {}
@@ -3436,6 +4685,80 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 policy.max_sparse_exceptions = 0
 
     # ==============================
+    # Server-Side Structural Alignment & Padding Helpers (Approach 2)
+    # ==============================
+
+    def resolve_pad_token_id(
+        self,
+        tokenizer: Any,
+        content_text: str | None = None,
+        pad_token: str | None = None,
+        pad_token_id: int | None = None,
+    ) -> int:
+        """Resolve padding token ID on the connector using its configured default or map."""
+        return self.store.resolve_pad_token_id(
+            tokenizer=tokenizer,
+            content_text=content_text,
+            pad_token=pad_token,
+            pad_token_id=pad_token_id,
+        )
+
+    def align_tokens(
+        self,
+        token_ids: list[int],
+        pad_token_id: int | None = None,
+        tokenizer: Any = None,
+        content_text: str | None = None,
+        target_blocks: int | None = None,
+    ) -> list[int]:
+        """Pad or truncate `token_ids` to an exact multiple of `self._block_size`."""
+        return self.store.align_tokens(
+            token_ids=token_ids,
+            pad_token_id=pad_token_id,
+            tokenizer=tokenizer,
+            content_text=content_text,
+            target_blocks=target_blocks,
+        )
+
+    def encode_aligned_segment(
+        self,
+        tokenizer: Any,
+        text: str,
+        bucket_file_viewer: bool = True,
+        target_blocks: int | None = None,
+        pad_token: str | None = None,
+        pad_token_id: int | None = None,
+        line_step: int = 10,
+    ) -> list[int]:
+        """Encode and block-align a structural prompt segment on the server side (Approach 2)."""
+        return self.store.encode_aligned_segment(
+            tokenizer=tokenizer,
+            text=text,
+            bucket_file_viewer=bucket_file_viewer,
+            target_blocks=target_blocks,
+            pad_token=pad_token,
+            pad_token_id=pad_token_id,
+            line_step=line_step,
+        )
+
+    def align_structural_prompt(
+        self,
+        tokenizer: Any,
+        segments: list[tuple[str, bool]] | list[str],
+        bucket_file_viewer: bool = True,
+        pad_token: str | None = None,
+        pad_token_id: int | None = None,
+    ) -> list[int]:
+        """Tokenize and block-align a sequence of structural prompt segments (Approach 2)."""
+        return self.store.align_structural_prompt(
+            tokenizer=tokenizer,
+            segments=segments,
+            bucket_file_viewer=bucket_file_viewer,
+            pad_token=pad_token,
+            pad_token_id=pad_token_id,
+        )
+
+    # ==============================
     # Scheduler-side methods
     # ==============================
 
@@ -3473,8 +4796,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if self.store.has_full_block(full_hash):
                 # Prefix has not diverged yet
                 divergence_distance = None
-            elif self.store.has_token_block(token_hash):
-                # Divergent prefix, but token block matches a reference block!
+            elif self.store.has_token_block(
+                token_hash
+            ) or self.store.has_stitched_token_block(blk_tokens):
+                # Divergent prefix, but token block matches an exact or stitched reference block!
                 if divergence_distance is None:
                     divergence_distance = 0
                 else:
