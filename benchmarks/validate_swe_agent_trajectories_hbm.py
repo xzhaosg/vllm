@@ -57,11 +57,17 @@ def load_nebius_passing_trajectories(
             f"/tmp/nebius_swe_agent_passing_n{num_trajectories}"
             f"_min{min_turns}_max{max_turns}.json"
         )
-    if os.path.exists(cache_path):
-        with open(cache_path, encoding="utf-8") as f:
-            cached = json.load(f)
-        if len(cached) >= num_trajectories:
-            return cached[:num_trajectories]
+    fallback_paths = [
+        cache_path,
+        f"/tmp/nebius_swe_agent_passing_n157_min{min_turns}_max{max_turns}.json",
+        f"/workspace/nebius_swe_agent_passing_n157_min{min_turns}_max{max_turns}.json",
+    ]
+    for cand_path in fallback_paths:
+        if cand_path and os.path.exists(cand_path):
+            with open(cand_path, encoding="utf-8") as f:
+                cached = json.load(f)
+            if len(cached) >= num_trajectories:
+                return cached[:num_trajectories]
 
     found: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
@@ -227,7 +233,7 @@ def build_trajectory_samples(
     for tok in raw_edit_toks:
         if tok != newline_id and tok not in edit_toks:
             edit_toks.append(tok)
-    edit_blk = 1 if block_size >= 128 else 2
+    edit_blk = 1 if block_size >= 64 else 2
 
     is_harmony = (
         hasattr(tokenizer, "get_vocab") and "<|channel|>" in tokenizer.get_vocab()
@@ -236,6 +242,16 @@ def build_trajectory_samples(
         hasattr(tokenizer, "get_vocab")
         and "<think>" in tokenizer.get_vocab()
         and "<|im_start|>" in tokenizer.get_vocab()
+    )
+    is_deepseek_v41 = (
+        hasattr(tokenizer, "get_vocab")
+        and "<｜Assistant｜>" in tokenizer.get_vocab()
+        and "</think>" in tokenizer.get_vocab()
+    )
+    is_glm = (
+        hasattr(tokenizer, "get_vocab")
+        and "<|assistant|>" in tokenizer.get_vocab()
+        and "<|user|>" in tokenizer.get_vocab()
     )
 
     samples: list[dict[str, Any]] = []
@@ -251,8 +267,8 @@ def build_trajectory_samples(
         sid_p = 300000000 + sample_idx
 
         # Shared GitHub Issue & Reference Patch Context block(s)
-        issue_blocks = 1 if block_size >= 128 else 8
-        obs_blocks = 2 if block_size >= 128 else 32
+        issue_blocks = 1 if block_size >= 64 else 8
+        obs_blocks = 2 if block_size >= 64 else 32
         issue_section_text = (
             f"ID: {sid_h} | Active SWE-Agent Issue & Patch Context: {sid_b}\n\n"
             f"### GitHub Issue ({inst})\n"
@@ -284,6 +300,10 @@ def build_trajectory_samples(
                 f"{prompt_question}"
                 "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
             )
+        elif is_deepseek_v41:
+            suffix_text = f"<｜User｜>{prompt_question}<｜Assistant｜></think>"
+        elif is_glm:
+            suffix_text = f"<|user|>{prompt_question}<|assistant|><think></think>"
         else:
             suffix_text = f"{prompt_question}\nResponse:"
 
@@ -293,9 +313,27 @@ def build_trajectory_samples(
         if len(suffix_ids) % block_size == 0:
             suffix_ids = [newline_id] + suffix_ids
 
+        # Static System Prompt & Workspace Header (Block 0..edit_blk) for real-world regime
+        static_header_text = (
+            f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | Open File: {fpath}\n"
+            f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
+        )
+        if block_size >= 64:
+            static_header_text += (
+                f"System & Workspace Context ({fpath}):\n"
+                f"{sys_txt[:800]}\n{issue_txt[:1200]}\n\n"
+            )
+        h_static = _align_to_block(
+            tokenizer.encode(static_header_text, add_special_tokens=False),
+            block_size,
+            newline_id,
+            target_blocks=edit_blk,
+        )
+
         # Build ALL turns directly from each turn's real `step_idx`, `prev_ai_resp`, and `user_obs`
         stateful_turns: list[list[int]] = []
         rolling_turns: list[list[int]] = []
+        real_world_turns: list[list[int]] = []
         gt_ai_resps: list[str] = []
 
         for t_idx, turn_data in enumerate(item["turns"]):
@@ -310,7 +348,7 @@ def build_trajectory_samples(
                 f"Step: {cur_step_idx} | Open File: {fpath}\n"
                 f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
             )
-            if block_size >= 128:
+            if block_size >= 64:
                 header_text += (
                     f"System & Workspace Context ({fpath}):\n"
                     f"{sys_txt[:800]}\n{issue_txt[:1200]}\n\n"
@@ -337,14 +375,16 @@ def build_trajectory_samples(
 
             if t_idx == 0:
                 rolling_turns.append(list(turn_prompt))
+                real_world_turns.append(
+                    h_static + issue_ids_base + obs_turn_ids + suffix_ids
+                )
             else:
-                # T2_rolling_action_history_dpB:
-                # Prepend 1-block Rolling Trajectory Log built from real `cur_step_idx` and `cur_prev_ai`
+                # Rolling Trajectory Log built from real `cur_step_idx` and `cur_prev_ai`
                 prepend_text = (
                     f"ID: {sid_p} | Rolling Trajectory Log: {inst} | Active File: {fpath}\n"
                     f"Step: {cur_step_idx} | Previous Command: {cur_prev_ai[:220]}\n\n"
                 )
-                if block_size >= 128:
+                if block_size >= 64:
                     prepend_text += (
                         f"Trajectory History ({inst}):\n{turn0_obs[:1600]}\n\n"
                     )
@@ -355,6 +395,13 @@ def build_trajectory_samples(
                     target_blocks=1,
                 )
                 rolling_turns.append(p_turn + h_turn + b_turn + suffix_ids)
+                # R_real_world_swe_agent:
+                # System Prompt + GitHub Issue stay at Blocks 0..1;
+                # Rolling Action Log (`p_turn`) is inserted at Block 2 (between Issue and Open File Window);
+                # Open File Window (`obs_turn_ids`) shifts to Blocks 3..4 (+B tokens).
+                real_world_turns.append(
+                    h_static + issue_ids_base + p_turn + obs_turn_ids + suffix_ids
+                )
 
         samples.append(
             {
@@ -370,6 +417,7 @@ def build_trajectory_samples(
                 "regimes": {
                     "T1_stateful_aci_window_dp0": stateful_turns,
                     "T2_rolling_action_history_dpB": rolling_turns,
+                    "R_real_world_swe_agent": real_world_turns,
                 },
             }
         )
@@ -518,33 +566,151 @@ def _get_blockpool_byte_metrics(llm: LLM, tp_size: int) -> dict[str, Any]:
     block_pool = kv_cache_manager.block_pool
     kv_cache_config = kv_cache_manager.kv_cache_config
     num_blocks = int(kv_cache_config.num_blocks)
-    per_worker_slot_bytes = (
+    shares_backing_buffer = any(
+        getattr(t, "offset", 0) > 0 for t in kv_cache_config.kv_cache_tensors
+    )
+    total_all_tensors_per_worker = (
+        (
+            max(int(t.size) for t in kv_cache_config.kv_cache_tensors)
+            if shares_backing_buffer
+            else sum(int(t.size) for t in kv_cache_config.kv_cache_tensors)
+        )
+        // num_blocks
+        if kv_cache_config.kv_cache_tensors and num_blocks > 0
+        else 0
+    )
+    single_tensor_per_worker = (
         int(kv_cache_config.kv_cache_tensors[0].size) // num_blocks
         if kv_cache_config.kv_cache_tensors and num_blocks > 0
         else 0
     )
-    block_slot_bytes_total_tp = per_worker_slot_bytes * tp_size
+    layer_to_tensor_page: dict[str, int] = {}
+    for t in kv_cache_config.kv_cache_tensors:
+        t_layers = (
+            getattr(t, "layers", None) or getattr(t, "shared_by", None) or []
+        )
+        b_stride = getattr(t, "block_stride", None)
+        l_stride = getattr(t, "layer_stride", None)
+        if b_stride is not None and l_stride is not None:
+            per_layer_page = min(int(b_stride), int(l_stride))
+        elif num_blocks > 0 and t_layers:
+            per_layer_page = int(t.size) // (num_blocks * len(t_layers))
+        elif num_blocks > 0:
+            per_layer_page = int(t.size) // num_blocks
+        else:
+            per_layer_page = 0
+        for ln in t_layers:
+            layer_to_tensor_page[ln] = per_layer_page
+
     group_unpadded_bytes_total_tp: dict[int, int] = {}
+    group_padded_bytes_total_tp: dict[int, int] = {}
+    cacheable_group_ids: list[int] = []
+    non_cacheable_group_ids: list[int] = []
+
     for g_id, group in enumerate(kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
-        unpadded_page = getattr(spec, "real_page_size_bytes", None) or getattr(
-            spec, "unpadded_page_size_bytes", None
+        is_mamba = spec is not None and (
+            spec.__class__.__name__ == "MambaSpec"
+            or getattr(spec, "mamba_type", None) is not None
         )
-        if (
-            unpadded_page is not None
-            and getattr(spec, "page_size_padded", None) is not None
-            and unpadded_page < spec.page_size_bytes
-        ):
-            unpadded_per_worker = len(group.layer_names) * int(unpadded_page)
+        is_cacheable = is_mamba or getattr(spec, "prefix_cacheable", True) is not False
+        if is_cacheable:
+            cacheable_group_ids.append(g_id)
         else:
-            unpadded_per_worker = per_worker_slot_bytes
+            non_cacheable_group_ids.append(g_id)
+
+        inner_specs = getattr(spec, "kv_cache_specs", None)
+        if isinstance(inner_specs, dict) and inner_specs:
+            unpadded_per_worker = sum(
+                int(
+                    getattr(s, "real_page_size_bytes", None)
+                    or getattr(s, "page_size_bytes", 0)
+                )
+                for s in inner_specs.values()
+            )
+        else:
+            unpadded_page = (
+                getattr(spec, "real_page_size_bytes", None)
+                or getattr(spec, "unpadded_page_size_bytes", None)
+                or getattr(spec, "page_size_bytes", None)
+            )
+            num_indexer = sum(
+                1 for ln in group.layer_names if "indexer" in ln
+            )
+            if (
+                0 < num_indexer < len(group.layer_names)
+                and unpadded_page is not None
+            ):
+                if layer_to_tensor_page and all(
+                    ln in layer_to_tensor_page for ln in group.layer_names
+                ):
+                    unpadded_per_worker = sum(
+                        min(layer_to_tensor_page[ln], int(unpadded_page))
+                        if "indexer" in ln
+                        else layer_to_tensor_page[ln]
+                        for ln in group.layer_names
+                    )
+                else:
+                    num_main = len(group.layer_names) - num_indexer
+                    main_page = max(
+                        int(getattr(spec, "page_size_bytes", 0)),
+                        576 * int(getattr(spec, "block_size", 64)),
+                    )
+                    indexer_page = int(unpadded_page)
+                    unpadded_per_worker = (
+                        num_main * main_page + num_indexer * indexer_page
+                    )
+            elif (
+                unpadded_page is not None
+                and getattr(spec, "page_size_padded", None) is not None
+                and unpadded_page < spec.page_size_bytes
+            ):
+                unpadded_per_worker = len(group.layer_names) * int(unpadded_page)
+            elif layer_to_tensor_page and all(
+                ln in layer_to_tensor_page for ln in group.layer_names
+            ):
+                unpadded_per_worker = sum(
+                    layer_to_tensor_page[ln] for ln in group.layer_names
+                )
+            elif len(kv_cache_config.kv_cache_tensors) > 1 and getattr(
+                spec, "page_size_bytes", None
+            ) is not None:
+                unpadded_per_worker = len(group.layer_names) * int(
+                    spec.page_size_bytes
+                )
+            else:
+                unpadded_per_worker = single_tensor_per_worker
         group_unpadded_bytes_total_tp[g_id] = unpadded_per_worker * tp_size
+
+        if layer_to_tensor_page and all(
+            ln in layer_to_tensor_page for ln in group.layer_names
+        ):
+            padded_per_worker = sum(
+                layer_to_tensor_page[ln] for ln in group.layer_names
+            )
+        elif len(kv_cache_config.kv_cache_tensors) > 1:
+            padded_per_worker = len(group.layer_names) * single_tensor_per_worker
+        else:
+            padded_per_worker = single_tensor_per_worker
+        group_padded_bytes_total_tp[g_id] = padded_per_worker * tp_size
+
+    if len(kv_cache_config.kv_cache_tensors) > 1 and cacheable_group_ids:
+        block_slot_bytes_total_tp = sum(
+            group_unpadded_bytes_total_tp[g_id] for g_id in cacheable_group_ids
+        )
+    else:
+        block_slot_bytes_total_tp = single_tensor_per_worker * tp_size
+
     return {
         "kv_cache_manager": kv_cache_manager,
         "block_pool": block_pool,
         "num_gpu_blocks": num_blocks,
         "block_slot_bytes_total_tp": block_slot_bytes_total_tp,
+        "all_tensors_slot_bytes_total_tp": total_all_tensors_per_worker * tp_size,
         "group_unpadded_bytes_total_tp": group_unpadded_bytes_total_tp,
+        "group_padded_bytes_total_tp": group_padded_bytes_total_tp,
+        "cacheable_group_ids": cacheable_group_ids,
+        "non_cacheable_group_ids": non_cacheable_group_ids,
     }
 
 
@@ -1025,26 +1191,37 @@ def main() -> None:
     )
     print(f"Loaded {len(trajectories)} verified-passing multi-turn trajectories.")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    is_dsv41 = "deepseek" in args.model.lower() and "v4" in args.model.lower()
+    is_glm_dsa = "glm-5" in args.model.lower() or "deepseek-v3.2" in args.model.lower()
+    default_bs = 128 if is_dsv41 else (64 if is_glm_dsa else 16)
+    extra_llm_kwargs: dict[str, Any] = {}
+    if is_dsv41:
+        extra_llm_kwargs["tokenizer_mode"] = "deepseek_v41"
+    if is_dsv41 or is_glm_dsa:
+        extra_llm_kwargs["kernel_config"] = {
+            "enable_flashinfer_autotune": False,
+            "enable_cutedsl_warmup": False,
+        }
 
     if args.mode == "blockpool":
         llm = LLM(
             model=args.model,
             tensor_parallel_size=args.tensor_parallel_size,
-            block_size=16,
+            block_size=default_bs,
             enable_prefix_caching=True,
             async_scheduling=False,
-            gpu_memory_utilization=max(args.gpu_memory_utilization, 0.88),
+            gpu_memory_utilization=max(args.gpu_memory_utilization, 0.85 if is_dsv41 else 0.88),
             max_model_len=args.max_model_len,
             max_num_batched_tokens=16384,
             enforce_eager=True,
+            **extra_llm_kwargs,
         )
         store = None
     else:
         llm = LLM(
             model=args.model,
             tensor_parallel_size=args.tensor_parallel_size,
-            block_size=16,
+            block_size=default_bs,
             enable_prefix_caching=True,
             async_scheduling=False,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -1060,8 +1237,11 @@ def main() -> None:
                     "pad_token": args.pad_token,
                 },
             ),
+            **extra_llm_kwargs,
         )
         store = get_shared_store()
+
+    tokenizer = llm.get_tokenizer()
 
     resolved_block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
 

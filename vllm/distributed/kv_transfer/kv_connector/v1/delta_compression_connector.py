@@ -205,7 +205,7 @@ def encode_file_viewer_bucketed_server(
             target_blocks=max_file_blocks,
         )
 
-    if block_size >= 128:
+    if block_size >= 64:
         obs_lines = text.splitlines(keepends=True)
         buckets_50: dict[int, list[tuple[int, str]]] = {}
         line_re_50 = re.compile(r"^(\d+):")
@@ -316,12 +316,41 @@ def encode_file_viewer_bucketed_server(
         b_key = (line_no - 1) // line_step
         buckets.setdefault(b_key, []).append(line_str)
 
+    eff_blocks_per_bucket = (
+        max(1, (blocks_per_bucket * 16) // block_size)
+        if block_size > 16 and blocks_per_bucket == 6
+        else blocks_per_bucket
+    )
+
     for b_key in sorted(buckets.keys()):
         if (
             max_file_blocks is not None
-            and (len(out_ids) // block_size) + blocks_per_bucket > max_file_blocks
+            and (len(out_ids) // block_size) + eff_blocks_per_bucket > max_file_blocks
         ):
             break
+        if block_size == 64 and eff_blocks_per_bucket == 1 and line_step == 10:
+            sub_buckets_64: dict[int, list[str]] = {}
+            for ln_str in buckets[b_key]:
+                m64 = re.match(r"^(\d+):", ln_str)
+                lno64 = int(m64.group(1)) if m64 else 1
+                sub_id64 = ((lno64 - 1) % 10) // 2
+                sub_buckets_64.setdefault(sub_id64, []).append(ln_str)
+            blk_ids_64: list[int] = []
+            for s_id in range(5):
+                stxt = "".join(sub_buckets_64.get(s_id, []))
+                sids = (
+                    _encode_text_without_special_tokens(tokenizer, stxt)
+                    if stxt
+                    else []
+                )
+                t_slot = 13 if s_id < 4 else 12
+                if len(sids) < t_slot:
+                    sids = sids + [resolved_pad_id] * (t_slot - len(sids))
+                else:
+                    sids = sids[:t_slot]
+                blk_ids_64.extend(sids)
+            out_ids.extend(blk_ids_64)
+            continue
         b_str = "".join(buckets[b_key])
         b_pad_id = resolve_pad_token_id(
             tokenizer,
@@ -335,7 +364,7 @@ def encode_file_viewer_bucketed_server(
                 _encode_text_without_special_tokens(tokenizer, b_str),
                 block_size,
                 b_pad_id,
-                target_blocks=blocks_per_bucket,
+                target_blocks=eff_blocks_per_bucket,
             )
         )
 
@@ -343,8 +372,9 @@ def encode_file_viewer_bucketed_server(
         max_file_blocks is None
         or len(out_ids) < max_file_blocks * block_size
     ):
+        max_ftr_blocks = 1 if block_size >= 64 else 2
         rem_blocks = (
-            min(2, max_file_blocks - (len(out_ids) // block_size))
+            min(max_ftr_blocks, max_file_blocks - (len(out_ids) // block_size))
             if max_file_blocks is not None
             else None
         )
@@ -428,6 +458,7 @@ def align_structural_prompt_server(
 
 _ROPE_COS_SIN_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 _INT2_SPARSE_CODEBOOK_CACHE: dict[torch.device, torch.Tensor] = {}
+_E2M1_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_int2_sparse_codebook(device: torch.device) -> torch.Tensor:
@@ -438,6 +469,202 @@ def _get_int2_sparse_codebook(device: torch.device) -> torch.Tensor:
         )
         _INT2_SPARSE_CODEBOOK_CACHE[device] = cb
     return cb
+
+
+def _get_e2m1_lut(device: torch.device) -> torch.Tensor:
+    lut = _E2M1_LUT_CACHE.get(device)
+    if lut is None:
+        lut = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        _E2M1_LUT_CACHE[device] = lut
+    return lut
+
+
+def _is_dsv41_nvfp4_mla(t: torch.Tensor | None) -> bool:
+    return (
+        isinstance(t, torch.Tensor)
+        and t.dtype == torch.uint8
+        and t.ndim >= 2
+        and t.shape[-1] == 288
+    )
+
+
+def _is_dsv41_fp8_indexer(t: torch.Tensor | None) -> bool:
+    return (
+        isinstance(t, torch.Tensor)
+        and t.dtype == torch.uint8
+        and t.ndim >= 2
+        and t.shape[-1] == 132
+    )
+
+
+def _is_fp8_e4m3_mla(t: torch.Tensor | None) -> bool:
+    return (
+        isinstance(t, torch.Tensor)
+        and t.ndim >= 2
+        and (
+            t.dtype == torch.float8_e4m3fn
+            or (t.dtype == torch.uint8 and t.shape[-1] in (576, 512))
+        )
+    )
+
+
+def _is_dsv41_quant_kv(t: torch.Tensor | None) -> bool:
+    return (
+        _is_dsv41_nvfp4_mla(t)
+        or _is_dsv41_fp8_indexer(t)
+        or _is_fp8_e4m3_mla(t)
+    )
+
+
+def _dequant_dsv41_kv(raw: torch.Tensor) -> torch.Tensor:
+    """Dequantize DeepSeek-V4.1 `nvfp4_ds_mla` (`[..., N, 288] uint8`),
+    `indexer.k_cache` (`[..., N, 132] uint8`), or `fp8_e4m3` MLA (`[..., N, 576] uint8`)
+    into `bfloat16`. Returns `raw` unchanged for standard floating-point KV tensors.
+    """
+    if _is_fp8_e4m3_mla(raw):
+        fp8_view = (
+            raw
+            if raw.dtype == torch.float8_e4m3fn
+            else raw.view(torch.float8_e4m3fn)
+        )
+        return fp8_view.to(torch.bfloat16)
+    if _is_dsv41_nvfp4_mla(raw):
+        prefix_shape = raw.shape[:-1]
+        q_bytes = raw[..., :256]
+        s_bytes = raw[..., 256:288]
+        s_fp32 = s_bytes.view(torch.float8_e4m3fn).to(torch.float32)
+        low = (q_bytes & 0x0F).to(torch.long)
+        high = ((q_bytes >> 4) & 0x0F).to(torch.long)
+        nibbles = torch.stack([low, high], dim=-1).reshape(*prefix_shape, 32, 16)
+        lut = _get_e2m1_lut(raw.device)
+        vals = (lut[nibbles] * s_fp32.unsqueeze(-1)).reshape(
+            *prefix_shape, 1, 512
+        )
+        return vals.to(torch.bfloat16)
+    if _is_dsv41_fp8_indexer(raw):
+        prefix_shape = raw.shape[:-2]
+        n_states = raw.shape[-2]
+        flat = raw.reshape(*prefix_shape, n_states * 132)
+        q_fp8 = (
+            flat[..., : n_states * 128]
+            .view(torch.float8_e4m3fn)
+            .reshape(*prefix_shape, n_states, 128)
+            .to(torch.float32)
+        )
+        s_raw = flat[..., n_states * 128 :].reshape(*prefix_shape, n_states, 4)
+        # On SM100 (mqa_logits_use_mx_scales=True), scale is 4 equal packed UE8M0 bytes;
+        # otherwise IEEE-754 float32 (whose low 2 mantissa bytes are 0 for power-of-two scales).
+        use_ue8m0 = (
+            raw.is_cuda and torch.cuda.get_device_capability(raw.device)[0] >= 10
+        ) or bool(
+            torch.any(s_raw[..., 0] != 0)
+            and torch.all(s_raw[..., 0] == s_raw[..., 1])
+        )
+        if use_ue8m0:
+            s_fp32 = torch.exp2(s_raw[..., :1].to(torch.float32) - 127.0)
+        else:
+            s_fp32 = (
+                s_raw.reshape(-1)
+                .view(torch.float32)
+                .reshape(*prefix_shape, n_states, 1)
+            )
+        return (q_fp8 * s_fp32).unsqueeze(-2).to(torch.bfloat16)
+    return raw
+
+
+def _requant_dsv41_kv(
+    vals_bf16: torch.Tensor, template_raw: torch.Tensor | None
+) -> torch.Tensor:
+    """Re-quantize `bfloat16` back into `nvfp4_ds_mla` (`[..., N, 288] uint8`),
+    `indexer.k_cache` (`[..., N, 132] uint8`), or `fp8_e4m3` MLA (`[..., N, 576] uint8`)
+    matching `template_raw`.
+    """
+    if template_raw is None or not _is_dsv41_quant_kv(template_raw):
+        return vals_bf16
+    if _is_fp8_e4m3_mla(template_raw):
+        q_fp8 = vals_bf16.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        return (
+            q_fp8
+            if template_raw.dtype == torch.float8_e4m3fn
+            else q_fp8.view(torch.uint8)
+        )
+    if _is_dsv41_nvfp4_mla(template_raw):
+        prefix_shape = vals_bf16.shape[:-2]
+        x = vals_bf16.to(torch.float32).reshape(*prefix_shape, 32, 16)
+        amax = x.abs().amax(dim=-1, keepdim=True)
+        scale_fp8 = (amax / 6.0).clamp(0.001953125, 448.0).to(torch.float8_e4m3fn)
+        scale_div = scale_fp8.to(torch.float32)
+        scale_div = torch.where(
+            scale_div > 0.0, scale_div, torch.ones_like(scale_div)
+        )
+        norm = x / scale_div
+        abs_n = norm.abs()
+        sign_bit = torch.where(
+            norm < 0.0,
+            torch.full_like(abs_n, 8, dtype=torch.uint8),
+            torch.zeros_like(abs_n, dtype=torch.uint8),
+        )
+        mag = torch.zeros_like(abs_n, dtype=torch.uint8)
+        mag = torch.where(abs_n >= 0.25, torch.full_like(mag, 1), mag)
+        mag = torch.where(abs_n >= 0.75, torch.full_like(mag, 2), mag)
+        mag = torch.where(abs_n >= 1.25, torch.full_like(mag, 3), mag)
+        mag = torch.where(abs_n >= 1.75, torch.full_like(mag, 4), mag)
+        mag = torch.where(abs_n >= 2.50, torch.full_like(mag, 5), mag)
+        mag = torch.where(abs_n >= 3.50, torch.full_like(mag, 6), mag)
+        mag = torch.where(abs_n >= 5.00, torch.full_like(mag, 7), mag)
+        q = (mag | sign_bit).reshape(*prefix_shape, 256, 2)
+        packed_bytes = q[..., 0] | (q[..., 1] << 4)
+        scale_bytes = scale_fp8.view(torch.uint8).reshape(*prefix_shape, 32)
+        return torch.cat([packed_bytes, scale_bytes], dim=-1)
+    if _is_dsv41_fp8_indexer(template_raw):
+        prefix_shape = vals_bf16.shape[:-3]
+        n_states = vals_bf16.shape[-3]
+        x = vals_bf16.to(torch.float32).reshape(*prefix_shape, n_states, 128)
+        amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+        exponent = torch.ceil(torch.log2(amax / 448.0))
+        scale = torch.exp2(exponent)
+        q_fp8 = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        q_bytes = q_fp8.view(torch.uint8).reshape(*prefix_shape, n_states * 128)
+        use_ue8m0 = (
+            vals_bf16.is_cuda
+            and torch.cuda.get_device_capability(vals_bf16.device)[0] >= 10
+        )
+        if use_ue8m0:
+            u = (exponent + 127.0).clamp(0.0, 254.0).to(torch.uint8)
+            s_bytes = u.expand(*prefix_shape, n_states, 4).reshape(
+                *prefix_shape, n_states * 4
+            )
+        else:
+            s_bytes = (
+                scale.to(torch.float32)
+                .view(torch.uint8)
+                .reshape(*prefix_shape, n_states * 4)
+            )
+        return torch.cat([q_bytes, s_bytes], dim=-1).reshape(
+            *prefix_shape, n_states, 132
+        )
+    return vals_bf16
 
 
 def _get_cached_rope_cos_sin(
@@ -560,6 +787,8 @@ def apply_relative_rope_rotation(
     rotary_dim: int | None = None,
     is_neox_style: bool = True,
     rope_scaling: dict[str, Any] | None = None,
+    rope_at_tail: bool = False,
+    rope_pos_scale: float = 1.0,
 ) -> torch.Tensor:
     """Apply exact relative RoPE phase rotation R(delta_pos) to post-RoPE keys.
 
@@ -577,10 +806,18 @@ def apply_relative_rope_rotation(
         is_neox_style: True for half-split NeoX RoPE (Gemma, Llama, Qwen); False for
             interleaved RoPE (DeepSeek, GLM).
         rope_scaling: Optional RoPE scaling dictionary (e.g. YaRN or linear scaling).
+        rope_at_tail: True when RoPE is applied to the last `rotary_dim` dimensions
+            (e.g. DeepSeek MLA `NoPE | RoPE`).
+        rope_pos_scale: Position scaling factor (e.g. 0.5 for 2x token-compressed MLA).
 
     Returns:
         Rotated key tensor of the same shape and dtype as k_tensor.
     """
+    if rope_pos_scale != 1.0:
+        if isinstance(delta_pos, int):
+            delta_pos = int(round(delta_pos * rope_pos_scale))
+        else:
+            delta_pos = delta_pos.to(torch.float32) * float(rope_pos_scale)
     if isinstance(delta_pos, int) and delta_pos == 0:
         return k_tensor.clone()
     if isinstance(delta_pos, torch.Tensor) and torch.all(delta_pos == 0):
@@ -605,8 +842,12 @@ def apply_relative_rope_rotation(
         return k_tensor.clone()
 
     k_fp32 = k_tensor.to(torch.float32)
-    k_rot = k_fp32[..., :r_dim]
-    k_pass = k_fp32[..., r_dim:]
+    if rope_at_tail and r_dim < head_dim:
+        k_pass = k_fp32[..., : head_dim - r_dim]
+        k_rot = k_fp32[..., head_dim - r_dim :]
+    else:
+        k_rot = k_fp32[..., :r_dim]
+        k_pass = k_fp32[..., r_dim:]
     half_dim = r_dim // 2
 
     if isinstance(delta_pos, int):
@@ -701,7 +942,10 @@ def apply_relative_rope_rotation(
         k_rot_out = torch.stack([out1, out2], dim=-1).flatten(-2)
 
     if r_dim < head_dim:
-        k_out = torch.cat([k_rot_out, k_pass], dim=-1)
+        if rope_at_tail:
+            k_out = torch.cat([k_pass, k_rot_out], dim=-1)
+        else:
+            k_out = torch.cat([k_rot_out, k_pass], dim=-1)
     else:
         k_out = k_rot_out
     return k_out.to(orig_dtype)
@@ -714,8 +958,12 @@ def apply_relative_rope_rotation_batch(
     rotary_dim: int | None = None,
     is_neox_style: bool = True,
     rope_scaling: dict[str, Any] | None = None,
+    rope_at_tail: bool = False,
+    rope_pos_scale: float = 1.0,
 ) -> torch.Tensor:
     """Apply relative RoPE rotation across a batch of N blocks `[N, *block_shape]`."""
+    if rope_pos_scale != 1.0:
+        delta_pos_list = [int(round(d * rope_pos_scale)) for d in delta_pos_list]
     n = len(delta_pos_list)
     if n == 0 or all(d == 0 for d in delta_pos_list):
         return k_batch.clone()
@@ -727,6 +975,8 @@ def apply_relative_rope_rotation_batch(
             rotary_dim=rotary_dim,
             is_neox_style=is_neox_style,
             rope_scaling=rope_scaling,
+            rope_at_tail=rope_at_tail,
+            rope_pos_scale=1.0,
         ).unsqueeze(0)
 
     orig_dtype = k_batch.dtype
@@ -744,8 +994,12 @@ def apply_relative_rope_rotation_batch(
         return k_batch.clone()
 
     k_fp32 = k_batch.to(torch.float32)
-    k_rot = k_fp32[..., :r_dim]
-    k_pass = k_fp32[..., r_dim:]
+    if rope_at_tail and r_dim < head_dim:
+        k_pass = k_fp32[..., : head_dim - r_dim]
+        k_rot = k_fp32[..., head_dim - r_dim :]
+    else:
+        k_rot = k_fp32[..., :r_dim]
+        k_pass = k_fp32[..., r_dim:]
     half_dim = r_dim // 2
     single_ndim = k_rot.ndim - 1
 
@@ -780,7 +1034,10 @@ def apply_relative_rope_rotation_batch(
         k_rot_out = torch.stack([out1, out2], dim=-1).flatten(-2)
 
     if r_dim < head_dim:
-        k_out = torch.cat([k_rot_out, k_pass], dim=-1)
+        if rope_at_tail:
+            k_out = torch.cat([k_pass, k_rot_out], dim=-1)
+        else:
+            k_out = torch.cat([k_rot_out, k_pass], dim=-1)
     else:
         k_out = k_rot_out
     return k_out.to(orig_dtype)
@@ -1174,6 +1431,9 @@ class DeltaCompressionStats:
     tier_counts: dict[CompressionTier, int] = field(
         default_factory=lambda: {tier: 0 for tier in CompressionTier}
     )
+    cumulative_tier_counts: dict[CompressionTier, int] = field(
+        default_factory=lambda: {tier: 0 for tier in CompressionTier}
+    )
 
     @property
     def compression_ratio(self) -> float:
@@ -1202,6 +1462,8 @@ class LayerCompressionPolicy:
     rotary_dim: int | None = None
     is_neox_style: bool = True
     rope_scaling: dict[str, Any] | None = None
+    rope_at_tail: bool = False
+    rope_pos_scale: float = 1.0
     # Distance from prefix divergence (in tokens) after which LOCAL_SLIDING layers
     # use Tier 0 (0-bit deduplication).
     sliding_window_dedup_threshold: int = 64
@@ -1721,29 +1983,6 @@ class DeltaBlockStore:
         if not layer_bases:
             return None, []
 
-        fast_cache_key = (
-            (
-                full_block_hash,
-                start_position,
-                prev_token_block_hash,
-                max_exceptions,
-                len(layer_bases),
-            )
-            if full_block_hash
-            else None
-        )
-        if fast_cache_key is not None and fast_cache_key in self._partial_match_cache:
-            cached_base_hash, cached_diff_idx = self._partial_match_cache[fast_cache_key]
-            if cached_base_hash is None:
-                return None, []
-            cached_rec = self._records.get((layer_name, cached_base_hash))
-            if (
-                cached_rec is not None
-                and cached_rec.tier == CompressionTier.UNCOMPRESSED_BASE
-                and (not exclude_hashes or cached_base_hash not in exclude_hashes)
-            ):
-                return cached_rec, cached_diff_idx
-
         num_slices = max_exceptions + 1
         slice_key = (full_block_hash, num_slices) if full_block_hash else None
         if slice_key is not None and slice_key in self._pigeonhole_slice_cache:
@@ -1757,19 +1996,10 @@ class DeltaBlockStore:
         candidates: list[CompressedKVBlockRecord] = []
         matched_buckets: list[list[CompressedKVBlockRecord]] = []
         for s_idx, sub_tuple in slices:
-            if len(sub_tuple) >= 16 and len(set(sub_tuple)) <= 1:
-                continue
             bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
             if bucket:
                 matched_buckets.append(bucket)
         if not matched_buckets:
-            for s_idx, sub_tuple in slices:
-                bucket = self._base_by_subchunk.get((layer_name, s_idx, sub_tuple))
-                if bucket:
-                    matched_buckets.append(bucket)
-        if not matched_buckets:
-            if fast_cache_key is not None:
-                self._partial_match_cache[fast_cache_key] = (None, [])
             return None, []
         matched_buckets.sort(key=len)
         for bucket in matched_buckets:
@@ -1785,7 +2015,6 @@ class DeltaBlockStore:
         cand_sig = tuple(c.full_block_hash for c in candidates)
         cache_key = (
             (
-                layer_name,
                 full_block_hash,
                 start_position,
                 prev_token_block_hash,
@@ -1853,8 +2082,6 @@ class DeltaBlockStore:
         )
         if cache_key is not None:
             self._partial_match_cache[cache_key] = res_pair
-        if fast_cache_key is not None:
-            self._partial_match_cache[fast_cache_key] = res_pair
         return best_base, best_diff_indices
 
     @staticmethod
@@ -1886,20 +2113,29 @@ class DeltaBlockStore:
         b_len = len(token_tuple)
         if b_len >= 2:
             w = self._get_boundary_wgram_size(b_len)
-            self._base_by_layer_pos.setdefault(
-                (layer_name, base_record.start_position), []
-            ).append(base_record)
-            suf_w = token_tuple[-w:]
-            if b_len < 16 or len(set(suf_w)) > 1:
-                self._base_by_suffix_wgram.setdefault(
-                    (layer_name, suf_w), []
+            is_subbucket_padded = False
+            if b_len >= 128:
+                slot_len = b_len // 5
+                for s_i in range(1, 5):
+                    sb_end = s_i * slot_len
+                    if sb_end >= w and len(set(token_tuple[sb_end - w : sb_end])) <= 1:
+                        is_subbucket_padded = True
+                        break
+            if not is_subbucket_padded:
+                self._base_by_layer_pos.setdefault(
+                    (layer_name, base_record.start_position), []
                 ).append(base_record)
-                self._layers_with_unaligned_bases.add(layer_name)
-            pre_w = token_tuple[:w]
-            if b_len < 16 or len(set(pre_w)) > 1:
-                self._base_by_prefix_wgram.setdefault(
-                    (layer_name, pre_w), []
-                ).append(base_record)
+                suf_w = token_tuple[-w:]
+                if b_len < 16 or len(set(suf_w)) > 1:
+                    self._base_by_suffix_wgram.setdefault(
+                        (layer_name, suf_w), []
+                    ).append(base_record)
+                    self._layers_with_unaligned_bases.add(layer_name)
+                pre_w = token_tuple[:w]
+                if b_len < 16 or len(set(pre_w)) > 1:
+                    self._base_by_prefix_wgram.setdefault(
+                        (layer_name, pre_w), []
+                    ).append(base_record)
 
     @staticmethod
     def _get_record_base_kv(
@@ -1913,6 +2149,14 @@ class DeltaBlockStore:
             return base_rec_1.raw_k, base_rec_1.raw_v
         assert base_rec_2.raw_k is not None
         s = stitch_offset
+        if (
+            len(base_rec_1.token_ids) > base_rec_1.raw_k.shape[0]
+            and base_rec_1.raw_k.shape[0] > 0
+        ):
+            s = max(
+                1,
+                (s * base_rec_1.raw_k.shape[0]) // len(base_rec_1.token_ids),
+            )
         k_stitched = torch.cat([base_rec_1.raw_k[s:], base_rec_2.raw_k[:s]], dim=0)
         if base_rec_1.raw_v is not None and base_rec_2.raw_v is not None:
             v_stitched: torch.Tensor | None = torch.cat(
@@ -1952,10 +2196,14 @@ class DeltaBlockStore:
 
         cache_key = (
             (
+                layer_name,
                 full_block_hash,
                 start_position,
                 max_edits,
                 len(layer_bases),
+                layer_bases[0].full_block_hash,
+                layer_bases[-1].full_block_hash,
+                self.stats.evicted_blocks,
             )
             if full_block_hash
             else None
@@ -1979,6 +2227,17 @@ class DeltaBlockStore:
                 return r1, r2, c_s, c_diffs
 
         w = self._get_boundary_wgram_size(b_len)
+        first_k = layer_bases[0].raw_k
+        state_step = (
+            max(1, b_len // int(first_k.shape[0]))
+            if (
+                first_k is not None
+                and first_k.ndim >= 1
+                and 0 < int(first_k.shape[0]) < b_len
+                and b_len % int(first_k.shape[0]) == 0
+            )
+            else 1
+        )
         seen_pairs: set[tuple[str, str, int]] = set()
         candidates: list[
             tuple[CompressedKVBlockRecord, CompressedKVBlockRecord, int]
@@ -1990,6 +2249,8 @@ class DeltaBlockStore:
             if len(candidates) >= 16:
                 break
             s = b_len - k
+            if state_step > 1 and s % state_step != 0:
+                continue
             if k >= w:
                 suf_wgram = token_ids[k - w : k]
                 if not (b_len >= 16 and len(set(suf_wgram)) <= 1):
@@ -2065,6 +2326,8 @@ class DeltaBlockStore:
                                     continue
                                 if len(b0.token_ids) != b_len:
                                     continue
+                                if b_len >= 16 and len(set(b0.token_ids[-w:])) <= 1:
+                                    continue
                                 if (
                                     b1.prev_token_block_hash
                                     and b0.token_block_hash
@@ -2088,6 +2351,8 @@ class DeltaBlockStore:
                     continue
                 if len(b0.token_ids) != b_len:
                     continue
+                if b_len >= 16 and len(set(b0.token_ids[-w:])) <= 1:
+                    continue
                 b1_list = self._base_by_layer_pos.get(
                     (layer_name, b0.start_position + b_len)
                 )
@@ -2105,6 +2370,8 @@ class DeltaBlockStore:
                     ):
                         continue
                     for s in range(1, b_len):
+                        if state_step > 1 and s % state_step != 0:
+                            continue
                         pkey = (b0.full_block_hash, b1.full_block_hash, s)
                         if pkey not in seen_pairs:
                             seen_pairs.add(pkey)
@@ -2126,6 +2393,10 @@ class DeltaBlockStore:
                     continue
                 diff_idx: list[int] = []
             else:
+                if not any(ta == tb for ta, tb in zip(token_ids[:k], b0.token_ids[s:])):
+                    continue
+                if not any(ta == tb for ta, tb in zip(token_ids[k:], b1.token_ids[:s])):
+                    continue
                 stitched_toks = b0.token_ids[s:] + b1.token_ids[:s]
                 bounded_diffs = self._diff_indices_bounded(
                     token_ids, stitched_toks, max_edits
@@ -2168,6 +2439,13 @@ class DeltaBlockStore:
 
     def has_stitched_token_block(self, token_ids: tuple[int, ...]) -> bool:
         """Return True if `token_ids` matches a stitched pair of consecutive base blocks."""
+        for layer_name in self._known_layers:
+            policy = self.get_layer_policy(layer_name)
+            if not policy.is_mamba and policy.rope_pos_scale >= 1.0:
+                b0, b1, s, _ = self._find_stitched_base_blocks(
+                    layer_name, token_ids, max_edits=0
+                )
+                return b0 is not None and b1 is not None and s > 0
         for layer_name in self._known_layers:
             policy = self.get_layer_policy(layer_name)
             if not policy.is_mamba:
@@ -2322,15 +2600,25 @@ class DeltaBlockStore:
             base_raw_k, base_raw_v = self._get_record_base_kv(
                 base_rec, base_rec_2, stitch_offset
             )
+            is_dsv41_q = _is_dsv41_quant_kv(k_cpu)
+            is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_cpu)
+            is_fp8_mla = _is_fp8_e4m3_mla(k_cpu)
+            delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
+            k_work = _dequant_dsv41_kv(k_cpu) if is_dsv41_q else k_cpu
+            base_k_work = (
+                _dequant_dsv41_kv(base_raw_k) if is_dsv41_q else base_raw_k
+            )
             k_ref_aligned = apply_relative_rope_rotation(
-                base_raw_k,
+                base_k_work,
                 delta_pos=delta_pos,
                 rope_theta=policy.rope_theta,
                 rotary_dim=0 if policy.is_mamba else policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
+                rope_at_tail=policy.rope_at_tail,
+                rope_pos_scale=policy.rope_pos_scale,
             )
-            k_fp32 = k_cpu.to(torch.float32)
+            k_fp32 = k_work.to(torch.float32)
             delta_k = k_fp32 - k_ref_aligned.to(torch.float32)
             eta_k_t = torch.linalg.norm(delta_k) / torch.linalg.norm(k_fp32).clamp(
                 min=1e-8
@@ -2391,9 +2679,14 @@ class DeltaBlockStore:
 
             # Select Tier based on residual magnitude:
             if (
-                policy.is_sliding_window and eta_max <= policy.tau_zero_bit
+                (
+                    policy.is_sliding_window
+                    or (is_dsv41_q and not is_fp8_mla)
+                )
+                and eta_max <= policy.tau_zero_bit
             ) or (
-                policy.is_mamba and eta_max <= min(policy.tau_zero_bit, 0.01)
+                (policy.is_mamba or is_fp8_mla)
+                and eta_max <= min(policy.tau_zero_bit, 0.01)
             ):
                 record = CompressedKVBlockRecord(
                     tier=CompressionTier.TIER0_ZERO_BIT,
@@ -2445,7 +2738,7 @@ class DeltaBlockStore:
                             v_cpu[outlier_idx].clone() if v_cpu is not None else None
                         )
                         q_dk = quantize_residual_packed(
-                            delta_k_rem.to(k_cpu.dtype), bits=4
+                            delta_k_rem.to(k_work.dtype), bits=delta_bits_4
                         )
                         q_dv = (
                             quantize_residual_packed(
@@ -2474,14 +2767,20 @@ class DeltaBlockStore:
                         )
                         return self._commit_record(layer_name, record, raw_bytes)
 
-            eff_tau_int2 = min(policy.tau_int2, 0.08)
+            eff_tau_int2 = (
+                policy.tau_int2 if is_fp8_mla else min(policy.tau_int2, 0.08)
+            )
             tier1_eligible = (
                 (eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4)
                 if policy.is_mamba
-                else (eta_max <= eff_tau_int2)
+                else (
+                    eta_max <= policy.tau_int4
+                    if is_dsv41_nvfp4
+                    else eta_max <= eff_tau_int2
+                )
             )
             if tier1_eligible:
-                q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=2)
+                q_dk = quantize_residual_packed(delta_k.to(k_work.dtype), bits=2)
                 # For Mamba/GDN, conv_state (v_cpu) is only ~6.5% of the block bytes
                 # and holds the 3-token boundary window, so use 4-bit quantization on it.
                 v_bits = 4 if policy.is_mamba else 2
@@ -2508,7 +2807,9 @@ class DeltaBlockStore:
                 return self._commit_record(layer_name, record, raw_bytes)
 
             if eta_max <= policy.tau_int4:
-                q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
+                q_dk = quantize_residual_packed(
+                    delta_k.to(k_work.dtype), bits=delta_bits_4
+                )
                 q_dv = (
                     quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
                     if (delta_v is not None and v_cpu is not None)
@@ -2659,15 +2960,27 @@ class DeltaBlockStore:
                 partial_raw_k, partial_raw_v = self._get_record_base_kv(
                     partial_base, partial_base_2, partial_stitch_offset
                 )
+                is_dsv41_q = _is_dsv41_quant_kv(k_cpu)
+                is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_cpu)
+                delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
+                k_work = _dequant_dsv41_kv(k_cpu) if is_dsv41_q else k_cpu
+                partial_k_work = (
+                    _dequant_dsv41_kv(partial_raw_k)
+                    if is_dsv41_q
+                    else partial_raw_k
+                )
                 k_ref_aligned = apply_relative_rope_rotation(
-                    partial_raw_k,
+                    partial_k_work,
                     delta_pos=delta_pos,
                     rope_theta=policy.rope_theta,
                     rotary_dim=policy.rotary_dim,
                     is_neox_style=policy.is_neox_style,
                     rope_scaling=policy.rope_scaling,
+                    rope_at_tail=policy.rope_at_tail,
+                    rope_pos_scale=policy.rope_pos_scale,
                 )
-                delta_k = k_cpu.to(torch.float32) - k_ref_aligned.to(torch.float32)
+                k_work_fp32 = k_work.to(torch.float32)
+                delta_k = k_work_fp32 - k_ref_aligned.to(torch.float32)
                 delta_v = (
                     (v_cpu.to(torch.float32) - partial_raw_v.to(torch.float32))
                     if (v_cpu is not None and partial_raw_v is not None)
@@ -2677,13 +2990,18 @@ class DeltaBlockStore:
                 # If there are unused sparse exception slots and an adjacent token
                 # inside the edited block experienced a large MoE/attention shift,
                 # promote that token to BF16 as well.
-                all_sparse_indices = list(diff_indices)
+                b_tok = delta_k.shape[0]
+                if 0 < b_tok < len(token_tuple):
+                    all_sparse_indices = sorted(
+                        {(idx * b_tok) // len(token_tuple) for idx in diff_indices}
+                    )
+                else:
+                    all_sparse_indices = list(diff_indices)
                 rem_slots = policy.max_sparse_exceptions - len(all_sparse_indices)
-                if rem_slots > 0 and delta_k.ndim >= 2 and delta_k.shape[0] >= 4:
-                    b_tok = delta_k.shape[0]
+                if rem_slots > 0 and delta_k.ndim >= 2 and b_tok >= 4:
                     dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
                     k_tok = torch.linalg.norm(
-                        k_cpu.to(torch.float32).reshape(b_tok, -1), dim=-1
+                        k_work_fp32.reshape(b_tok, -1), dim=-1
                     ).clamp(min=1e-6)
                     tok_eta = dk_tok / k_tok
                     if delta_v is not None and v_cpu is not None:
@@ -2709,7 +3027,7 @@ class DeltaBlockStore:
                 # Zero out the sparse BF16 rows in the residual so their large outliers do not
                 # pollute the per-head INT4 quantization scale of the remaining rows!
                 delta_k[idx_tensor] = 0.0
-                k_rem = k_cpu.to(torch.float32).clone()
+                k_rem = k_work_fp32.clone()
                 k_rem[idx_tensor] = 0.0
                 eta_k_t = torch.linalg.norm(delta_k) / torch.linalg.norm(k_rem).clamp(
                     min=1e-8
@@ -2732,7 +3050,9 @@ class DeltaBlockStore:
                     sparse_k = k_cpu[idx_tensor].clone()
                     sparse_v = v_cpu[idx_tensor].clone() if v_cpu is not None else None
                     q_dk = (
-                        quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
+                        quantize_residual_packed(
+                            delta_k.to(k_work.dtype), bits=delta_bits_4
+                        )
                         if policy.layer_idx > 0
                         else None
                     )
@@ -2841,6 +3161,7 @@ class DeltaBlockStore:
         self.stats.raw_bytes_equivalent += raw_bytes
         self.stats.compressed_bytes_stored += record.nbytes
         self.stats.tier_counts[record.tier] += 1
+        self.stats.cumulative_tier_counts[record.tier] += 1
         return record
 
     def store_blocks_batch(
@@ -3064,14 +3385,30 @@ class DeltaBlockStore:
         # Pass 2A: Batched GPU evaluation for exact (or 0-edit stitched) token matches + Mamba partial matches
         if exact_group:
             m = len(exact_group)
-            k_stack = torch.stack(
+            k_stack_raw = torch.stack(
                 [k_cpus[idx] for idx, _, _, _, _ in exact_group], dim=0
             )
             base_kv_pairs = [
                 self._get_record_base_kv(b1, b2, s_off)
                 for _, b1, b2, s_off, _ in exact_group
             ]
-            base_k_stack = torch.stack([kv[0] for kv in base_kv_pairs], dim=0)
+            base_k_stack_raw = torch.stack(
+                [kv[0] for kv in base_kv_pairs], dim=0
+            )
+            is_dsv41_q = _is_dsv41_quant_kv(k_stack_raw)
+            is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_stack_raw)
+            is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw)
+            delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
+            k_stack = (
+                _dequant_dsv41_kv(k_stack_raw)
+                if is_dsv41_q
+                else k_stack_raw
+            )
+            base_k_stack = (
+                _dequant_dsv41_kv(base_k_stack_raw)
+                if is_dsv41_q
+                else base_k_stack_raw
+            )
             dpos_list = [dpos for _, _, _, _, dpos in exact_group]
             k_ref_aligned = apply_relative_rope_rotation_batch(
                 base_k_stack,
@@ -3080,6 +3417,8 @@ class DeltaBlockStore:
                 rotary_dim=0 if policy.is_mamba else policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
+                rope_at_tail=policy.rope_at_tail,
+                rope_pos_scale=policy.rope_pos_scale,
             )
             k_fp32 = k_stack.to(torch.float32)
             delta_k = k_fp32 - k_ref_aligned.to(torch.float32)
@@ -3143,7 +3482,9 @@ class DeltaBlockStore:
                 outlier_mask = None
                 metrics_rows = torch.stack([eta_k_t, eta_v_t], dim=-1).tolist()
 
-            eff_tau_int2 = min(policy.tau_int2, 0.08)
+            eff_tau_int2 = (
+                policy.tau_int2 if is_fp8_mla else min(policy.tau_int2, 0.08)
+            )
             tier1_g_idxs: list[int] = []
             tier2_g_idxs: list[int] = []
 
@@ -3168,9 +3509,13 @@ class DeltaBlockStore:
                 )
 
                 if (
-                    policy.is_sliding_window and eta_max <= policy.tau_zero_bit
+                    (
+                        policy.is_sliding_window
+                        or (is_dsv41_q and not is_fp8_mla)
+                    )
+                    and eta_max <= policy.tau_zero_bit
                 ) or (
-                    policy.is_mamba
+                    (policy.is_mamba or is_fp8_mla)
                     and eta_max <= min(policy.tau_zero_bit, 0.01)
                 ):
                     records[item_idx] = CompressedKVBlockRecord(
@@ -3227,7 +3572,7 @@ class DeltaBlockStore:
                             v_c[outlier_idx].clone() if v_c is not None else None
                         )
                         q_dk = quantize_residual_packed(
-                            dk_single.to(k_c.dtype), bits=4
+                            dk_single.to(k_stack.dtype), bits=delta_bits_4
                         )
                         q_dv = (
                             quantize_residual_packed(
@@ -3259,7 +3604,11 @@ class DeltaBlockStore:
                 tier1_eligible = (
                     (eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4)
                     if policy.is_mamba
-                    else (eta_max <= eff_tau_int2)
+                    else (
+                        eta_max <= policy.tau_int4
+                        if is_dsv41_nvfp4
+                        else eta_max <= eff_tau_int2
+                    )
                 )
                 if tier1_eligible:
                     tier1_g_idxs.append(g_idx)
@@ -3309,7 +3658,7 @@ class DeltaBlockStore:
 
             if tier2_g_idxs:
                 q_dk_list2 = quantize_residual_packed_batch(
-                    delta_k[tier2_g_idxs].to(k_stack.dtype), bits=4
+                    delta_k[tier2_g_idxs].to(k_stack.dtype), bits=delta_bits_4
                 )
                 q_dv_list2 = (
                     quantize_residual_packed_batch(
@@ -3350,7 +3699,7 @@ class DeltaBlockStore:
         # Pass 2B: Batched GPU evaluation for full-attention partial (and stitched partial) matches
         if attn_partial_group:
             p = len(attn_partial_group)
-            k_stack = torch.stack(
+            k_stack_raw = torch.stack(
                 [k_cpus[idx] for idx, _, _, _, _, _ in attn_partial_group],
                 dim=0,
             )
@@ -3358,8 +3707,22 @@ class DeltaBlockStore:
                 self._get_record_base_kv(b1, b2, s_off)
                 for _, b1, b2, s_off, _, _ in attn_partial_group
             ]
-            base_k_stack = torch.stack(
+            base_k_stack_raw = torch.stack(
                 [kv[0] for kv in partial_kv_pairs], dim=0
+            )
+            is_dsv41_q = _is_dsv41_quant_kv(k_stack_raw)
+            is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_stack_raw)
+            is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw)
+            delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
+            k_stack = (
+                _dequant_dsv41_kv(k_stack_raw)
+                if is_dsv41_q
+                else k_stack_raw
+            )
+            base_k_stack = (
+                _dequant_dsv41_kv(base_k_stack_raw)
+                if is_dsv41_q
+                else base_k_stack_raw
             )
             dpos_list = [dpos for _, _, _, _, dpos, _ in attn_partial_group]
             k_ref_aligned = apply_relative_rope_rotation_batch(
@@ -3369,6 +3732,8 @@ class DeltaBlockStore:
                 rotary_dim=policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
+                rope_at_tail=policy.rope_at_tail,
+                rope_pos_scale=policy.rope_pos_scale,
             )
             k_fp32 = k_stack.to(torch.float32)
             delta_k = k_fp32 - k_ref_aligned.to(torch.float32)
@@ -3393,7 +3758,15 @@ class DeltaBlockStore:
 
             b_tok = delta_k.shape[1]
             all_sparse_per_p: list[list[int]] = [
-                list(d_idx) for _, _, _, _, _, d_idx in attn_partial_group
+                sorted(
+                    {
+                        (idx * b_tok) // len(token_tuples[item_i])
+                        for idx in d_idx
+                    }
+                )
+                if (0 < b_tok < len(token_tuples[item_i]))
+                else list(d_idx)
+                for item_i, _, _, _, _, d_idx in attn_partial_group
             ]
             max_rem_slots = max(
                 0,
@@ -3473,7 +3846,8 @@ class DeltaBlockStore:
             if valid_p_idxs:
                 if policy.layer_idx > 0:
                     q_dk_p = quantize_residual_packed_batch(
-                        delta_k[valid_p_idxs].to(k_stack.dtype), bits=4
+                        delta_k[valid_p_idxs].to(k_stack.dtype),
+                        bits=delta_bits_4,
                     )
                     q_dv_p = (
                         quantize_residual_packed_batch(
@@ -3882,14 +4256,22 @@ class DeltaBlockStore:
                     if target_start_position is not None
                     else 0
                 )
+                is_dsv41_q = _is_dsv41_quant_kv(raw_k_ref)
+                k_ref_work = (
+                    _dequant_dsv41_kv(raw_k_ref) if is_dsv41_q else raw_k_ref
+                )
                 k_recon = apply_relative_rope_rotation(
-                    raw_k_ref,
+                    k_ref_work,
                     delta_pos=delta_pos,
                     rope_theta=policy.rope_theta,
                     rotary_dim=policy.rotary_dim,
                     is_neox_style=policy.is_neox_style,
                     rope_scaling=policy.rope_scaling,
+                    rope_at_tail=policy.rope_at_tail,
+                    rope_pos_scale=policy.rope_pos_scale,
                 )
+                if is_dsv41_q:
+                    k_recon = _requant_dsv41_kv(k_recon, raw_k_ref)
                 v_recon = (
                     raw_v_ref.clone() if raw_v_ref is not None else None
                 )
@@ -3923,18 +4305,24 @@ class DeltaBlockStore:
         raw_k_ref, raw_v_ref = self._get_record_base_kv(
             base_rec, base_rec_2, rec.stitch_offset
         )
+        is_dsv41_q = _is_dsv41_quant_kv(raw_k_ref)
+        k_ref_work = _dequant_dsv41_kv(raw_k_ref) if is_dsv41_q else raw_k_ref
 
         k_aligned = apply_relative_rope_rotation(
-            raw_k_ref,
+            k_ref_work,
             delta_pos=rec.delta_pos,
             rope_theta=policy.rope_theta,
             rotary_dim=policy.rotary_dim,
             is_neox_style=policy.is_neox_style,
             rope_scaling=policy.rope_scaling,
+            rope_at_tail=policy.rope_at_tail,
+            rope_pos_scale=policy.rope_pos_scale,
         )
         v_base = raw_v_ref.clone() if raw_v_ref is not None else None
 
         if rec.tier == CompressionTier.TIER0_ZERO_BIT:
+            if is_dsv41_q:
+                k_aligned = _requant_dsv41_kv(k_aligned, raw_k_ref)
             return k_aligned, v_base
 
         if rec.tier in (
@@ -3946,6 +4334,8 @@ class DeltaBlockStore:
             k_out = (k_aligned.to(torch.float32) + dk.to(torch.float32)).to(
                 k_aligned.dtype
             )
+            if is_dsv41_q:
+                k_out = _requant_dsv41_kv(k_out, raw_k_ref)
             if v_base is not None and rec.quant_delta_v is not None:
                 dv = dequantize_residual_packed(rec.quant_delta_v)
                 v_out = (v_base.to(torch.float32) + dv.to(torch.float32)).to(
@@ -3961,6 +4351,8 @@ class DeltaBlockStore:
                 dk = dequantize_residual_packed(rec.quant_delta_k)
                 k_out = k_out + dk.to(torch.float32)
             k_out_typed = k_out.to(k_aligned.dtype)
+            if is_dsv41_q:
+                k_out_typed = _requant_dsv41_kv(k_out_typed, raw_k_ref)
 
             if v_base is not None:
                 v_out = v_base.to(torch.float32)
@@ -3971,7 +4363,7 @@ class DeltaBlockStore:
             else:
                 v_out_typed = None
 
-            # Overwrite edited token positions with exact BF16 rows
+            # Overwrite edited token positions with exact BF16 (or exact uint8) rows
             if rec.sparse_token_indices is not None and rec.sparse_k_bf16 is not None:
                 idx = rec.sparse_token_indices.to(torch.long)
                 k_out_typed[idx] = rec.sparse_k_bf16
@@ -4119,8 +4511,14 @@ class DeltaBlockStore:
                 tier3_items.append((i, rec, rk, rv))
 
         if tier0_items:
-            base_k_s = torch.stack(
+            base_k_s_raw = torch.stack(
                 [rk for _, rk, _, _ in tier0_items], dim=0
+            )
+            is_dsv41_q = _is_dsv41_quant_kv(base_k_s_raw)
+            base_k_s = (
+                _dequant_dsv41_kv(base_k_s_raw)
+                if is_dsv41_q
+                else base_k_s_raw
             )
             dpos_s = [d for _, _, _, d in tier0_items]
             k_aligned_s = apply_relative_rope_rotation_batch(
@@ -4130,7 +4528,11 @@ class DeltaBlockStore:
                 rotary_dim=policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
+                rope_at_tail=policy.rope_at_tail,
+                rope_pos_scale=policy.rope_pos_scale,
             )
+            if is_dsv41_q:
+                k_aligned_s = _requant_dsv41_kv(k_aligned_s, base_k_s_raw)
             for sub_i, (item_idx, _, rv, _) in enumerate(tier0_items):
                 results[item_idx] = (
                     k_aligned_s[sub_i],
@@ -4140,8 +4542,14 @@ class DeltaBlockStore:
         for dense_group in (tier1_items, tier2_items):
             if not dense_group:
                 continue
-            base_k_s = torch.stack(
+            base_k_s_raw = torch.stack(
                 [rk for _, _, rk, _ in dense_group], dim=0
+            )
+            is_dsv41_q = _is_dsv41_quant_kv(base_k_s_raw)
+            base_k_s = (
+                _dequant_dsv41_kv(base_k_s_raw)
+                if is_dsv41_q
+                else base_k_s_raw
             )
             dpos_s = [r.delta_pos for _, r, _, _ in dense_group]
             k_aligned_s = apply_relative_rope_rotation_batch(
@@ -4151,6 +4559,8 @@ class DeltaBlockStore:
                 rotary_dim=policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
+                rope_at_tail=policy.rope_at_tail,
+                rope_pos_scale=policy.rope_pos_scale,
             )
             dk_batch = dequantize_residual_packed_batch(
                 [r.quant_delta_k for _, r, _, _ in dense_group]  # type: ignore[misc]
@@ -4158,6 +4568,8 @@ class DeltaBlockStore:
             k_out_s = (
                 k_aligned_s.to(torch.float32) + dk_batch.to(torch.float32)
             ).to(k_aligned_s.dtype)
+            if is_dsv41_q:
+                k_out_s = _requant_dsv41_kv(k_out_s, base_k_s_raw)
 
             has_v = (
                 dense_group[0][3] is not None
@@ -4183,8 +4595,14 @@ class DeltaBlockStore:
                     )
 
         if tier3_items:
-            base_k_s = torch.stack(
+            base_k_s_raw = torch.stack(
                 [rk for _, _, rk, _ in tier3_items], dim=0
+            )
+            is_dsv41_q = _is_dsv41_quant_kv(base_k_s_raw)
+            base_k_s = (
+                _dequant_dsv41_kv(base_k_s_raw)
+                if is_dsv41_q
+                else base_k_s_raw
             )
             dpos_s = [r.delta_pos for _, r, _, _ in tier3_items]
             k_aligned_s = apply_relative_rope_rotation_batch(
@@ -4194,6 +4612,8 @@ class DeltaBlockStore:
                 rotary_dim=policy.rotary_dim,
                 is_neox_style=policy.is_neox_style,
                 rope_scaling=policy.rope_scaling,
+                rope_at_tail=policy.rope_at_tail,
+                rope_pos_scale=policy.rope_pos_scale,
             )
             has_q_dk = tier3_items[0][1].quant_delta_k is not None
             if has_q_dk and all(
@@ -4207,6 +4627,8 @@ class DeltaBlockStore:
                 ).to(k_aligned_s.dtype)
             else:
                 k_out_s = k_aligned_s.clone()
+            if is_dsv41_q:
+                k_out_s = _requant_dsv41_kv(k_out_s, base_k_s_raw)
 
             has_v = tier3_items[0][3] is not None
             if has_v:
@@ -4524,6 +4946,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if hf_config is not None
             else None
         )
+        layer_rope_theta = (
+            _safe_getattr(hf_config, "layer_rope_theta", None)
+            if hf_config is not None
+            else None
+        )
         if isinstance(layer_types, (list, tuple)) and any(
             lt in ("linear_attention", "mamba") for lt in layer_types
         ):
@@ -4549,8 +4976,15 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     spec.__class__.__name__ == "MambaSpec"
                     or getattr(spec, "mamba_type", None) is not None
                 )
-                self._group_block_sizes.append(grp_bs)
+                grp_non_cacheable = (
+                    not grp_is_mamba
+                    and spec is not None
+                    and getattr(spec, "prefix_cacheable", True) is False
+                )
+                self._group_block_sizes.append(0 if grp_non_cacheable else grp_bs)
                 self._group_is_mamba.append(grp_is_mamba)
+                if grp_non_cacheable:
+                    continue
                 for layer_name in getattr(group_spec, "layer_names", []):
                     self._layer_to_group_idx[layer_name] = group_idx
                     if layer_name in self.store.layer_policies:
@@ -4593,19 +5027,102 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         if spec_sw is not None
                         else (default_sw if is_sw else None)
                     )
-                    theta = local_theta if is_sw else global_theta
-                    if is_mamba:
-                        layer_rope_scaling = None
-                        layer_rotary_dim: int | None = 0
-                    elif is_sw and sliding_rope_params is not None:
-                        layer_rope_scaling = sliding_rope_params
-                        layer_rotary_dim = None
-                    elif is_sw and has_separate_local_rope:
-                        layer_rope_scaling = None
-                        layer_rotary_dim = rotary_dim
-                    else:
+                    tokens_per_state = int(
+                        getattr(layer_spec, "tokens_per_state", 1) or 1
+                    )
+                    is_dsv41_layer = model_type == "deepseek_v41" or (
+                        getattr(layer_spec, "head_size", 0) == 288
+                        and getattr(layer_spec, "dtype", None) == torch.uint8
+                    )
+                    is_dsa_or_mla_model = model_type in (
+                        "glm_moe_dsa",
+                        "deepseek_v32",
+                        "deepseek_v3",
+                        "deepseek_v2",
+                    ) or (
+                        not is_dsv41_layer
+                        and _safe_getattr(hf_config, "kv_lora_rank", None) is not None
+                    )
+                    layer_is_neox = True
+                    layer_rope_at_tail = False
+                    layer_rope_pos_scale = 1.0
+                    if is_dsv41_layer:
+                        theta = float(
+                            _safe_getattr(
+                                hf_config, "compress_rope_theta", 160000.0
+                            )
+                            or 160000.0
+                        )
+                        if isinstance(full_rope_params, dict):
+                            layer_rope_scaling = dict(full_rope_params)
+                            if layer_rope_scaling.get("rope_type") == "yarn":
+                                layer_rope_scaling["rope_type"] = "deepseek_yarn"
+                        else:
+                            layer_rope_scaling = {
+                                "rope_type": "deepseek_yarn",
+                                "factor": 16.0,
+                                "beta_fast": 32.0,
+                                "beta_slow": 1.0,
+                                "original_max_position_embeddings": 65536,
+                            }
+                        layer_rotary_dim = int(
+                            _safe_getattr(hf_config, "qk_rope_head_dim", 64) or 64
+                        )
+                        layer_is_neox = False
+                        layer_rope_at_tail = True
+                        layer_rope_pos_scale = 1.0
+                    elif is_dsa_or_mla_model:
+                        theta = local_theta if is_sw else global_theta
                         layer_rope_scaling = full_rope_params
-                        layer_rotary_dim = rotary_dim
+                        layer_rotary_dim = int(
+                            _safe_getattr(hf_config, "qk_rope_head_dim", 64) or 64
+                        )
+                        is_indexer_layer = "indexer" in layer_name
+                        if is_indexer_layer:
+                            layer_is_neox = not bool(
+                                _safe_getattr(
+                                    hf_config, "indexer_rope_interleave", False
+                                )
+                            )
+                            layer_rope_at_tail = False
+                        else:
+                            layer_is_neox = not bool(
+                                _safe_getattr(hf_config, "rope_interleave", True)
+                            )
+                            layer_rope_at_tail = True
+                    else:
+                        theta = local_theta if is_sw else global_theta
+                        if is_mamba:
+                            layer_rope_scaling = None
+                            layer_rotary_dim = 0
+                        elif is_sw and sliding_rope_params is not None:
+                            layer_rope_scaling = sliding_rope_params
+                            layer_rotary_dim = None
+                        elif is_sw and has_separate_local_rope:
+                            layer_rope_scaling = None
+                            layer_rotary_dim = rotary_dim
+                        else:
+                            layer_rope_scaling = full_rope_params
+                            layer_rotary_dim = rotary_dim
+                        if (
+                            isinstance(layer_rope_theta, (list, tuple))
+                            and layer_idx < len(layer_rope_theta)
+                        ):
+                            per_layer_theta = float(
+                                layer_rope_theta[layer_idx] or 0.0
+                            )
+                            if per_layer_theta <= 0.0:
+                                theta = 0.0
+                                layer_rope_scaling = None
+                                layer_rotary_dim = 0
+                            else:
+                                theta = per_layer_theta
+                        if model_type in (
+                            "muse_spark",
+                            "muse_spark_text",
+                            "musespark1x_text",
+                        ):
+                            layer_is_neox = False
                     follows_global_layer = (
                         is_sw
                         and layer_idx > 0
@@ -4640,7 +5157,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                             sliding_window_size=sw_size,
                             rope_theta=0.0 if is_mamba else theta,
                             rotary_dim=layer_rotary_dim,
+                            is_neox_style=layer_is_neox,
                             rope_scaling=layer_rope_scaling,
+                            rope_at_tail=layer_rope_at_tail,
+                            rope_pos_scale=layer_rope_pos_scale,
                             sliding_window_dedup_threshold=sw_dedup_thresh,
                             tau_zero_bit=0.0
                             if is_mamba
@@ -4768,16 +5288,19 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int] | tuple[int, ...],
         all_group_block_ids: tuple[list[int], ...] | None = None,
     ) -> list[DeltaBlockTransferSpec]:
+        active_g_indices = sorted(set(self._layer_to_group_idx.values()))
+        primary_g = active_g_indices[0] if active_g_indices else 0
         max_avail_blocks = (
             max(
                 (
                     len(g) * self._get_group_block_scale(g_idx)
                     for g_idx, g in enumerate(all_group_block_ids)
+                    if (not active_g_indices or g_idx in active_g_indices)
                 ),
-                default=len(block_ids) * self._get_group_block_scale(0),
+                default=len(block_ids) * self._get_group_block_scale(primary_g),
             )
             if all_group_block_ids
-            else len(block_ids) * self._get_group_block_scale(0)
+            else len(block_ids) * self._get_group_block_scale(primary_g)
         )
         num_full_blocks = min(len(token_ids) // self._block_size, max_avail_blocks)
         specs: list[DeltaBlockTransferSpec] = []
@@ -4821,10 +5344,15 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     for g_idx, g_blks in enumerate(all_group_block_ids)
                 )
 
-            b0_idx = b_idx // self._get_group_block_scale(0)
+            primary_blks = (
+                all_group_block_ids[primary_g]
+                if (all_group_block_ids and primary_g < len(all_group_block_ids))
+                else block_ids
+            )
+            b0_idx = b_idx // self._get_group_block_scale(primary_g)
             phys_id = (
-                int(block_ids[b0_idx])
-                if b0_idx < len(block_ids) and block_ids[b0_idx] is not None
+                int(primary_blks[b0_idx])
+                if b0_idx < len(primary_blks) and primary_blks[b0_idx] is not None
                 else 0
             )
             specs.append(
@@ -4866,6 +5394,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             else:
                 break
 
+        longest_attn_matched = matched_positions[-1][0] if matched_positions else 0
         if self.store.has_mamba_layers:
             while matched_positions and not self.store.has_mamba_block(
                 matched_positions[-1][1]
@@ -4873,6 +5402,13 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 matched_positions.pop()
 
         matched_tokens = matched_positions[-1][0] if matched_positions else 0
+        if longest_attn_matched > matched_tokens and hasattr(
+            request, "shared_prefix_boundary"
+        ):
+            request.shared_prefix_boundary = max(
+                getattr(request, "shared_prefix_boundary", 0) or 0,
+                longest_attn_matched,
+            )
         sched_bs = self._scheduler_block_size
         if sched_bs > self._block_size:
             matched_tokens = (matched_tokens // sched_bs) * sched_bs
@@ -5037,6 +5573,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         mamba_g_indices = [
             g_idx for g_idx, is_m in enumerate(self._group_is_mamba) if is_m
         ]
+        active_g_indices = sorted(set(self._layer_to_group_idx.values()))
         for req_meta in meta.requests:
             if req_meta.is_store:
                 for blk_spec in req_meta.blocks:
@@ -5048,9 +5585,14 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                             for g_idx in mamba_g_indices
                         )
                     elif blk_spec.group_block_ids:
+                        check_g = active_g_indices or list(
+                            range(len(blk_spec.group_block_ids))
+                        )
                         has_mamba_state = all(
-                            g_id is not None and g_id > 0
-                            for g_id in blk_spec.group_block_ids
+                            g_idx < len(blk_spec.group_block_ids)
+                            and blk_spec.group_block_ids[g_idx] is not None
+                            and blk_spec.group_block_ids[g_idx] > 0
+                            for g_idx in check_g
                         )
                     else:
                         has_mamba_state = blk_spec.physical_block_id > 0
@@ -5105,12 +5647,29 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         return None
 
     @staticmethod
+    def _is_mla_kv_tensor(
+        kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
+        attn_metadata: Any = None,
+    ) -> bool:
+        if isinstance(kv_layer, tuple):
+            return False
+        if isinstance(attn_metadata, MLACommonMetadata):
+            return True
+        if _is_dsv41_quant_kv(kv_layer):
+            return True
+        if kv_layer.ndim == 3 or (kv_layer.ndim == 4 and kv_layer.shape[1] == 1):
+            return True
+        return False
+
+    @staticmethod
     def _get_kernel_block_ratio(
         kv_layer: torch.Tensor | tuple[torch.Tensor, ...],
         is_mla: bool = False,
         block_size: int | None = None,
     ) -> int:
         if isinstance(kv_layer, tuple) or block_size is None or block_size <= 0:
+            return 1
+        if _is_dsv41_quant_kv(kv_layer):
             return 1
         if is_mla:
             kbs = (
@@ -5479,7 +6038,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 if isinstance(attn_metadata, dict)
                 else attn_metadata
             )
-            is_mla = isinstance(layer_attn_meta, MLACommonMetadata)
+            is_mla = self._is_mla_kv_tensor(kv_tensor, layer_attn_meta)
             num_blocks = self._get_kv_layer_num_blocks(
                 kv_tensor, is_mla=is_mla, block_size=self._block_size
             )
@@ -5568,7 +6127,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             policy.tau_int2 = 0.0
             policy.max_sparse_exceptions = 0
 
-        is_mla = isinstance(attn_metadata, MLACommonMetadata)
+        is_mla = self._is_mla_kv_tensor(kv_layer, attn_metadata)
         num_blocks = self._get_kv_layer_num_blocks(
             kv_layer, is_mla=is_mla, block_size=self._block_size
         )
@@ -5579,6 +6138,20 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if not req_meta.is_store:
                 continue
             for blk_spec in req_meta.blocks:
+                existing_rec = self.store._records.get(
+                    (layer_name, blk_spec.full_block_hash)
+                )
+                if existing_rec is not None:
+                    self.store._touch_lru(
+                        blk_spec.full_block_hash,
+                        existing_rec.ref_base_hash,
+                        existing_rec.ref_base_hash_2,
+                    )
+                    if policy.is_mamba:
+                        self.store._known_mamba_blocks.add(
+                            blk_spec.full_block_hash
+                        )
+                    continue
                 phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                 if phys_blk_id is None or phys_blk_id >= num_blocks:
                     continue
@@ -5622,6 +6195,11 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         for layer_name in all_layer_names:
             if layer_name in self._layers_saved_in_step:
                 continue
+            if (
+                self._layer_to_group_idx
+                and layer_name not in self._layer_to_group_idx
+            ):
+                continue
             layer = self._active_no_compile_layers.get(layer_name)
             kv_tensor = self._get_layer_kv_cache(
                 layer_name, layer, self._active_virtual_engine
@@ -5629,8 +6207,6 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if kv_tensor is None:
                 continue
             policy = self.store.get_layer_policy(layer_name)
-            if not isinstance(kv_tensor, tuple) and not policy.is_mamba:
-                continue
             if isinstance(kv_tensor, tuple) and not policy.is_mamba:
                 policy.is_mamba = True
                 policy.rotary_dim = 0
@@ -5638,14 +6214,29 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 policy.tau_int2 = 0.0
                 policy.max_sparse_exceptions = 0
 
+            is_mla = self._is_mla_kv_tensor(kv_tensor)
             num_blocks = self._get_kv_layer_num_blocks(
-                kv_tensor, is_mla=False, block_size=self._block_size
+                kv_tensor, is_mla=is_mla, block_size=self._block_size
             )
             batch_items: list[
                 tuple[DeltaBlockTransferSpec, torch.Tensor, torch.Tensor | None]
             ] = []
             for req_meta in store_reqs:
                 for blk_spec in req_meta.blocks:
+                    existing_rec = self.store._records.get(
+                        (layer_name, blk_spec.full_block_hash)
+                    )
+                    if existing_rec is not None:
+                        self.store._touch_lru(
+                            blk_spec.full_block_hash,
+                            existing_rec.ref_base_hash,
+                            existing_rec.ref_base_hash_2,
+                        )
+                        if policy.is_mamba:
+                            self.store._known_mamba_blocks.add(
+                                blk_spec.full_block_hash
+                            )
+                        continue
                     phys_blk_id = self._resolve_physical_block_id(layer_name, blk_spec)
                     if (
                         phys_blk_id is None
@@ -5656,8 +6247,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     k_blk, v_blk = self._extract_block_kv(
                         kv_tensor,
                         phys_blk_id,
-                        is_mla=False,
+                        is_mla=is_mla,
                         block_size=self._block_size,
+                        start_position=blk_spec.start_position,
                     )
                     batch_items.append((blk_spec, k_blk, v_blk))
             if batch_items:

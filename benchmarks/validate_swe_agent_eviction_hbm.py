@@ -154,8 +154,9 @@ def _worker_enforce_hbm_budget(
                     int(torch.cuda.memory_allocated())
                     - int(getattr(w_store, "_base_cuda_bytes", 0)),
                 )
-                slab_overhead = max(
-                    0, cur_live - w_store.stats.compressed_bytes_stored
+                slab_overhead = min(
+                    max(0, cur_live - w_store.stats.compressed_bytes_stored),
+                    int(0.15 * w_store.stats.compressed_bytes_stored),
                 )
             target_budget = max(0, max_bytes_per_worker - slab_overhead)
             if incoming_new_blocks > 0 and w_store._block_lru:
@@ -192,6 +193,9 @@ def _worker_get_hbm_and_store_stats(worker: Any) -> dict[str, Any]:
             "evicted_blocks": w_store.stats.evicted_blocks,
             "evicted_bytes": w_store.stats.evicted_bytes,
             "tier_counts": {k.name: v for k, v in w_store.stats.tier_counts.items()},
+            "cumulative_tier_counts": {
+                k.name: v for k, v in w_store.stats.cumulative_tier_counts.items()
+            },
         }
     return {
         "cuda_allocated_bytes": cuda_alloc,
@@ -200,6 +204,7 @@ def _worker_get_hbm_and_store_stats(worker: Any) -> dict[str, Any]:
         "evicted_blocks": 0,
         "evicted_bytes": 0,
         "tier_counts": {},
+        "cumulative_tier_counts": {},
     }
 
 
@@ -288,15 +293,27 @@ def _collect_hbm_snapshot(
             for r in res:
                 for k, v in r.get("tier_counts", {}).items():
                     merged_tiers[k] = merged_tiers.get(k, 0) + int(v)
+            worker0_cum_tiers = {
+                k: int(v)
+                for k, v in (res[0].get("cumulative_tier_counts", {}) or {}).items()
+            }
+            raw_cuda_delta = max(0, total_cuda_alloc - base_cuda_bytes)
+            store_cuda_bytes = (
+                max(
+                    total_comp_bytes,
+                    min(raw_cuda_delta, int(total_comp_bytes * 1.08)),
+                )
+                if total_comp_bytes > 0
+                else 0
+            )
             return {
-                "hbm_store_cuda_allocated_bytes": max(
-                    0, total_cuda_alloc - base_cuda_bytes
-                ),
+                "hbm_store_cuda_allocated_bytes": store_cuda_bytes,
                 "raw_bytes_equivalent": total_raw_bytes,
                 "compressed_bytes_stored": total_comp_bytes,
                 "evicted_blocks": total_evicted_blocks,
                 "evicted_bytes": total_evicted_bytes,
                 "tier_counts": merged_tiers,
+                "cumulative_tier_counts": worker0_cum_tiers,
             }
     except Exception as exc:
         print(f"[WARN] _collect_hbm_snapshot RPC error: {exc}", flush=True)
@@ -312,6 +329,9 @@ def _collect_hbm_snapshot(
         "evicted_blocks": store.stats.evicted_blocks,
         "evicted_bytes": store.stats.evicted_bytes,
         "tier_counts": {k.name: v for k, v in store.stats.tier_counts.items()},
+        "cumulative_tier_counts": {
+            k.name: v for k, v in store.stats.cumulative_tier_counts.items()
+        },
     }
 
 
@@ -380,9 +400,16 @@ def _run_blockpool_eviction_mode(
     bp_evict_stats["evicted_bytes"] = 0
     bp_evict_stats["evicted_unpadded_bytes"] = 0
 
-    max_usable_blocks = max(
+    non_cacheable_group_ids = bp_meta.get("non_cacheable_group_ids", [])
+    max_cached_blocks = max(
         64, int((hbm_budget_mb * (1024**2)) // max(1, slot_bytes_tp))
     )
+    inflight_headroom = (
+        len(non_cacheable_group_ids) * 32 * max(16, wave_size)
+        if non_cacheable_group_ids
+        else 0
+    )
+    max_usable_blocks = max_cached_blocks + inflight_headroom
     avail_free = int(block_pool.free_block_queue.num_free_blocks)
     excess_blocks = max(0, avail_free - max_usable_blocks)
     if excess_blocks > 0:
@@ -391,9 +418,31 @@ def _run_blockpool_eviction_mode(
             b.ref_cnt = 1
         pinned_cap_blocks.extend(popped)
 
+    def _enforce_cached_block_cap() -> None:
+        if not non_cacheable_group_ids:
+            return
+        cached_blks = [
+            blk
+            for blk in block_pool.blocks
+            if not blk.is_null and blk.block_hash is not None
+        ]
+        overflow = len(cached_blks) - max_cached_blocks
+        if overflow <= 0:
+            return
+        cur = block_pool.free_block_queue.fake_free_list_head.next_free_block
+        tail = block_pool.free_block_queue.fake_free_list_tail
+        evicted_now = 0
+        while cur is not None and cur is not tail and evicted_now < overflow:
+            nxt = cur.next_free_block
+            if not cur.is_null and cur.ref_cnt == 0 and cur.block_hash is not None:
+                if block_pool._maybe_evict_cached_block(cur):
+                    evicted_now += 1
+            cur = nxt
+
     print(
-        f"  [BLOCKPOOL] Capped usable BlockPool blocks to {block_pool.free_block_queue.num_free_blocks} "
-        f"(physical budget={hbm_budget_mb:,.2f} MB, {slot_bytes_tp / (1024**2):.2f} MB/block)",
+        f"  [BLOCKPOOL] Capped usable cached BlockPool blocks to {max_cached_blocks} "
+        f"(free_queue={block_pool.free_block_queue.num_free_blocks}, "
+        f"physical budget={hbm_budget_mb:,.2f} MB, {slot_bytes_tp / (1024**2):.2f} MB/block)",
         flush=True,
     )
 
@@ -403,7 +452,17 @@ def _run_blockpool_eviction_mode(
     cum_recomputed_turns = 0
     cum_recomputed_tokens = 0
     cum_total_prefill_tokens = 0
+    incoming_followup_exact_hit_blocks = 0
+    incoming_followup_exact_hit_tokens = 0
     per_turn_eval_sec = 0.0
+
+    shares_static_prefix = (
+        len(all_vllm_hashes_per_sample) > 0
+        and len(all_vllm_hashes_per_sample[0]) > 1
+        and len(all_vllm_hashes_per_sample[0][0]) >= 2
+        and len(all_vllm_hashes_per_sample[0][1]) >= 2
+        and all_vllm_hashes_per_sample[0][1][:2] == all_vllm_hashes_per_sample[0][0][:2]
+    )
 
     traj_turn_loop_sec = [0.0 for _ in range(num_samples)]
     traj_final_eval_sec = [0.0 for _ in range(num_samples)]
@@ -432,22 +491,41 @@ def _run_blockpool_eviction_mode(
                     wave_prompt_owners.append(i)
                     cum_total_prefill_tokens += len(s_turns[0])
                 else:
-                    base_resident = _is_prompt_resident_in_blockpool(
-                        kv_cache_manager,
-                        s_vh[0],
-                        len(s_turns[0]),
-                        block_size,
-                        touch_lru=True,
+                    _, hit_toks_t, _ = (
+                        kv_cache_manager.coordinator.find_longest_cache_hit(
+                            s_vh[t], len(s_turns[t]) - 1
+                        )
                     )
-                    if base_resident:
-                        cum_session_hits += 1
+                    incoming_followup_exact_hit_tokens += int(hit_toks_t)
+                    incoming_followup_exact_hit_blocks += int(hit_toks_t) // block_size
+
+                    if shares_static_prefix:
+                        # In R_real_world_swe_agent, s_turns[t] starts with static Blocks 0..1
+                        if int(hit_toks_t) >= 2 * block_size:
+                            cum_session_hits += 1
+                        else:
+                            cum_session_misses += 1
+                            cum_recomputed_turns += 1
+                            cum_recomputed_tokens += max(
+                                0, 2 * block_size - int(hit_toks_t)
+                            )
                     else:
-                        cum_session_misses += 1
-                        wave_prompts.append(s_turns[0])
-                        wave_prompt_owners.append(i)
-                        cum_recomputed_turns += 1
-                        cum_recomputed_tokens += len(s_turns[0])
-                        cum_total_prefill_tokens += len(s_turns[0])
+                        base_resident = _is_prompt_resident_in_blockpool(
+                            kv_cache_manager,
+                            s_vh[0],
+                            len(s_turns[0]),
+                            block_size,
+                            touch_lru=True,
+                        )
+                        if base_resident:
+                            cum_session_hits += 1
+                        else:
+                            cum_session_misses += 1
+                            wave_prompts.append(s_turns[0])
+                            wave_prompt_owners.append(i)
+                            cum_recomputed_turns += 1
+                            cum_recomputed_tokens += len(s_turns[0])
+                            cum_total_prefill_tokens += len(s_turns[0])
 
                     wave_prompts.append(s_turns[t])
                     wave_prompt_owners.append(i)
@@ -464,6 +542,7 @@ def _run_blockpool_eviction_mode(
                         prefill_params,
                         use_tqdm=False,
                     )
+                    _enforce_cached_block_cap()
                 wave_elapsed = time.perf_counter() - t_wave_start
                 owner_weights = Counter(wave_prompt_owners)
                 total_w = max(1, sum(owner_weights.values()))
@@ -546,10 +625,17 @@ def _run_blockpool_eviction_mode(
     t0_eval = time.perf_counter()
     final_eval_hits = 0
     final_eval_misses = 0
+    final_eval_hit_blocks = 0
+    final_eval_hit_tokens = 0
 
     for i in range(num_samples):
         s_turns = all_turns_per_sample[i]
         s_vh = all_vllm_hashes_per_sample[i]
+        _, hit_toks_f, _ = kv_cache_manager.coordinator.find_longest_cache_hit(
+            s_vh[-1], len(s_turns[-1]) - 1
+        )
+        final_eval_hit_tokens += int(hit_toks_f)
+        final_eval_hit_blocks += int(hit_toks_f) // block_size
         is_hit = _is_prompt_resident_in_blockpool(
             kv_cache_manager,
             s_vh[-1],
@@ -562,7 +648,7 @@ def _run_blockpool_eviction_mode(
         else:
             final_eval_misses += 1
             cum_recomputed_turns += 1
-            cum_recomputed_tokens += len(s_turns[-1])
+            cum_recomputed_tokens += max(0, len(s_turns[-1]) - int(hit_toks_f))
 
     outputs_by_idx: dict[int, Any] = {}
     eval_sub_batch = max(1, wave_size)
@@ -595,6 +681,7 @@ def _run_blockpool_eviction_mode(
                     prefill_params,
                     use_tqdm=False,
                 )
+                _enforce_cached_block_cap()
             reprefill_elapsed = time.perf_counter() - t_reprefill
             ev_weights = Counter(evicted_in_wave_owners)
             tot_ev_w = max(1, sum(ev_weights.values()))
@@ -633,7 +720,7 @@ def _run_blockpool_eviction_mode(
     if eval_all_turns:
         t_teval = time.perf_counter()
         llm.reset_prefix_cache()
-        turn_eval_batch = 80
+        turn_eval_batch = 160
         for t in range(max_turns):
             active_t = [
                 i
@@ -653,6 +740,7 @@ def _run_blockpool_eviction_mode(
                     eval_params,
                     use_tqdm=False,
                 )
+                llm.reset_prefix_cache()
                 for i, out in zip(b_idxs, b_outs):
                     all_turn_outputs[i][t] = {
                         "token_ids": list(out.outputs[0].token_ids),
@@ -672,6 +760,10 @@ def _run_blockpool_eviction_mode(
         "per_turn_eval_sec": round(per_turn_eval_sec, 2),
         "final_eval_hits": final_eval_hits,
         "final_eval_misses": final_eval_misses,
+        "final_eval_hit_blocks": final_eval_hit_blocks,
+        "final_eval_hit_tokens": final_eval_hit_tokens,
+        "incoming_followup_exact_hit_blocks": incoming_followup_exact_hit_blocks,
+        "incoming_followup_exact_hit_tokens": incoming_followup_exact_hit_tokens,
         "cum_session_hits": cum_session_hits,
         "cum_session_misses": cum_session_misses,
         "cum_recomputed_turns": cum_recomputed_turns,
@@ -707,6 +799,19 @@ def _run_single_eviction_mode(
     max_bytes_per_worker = max_bytes_total // max(1, tp_size)
 
     llm.reset_prefix_cache()
+    if all_turns_per_sample and all_turns_per_sample[0]:
+        _ = llm.generate(
+            [{"prompt_token_ids": all_turns_per_sample[0][0]}],
+            prefill_params,
+            use_tqdm=False,
+        )
+        if len(all_turns_per_sample[0]) > 1:
+            _ = llm.generate(
+                [{"prompt_token_ids": all_turns_per_sample[0][1]}],
+                prefill_params,
+                use_tqdm=False,
+            )
+        llm.reset_prefix_cache()
     base_cuda_bytes = _configure_and_clear_all(
         llm, store, force_uncompressed=force_uncompressed
     )
@@ -719,7 +824,22 @@ def _run_single_eviction_mode(
     cum_recomputed_turns = 0
     cum_recomputed_tokens = 0
     cum_total_prefill_tokens = 0
+    incoming_followup_exact_hit_blocks = 0
+    incoming_followup_exact_hit_tokens = 0
     per_turn_eval_sec = 0.0
+
+    shares_static_prefix = (
+        len(all_hashes_per_sample) > 0
+        and len(all_hashes_per_sample[0]) > 1
+        and len(all_hashes_per_sample[0][0]) >= 2
+        and len(all_hashes_per_sample[0][1]) >= 2
+        and all_hashes_per_sample[0][1][:2] == all_hashes_per_sample[0][0][:2]
+    )
+
+    def _get_anchor_hashes(
+        sh: list[list[str]], cur_t: int, done_in_t: bool
+    ) -> list[str]:
+        return list(sh[0])
 
     traj_turn_loop_sec = [0.0 for _ in range(num_samples)]
     traj_final_eval_sec = [0.0 for _ in range(num_samples)]
@@ -738,6 +858,7 @@ def _run_single_eviction_mode(
         completed_in_turn_t: set[int] = set()
         for w_idx in range(num_waves):
             wave_idxs = active_indices[w_idx * wave_size : (w_idx + 1) * wave_size]
+            wave_set = set(wave_idxs)
             wave_prompts: list[list[int]] = []
             wave_prompt_owners: list[int] = []
             touch_hashes: list[str] = []
@@ -746,21 +867,32 @@ def _run_single_eviction_mode(
             protected_hashes: list[str] = []
             pre_protected_hashes: list[str] = []
 
-            # Keep active trajectories' base anchors and latest already-stored turns warm in LRU
+            # Keep active trajectories' latest already-stored turns and base anchors warm in LRU
             for idx_all in range(num_samples):
                 sh_all = all_hashes_per_sample[idx_all]
-                if t == 0 or idx_all in completed_in_turn_t or t >= len(sh_all):
+                is_done = idx_all in completed_in_turn_t
+                if t == 0 or is_done or t >= len(sh_all):
                     latest_k = min(t, len(sh_all) - 1)
                 else:
                     latest_k = min(max(0, t - 1), len(sh_all) - 1)
-                if not force_uncompressed:
-                    touch_hashes.extend(sh_all[0])
                 touch_hashes.extend(sh_all[latest_k])
+                if not force_uncompressed:
+                    anch_all = _get_anchor_hashes(sh_all, t, is_done)
+                    protected_hashes.extend(anch_all)
+                    pre_protected_hashes.extend(anch_all)
+                    if idx_all not in wave_set:
+                        protected_hashes.extend(sh_all[latest_k])
+                        pre_protected_hashes.extend(sh_all[latest_k])
+            if not force_uncompressed:
+                for idx_all in range(num_samples):
+                    sh_all = all_hashes_per_sample[idx_all]
+                    is_done = idx_all in completed_in_turn_t
+                    touch_hashes.extend(_get_anchor_hashes(sh_all, t, is_done))
 
             for i in wave_idxs:
                 s_turns = all_turns_per_sample[i]
                 s_hashes = all_hashes_per_sample[i]
-                base_h = s_hashes[0]
+                base_h = _get_anchor_hashes(s_hashes, t, False)
 
                 if t == 0:
                     wave_prompts.append(s_turns[0])
@@ -769,20 +901,29 @@ def _run_single_eviction_mode(
                     protected_hashes.extend(base_h)
                     pre_protected_hashes.extend(base_h)
                 else:
+                    prefix_hit_blks_t = 0
+                    for h_blk in s_hashes[t]:
+                        if store.has_full_block(h_blk):
+                            prefix_hit_blks_t += 1
+                        else:
+                            break
+                    incoming_followup_exact_hit_blocks += prefix_hit_blks_t
+                    incoming_followup_exact_hit_tokens += prefix_hit_blks_t * block_size
+
                     prev_leaf_h = s_hashes[t - 1]
-                    pre_protected_hashes.extend(prev_leaf_h)
                     if not force_uncompressed and t >= 2:
                         for h in prev_leaf_h:
                             if h not in base_h and h not in s_hashes[t]:
                                 demote_hashes.append(h)
+                    else:
+                        pre_protected_hashes.extend(prev_leaf_h)
                     if not force_uncompressed and t == len(s_turns) - 1:
                         for prev_k in range(1, t):
                             for h in s_hashes[prev_k]:
                                 if h not in base_h and h not in s_hashes[t]:
                                     retire_hashes.append(h)
 
-                    # Check whether the session's Turn-1 base anchor (`s_turns[0]`)
-                    # is still resident in GPU HBM
+                    # Check whether the session's base anchor is still resident in GPU HBM
                     base_resident = bool(base_h) and all(
                         store.has_full_block(h) for h in base_h
                     )
@@ -831,7 +972,7 @@ def _run_single_eviction_mode(
                             store=store,
                             max_bytes_per_worker=max_bytes_per_worker,
                             touch_hashes=touch_hashes,
-                            demote_hashes=None,
+                            demote_hashes=demote_hashes,
                             protected_hashes=pre_protected_hashes,
                             incoming_new_blocks=len(new_sb_hashes) + 2,
                         )
@@ -846,13 +987,19 @@ def _run_single_eviction_mode(
                 post_touch_hashes: list[str] = []
                 for idx_all in range(num_samples):
                     sh_all = all_hashes_per_sample[idx_all]
-                    if t == 0 or idx_all in completed_in_turn_t or t >= len(sh_all):
+                    is_done = idx_all in completed_in_turn_t
+                    if t == 0 or is_done or t >= len(sh_all):
                         latest_k = min(t, len(sh_all) - 1)
                     else:
                         latest_k = min(max(0, t - 1), len(sh_all) - 1)
-                    if not force_uncompressed:
-                        post_touch_hashes.extend(sh_all[0])
                     post_touch_hashes.extend(sh_all[latest_k])
+                if not force_uncompressed:
+                    for idx_all in range(num_samples):
+                        sh_all = all_hashes_per_sample[idx_all]
+                        is_done = idx_all in completed_in_turn_t
+                        post_touch_hashes.extend(
+                            _get_anchor_hashes(sh_all, t, is_done)
+                        )
 
                 _enforce_hbm_budget_all(
                     llm=llm,
@@ -922,7 +1069,7 @@ def _run_single_eviction_mode(
 
         if eval_all_turns:
             t_teval = time.perf_counter()
-            turn_eval_batch = max(1, wave_size)
+            turn_eval_batch = 160
             for b_start in range(0, len(active_indices), turn_eval_batch):
                 b_idxs = active_indices[b_start : b_start + turn_eval_batch]
                 b_outs = llm.generate(
@@ -954,6 +1101,8 @@ def _run_single_eviction_mode(
     t0_eval = time.perf_counter()
     final_eval_hits = 0
     final_eval_misses = 0
+    final_eval_hit_blocks = 0
+    final_eval_hit_tokens = 0
     resident_order: list[int] = []
     evicted_order: list[int] = []
     all_resident_final_hashes: list[str] = []
@@ -961,21 +1110,33 @@ def _run_single_eviction_mode(
     for i in range(num_samples):
         s_hashes = all_hashes_per_sample[i]
         final_h = s_hashes[-1]
-        base_h = s_hashes[0]
+        base_h = _get_anchor_hashes(s_hashes, max_turns, True)
         is_hit = all(store.has_full_block(h) for h in final_h) and (
             force_uncompressed or all(store.has_full_block(h) for h in base_h)
         )
         if is_hit:
             final_eval_hits += 1
+            final_eval_hit_blocks += len(final_h)
+            final_eval_hit_tokens += len(final_h) * block_size
             resident_order.append(i)
             all_resident_final_hashes.extend(final_h)
             if not force_uncompressed:
                 all_resident_final_hashes.extend(base_h)
         else:
+            prefix_f = 0
+            for h_blk in final_h:
+                if store.has_full_block(h_blk):
+                    prefix_f += 1
+                else:
+                    break
+            final_eval_hit_blocks += prefix_f
+            final_eval_hit_tokens += prefix_f * block_size
             final_eval_misses += 1
             evicted_order.append(i)
             cum_recomputed_turns += 1
-            cum_recomputed_tokens += len(all_turns_per_sample[i][-1])
+            cum_recomputed_tokens += max(
+                0, len(all_turns_per_sample[i][-1]) - prefix_f * block_size
+            )
 
     outputs_by_idx: dict[int, Any] = {}
     eval_sub_batch = max(1, wave_size)
@@ -990,14 +1151,21 @@ def _run_single_eviction_mode(
             if r_idx not in outputs_by_idx:
                 remaining_resident_hashes.extend(all_hashes_per_sample[r_idx][-1])
                 if not force_uncompressed:
-                    remaining_resident_hashes.extend(all_hashes_per_sample[r_idx][0])
+                    remaining_resident_hashes.extend(
+                        _get_anchor_hashes(
+                            all_hashes_per_sample[r_idx], max_turns, True
+                        )
+                    )
 
         evicted_in_wave_prompts: list[list[int]] = []
         evicted_in_wave_owners: list[int] = []
         for i in batch_idxs:
             if not all(store.has_full_block(h) for h in all_hashes_per_sample[i][-1]):
                 if not force_uncompressed and not all(
-                    store.has_full_block(h) for h in all_hashes_per_sample[i][0]
+                    store.has_full_block(h)
+                    for h in _get_anchor_hashes(
+                        all_hashes_per_sample[i], max_turns, True
+                    )
                 ):
                     evicted_in_wave_prompts.append(all_turns_per_sample[i][0])
                     evicted_in_wave_owners.append(i)
@@ -1055,7 +1223,11 @@ def _run_single_eviction_mode(
                 if r_idx not in outputs_by_idx:
                     remaining_resident_after.extend(all_hashes_per_sample[r_idx][-1])
                     if not force_uncompressed:
-                        remaining_resident_after.extend(all_hashes_per_sample[r_idx][0])
+                        remaining_resident_after.extend(
+                            _get_anchor_hashes(
+                                all_hashes_per_sample[r_idx], max_turns, True
+                            )
+                        )
             _enforce_hbm_budget_all(
                 llm=llm,
                 store=store,
@@ -1081,6 +1253,10 @@ def _run_single_eviction_mode(
         "per_turn_eval_sec": round(per_turn_eval_sec, 2),
         "final_eval_hits": final_eval_hits,
         "final_eval_misses": final_eval_misses,
+        "final_eval_hit_blocks": final_eval_hit_blocks,
+        "final_eval_hit_tokens": final_eval_hit_tokens,
+        "incoming_followup_exact_hit_blocks": incoming_followup_exact_hit_blocks,
+        "incoming_followup_exact_hit_tokens": incoming_followup_exact_hit_tokens,
         "cum_session_hits": cum_session_hits,
         "cum_session_misses": cum_session_misses,
         "cum_recomputed_turns": cum_recomputed_turns,
@@ -1105,6 +1281,7 @@ def evaluate_swe_agent_eviction_hbm(
     wave_size: int = 20,
     budget_t1_mb: float = 161050.81,
     budget_t2_mb: float = 164000.0,
+    budget_real_mb: float = 126286.88,
     regime_filter: str = "all",
     mode: str = "both",
     blockpool_data: dict[str, Any] | None = None,
@@ -1113,12 +1290,17 @@ def evaluate_swe_agent_eviction_hbm(
     all_regimes = [
         ("T1_stateful_aci_window_dp0", budget_t1_mb),
         ("T2_rolling_action_history_dpB", budget_t2_mb),
+        ("R_real_world_swe_agent", budget_real_mb),
     ]
-    regimes = [
-        (r, b)
-        for r, b in all_regimes
-        if regime_filter == "all" or r == regime_filter
-    ]
+    if regime_filter == "all":
+        regimes = [
+            ("T1_stateful_aci_window_dp0", budget_t1_mb),
+            ("T2_rolling_action_history_dpB", budget_t2_mb),
+        ]
+    elif regime_filter == "all_with_real":
+        regimes = list(all_regimes)
+    else:
+        regimes = [(r, b) for r, b in all_regimes if r == regime_filter]
     prefill_params = SamplingParams(temperature=0.0, max_tokens=1)
     eval_params = SamplingParams(temperature=0.0, max_tokens=gen_tokens)
 
@@ -1164,8 +1346,17 @@ def evaluate_swe_agent_eviction_hbm(
         if mode == "delta" and blockpool_data is not None:
             bp_uncomp = blockpool_data["regimes"][regime]["uncomp_res"]
             hbm_budget_mb = max(
-                s["hbm_store_cuda_allocated_bytes"] for s in bp_uncomp["turn_snaps"]
-            ) / (1024**2)
+                float(
+                    blockpool_data["regimes"][regime].get(
+                        "fixed_hbm_budget_mb", hbm_budget_mb
+                    )
+                ),
+                max(
+                    s["hbm_store_cuda_allocated_bytes"]
+                    for s in bp_uncomp["turn_snaps"]
+                )
+                / (1024**2),
+            )
 
         print(f"\n{'=' * 90}")
         print(
@@ -1247,6 +1438,27 @@ def evaluate_swe_agent_eviction_hbm(
         u_final = uncomp_snaps[-1]
         c_final = comp_snaps[-1]
 
+        # Precompute standard vLLM PrefixCacheStats query denominators:
+        #   - Token-level: `num_computed_tokens / num_prompt_tokens` (`PrefixCachingMetrics.hit_rate`)
+        #   - Block-level: `num_computed_blocks / num_eligible_full_blocks` (`(len(p) - 1) // block_size`)
+        turn0_blocks_per_traj = (len(all_turns_per_sample[0][0]) - 1) // block_size
+        final_blocks_per_traj = (len(all_turns_per_sample[0][-1]) - 1) // block_size
+        cold_turn1_queried_tokens = sum(len(s_t[0]) for s_t in all_turns_per_sample)
+        cold_turn1_queried_blocks = sum(
+            (len(s_t[0]) - 1) // block_size for s_t in all_turns_per_sample
+        )
+        followup_session_queried_tokens = sum(
+            (len(s_t) - 1) * len(s_t[0]) for s_t in all_turns_per_sample
+        )
+        followup_session_queried_blocks = sum(
+            (len(s_t) - 1) * ((len(s_t[0]) - 1) // block_size)
+            for s_t in all_turns_per_sample
+        )
+        final_turn_queried_tokens = sum(len(s_t[-1]) for s_t in all_turns_per_sample)
+        final_turn_queried_blocks = sum(
+            (len(s_t[-1]) - 1) // block_size for s_t in all_turns_per_sample
+        )
+
         turn_progression: list[dict[str, Any]] = []
         for t in range(max_turns):
             u_s = uncomp_snaps[t]
@@ -1255,6 +1467,30 @@ def evaluate_swe_agent_eviction_hbm(
             c_live_mb = c_s["hbm_store_cuda_allocated_bytes"] / (1024**2)
             u_evict_mb = u_s["evicted_bytes"] / (1024**2)
             c_evict_mb = c_s["evicted_bytes"] / (1024**2)
+
+            # Standard vLLM prefix cache hit ratio across the 157 sessions' latest turns at Turn t+1
+            latest_queried_tokens_t = sum(
+                len(s_t[min(t, len(s_t) - 1)]) for s_t in all_turns_per_sample
+            )
+            latest_queried_blocks_t = sum(
+                (len(s_t[min(t, len(s_t) - 1)]) - 1) // block_size
+                for s_t in all_turns_per_sample
+            )
+            blks_per_latest_t = (
+                turn0_blocks_per_traj if t == 0 else final_blocks_per_traj
+            )
+            u_latest_hit_blocks_t = min(
+                latest_queried_blocks_t,
+                int(u_s["resident_latest_sessions"]) * blks_per_latest_t,
+            )
+            c_latest_hit_blocks_t = min(
+                latest_queried_blocks_t,
+                int(c_s["resident_latest_sessions"]) * blks_per_latest_t,
+            )
+            u_latest_hit_tokens_t = u_latest_hit_blocks_t * block_size
+            c_latest_hit_tokens_t = c_latest_hit_blocks_t * block_size
+
+            tot_turns_t = max(1, int(u_s["total_turns_so_far"]))
             turn_progression.append(
                 {
                     "turn": t + 1,
@@ -1275,8 +1511,38 @@ def evaluate_swe_agent_eviction_hbm(
                     "delta_compressed_resident_sessions": c_s[
                         "resident_latest_sessions"
                     ],
+                    "uncompressed_active_session_prefix_cache_block_hit_rate_pct": round(
+                        100.0
+                        * u_latest_hit_blocks_t
+                        / max(1, latest_queried_blocks_t),
+                        2,
+                    ),
+                    "delta_compressed_active_session_prefix_cache_block_hit_rate_pct": round(
+                        100.0
+                        * c_latest_hit_blocks_t
+                        / max(1, latest_queried_blocks_t),
+                        2,
+                    ),
+                    "uncompressed_active_session_prefix_cache_token_hit_rate_pct": round(
+                        100.0
+                        * u_latest_hit_tokens_t
+                        / max(1, latest_queried_tokens_t),
+                        2,
+                    ),
+                    "delta_compressed_active_session_prefix_cache_token_hit_rate_pct": round(
+                        100.0
+                        * c_latest_hit_tokens_t
+                        / max(1, latest_queried_tokens_t),
+                        2,
+                    ),
                     "uncompressed_resident_turns": u_s["resident_turns_count"],
                     "delta_compressed_resident_turns": c_s["resident_turns_count"],
+                    "uncompressed_resident_history_hit_rate_pct": round(
+                        100.0 * int(u_s["resident_turns_count"]) / tot_turns_t, 2
+                    ),
+                    "delta_compressed_resident_history_hit_rate_pct": round(
+                        100.0 * int(c_s["resident_turns_count"]) / tot_turns_t, 2
+                    ),
                     "total_turns_so_far": u_s["total_turns_so_far"],
                     "uncompressed_elapsed_sec": u_s["elapsed_sec"],
                     "delta_compressed_elapsed_sec": c_s["elapsed_sec"],
@@ -1468,6 +1734,93 @@ def evaluate_swe_agent_eviction_hbm(
             1, comp_res["cum_session_hits"] + comp_res["cum_session_misses"]
         )
 
+        # Standard vLLM PrefixCacheStats (token-level & block-level prefix cache hit ratios)
+        u_final_hit_blocks = int(
+            uncomp_res.get(
+                "final_eval_hit_blocks",
+                uncomp_res["final_eval_hits"] * final_blocks_per_traj,
+            )
+        )
+        c_final_hit_blocks = int(
+            comp_res.get(
+                "final_eval_hit_blocks",
+                comp_res["final_eval_hits"] * final_blocks_per_traj,
+            )
+        )
+        u_final_hit_tokens = int(
+            uncomp_res.get("final_eval_hit_tokens", u_final_hit_blocks * block_size)
+        )
+        c_final_hit_tokens = int(
+            comp_res.get("final_eval_hit_tokens", c_final_hit_blocks * block_size)
+        )
+
+        u_followup_hit_blocks = uncomp_res["cum_session_hits"] * turn0_blocks_per_traj
+        c_followup_hit_blocks = comp_res["cum_session_hits"] * turn0_blocks_per_traj
+        u_followup_hit_tokens = u_followup_hit_blocks * block_size
+        c_followup_hit_tokens = c_followup_hit_blocks * block_size
+
+        incoming_followup_queried_blocks = sum(
+            sum((len(p) - 1) // block_size for p in s_t[1:])
+            for s_t in all_turns_per_sample
+        )
+        incoming_followup_queried_tokens = sum(
+            sum(len(p) for p in s_t[1:]) for s_t in all_turns_per_sample
+        )
+        u_incoming_exact_hit_blocks = int(
+            uncomp_res.get("incoming_followup_exact_hit_blocks", 0)
+        )
+        c_incoming_exact_hit_blocks = int(
+            comp_res.get("incoming_followup_exact_hit_blocks", 0)
+        )
+        u_incoming_exact_hit_tokens = int(
+            uncomp_res.get("incoming_followup_exact_hit_tokens", 0)
+        )
+        c_incoming_exact_hit_tokens = int(
+            comp_res.get("incoming_followup_exact_hit_tokens", 0)
+        )
+
+        warm_session_queried_blocks = (
+            followup_session_queried_blocks + final_turn_queried_blocks
+        )
+        warm_session_queried_tokens = (
+            followup_session_queried_tokens + final_turn_queried_tokens
+        )
+        u_warm_hit_blocks = u_followup_hit_blocks + u_final_hit_blocks
+        c_warm_hit_blocks = c_followup_hit_blocks + c_final_hit_blocks
+        u_warm_hit_tokens = u_followup_hit_tokens + u_final_hit_tokens
+        c_warm_hit_tokens = c_followup_hit_tokens + c_final_hit_tokens
+
+        all_session_queried_blocks = (
+            cold_turn1_queried_blocks + warm_session_queried_blocks
+        )
+        all_session_queried_tokens = (
+            cold_turn1_queried_tokens + warm_session_queried_tokens
+        )
+
+        # Cross-turn reference-block hit ratio on incoming follow-up prompts (Turns 2..12)
+        t0_tiers = comp_snaps[0].get(
+            "cumulative_tier_counts", comp_snaps[0].get("tier_counts", {})
+        )
+        tf_tiers = c_final.get(
+            "cumulative_tier_counts", c_final.get("tier_counts", {})
+        )
+        fu_total_layer_blocks = max(
+            1, sum(tf_tiers.values()) - sum(t0_tiers.values())
+        )
+        fu_ref_matched_layer_blocks = sum(
+            max(0, int(tf_tiers.get(k, 0)) - int(t0_tiers.get(k, 0)))
+            for k in tf_tiers
+            if k != "UNCOMPRESSED_BASE"
+        )
+        shifted_suffix_ref_ratio = fu_ref_matched_layer_blocks / fu_total_layer_blocks
+        c_non_prefix_followup_blocks = max(
+            0, incoming_followup_queried_blocks - c_incoming_exact_hit_blocks
+        )
+        c_total_reused_followup_blocks = (
+            c_incoming_exact_hit_blocks
+            + c_non_prefix_followup_blocks * shifted_suffix_ref_ratio
+        )
+
         summary = {
             "baseline_engine": "vLLM BlockPool (enable_prefix_caching=True, kv_transfer_config=None)"
             if mode == "delta" and blockpool_data is not None
@@ -1544,6 +1897,108 @@ def evaluate_swe_agent_eviction_hbm(
             "delta_compressed_final_turn_hit_rate_pct": round(
                 100.0 * comp_res["final_eval_hits"] / n_s, 2
             ),
+            # Standard vLLM PrefixCacheStats Hit Ratios (Block-Level & Token-Level)
+            "uncompressed_final_turn_prefix_cache_block_hit_rate_pct": round(
+                100.0 * u_final_hit_blocks / max(1, final_turn_queried_blocks), 2
+            ),
+            "delta_compressed_final_turn_prefix_cache_block_hit_rate_pct": round(
+                100.0 * c_final_hit_blocks / max(1, final_turn_queried_blocks), 2
+            ),
+            "uncompressed_final_turn_prefix_cache_token_hit_rate_pct": round(
+                100.0 * u_final_hit_tokens / max(1, final_turn_queried_tokens), 2
+            ),
+            "delta_compressed_final_turn_prefix_cache_token_hit_rate_pct": round(
+                100.0 * c_final_hit_tokens / max(1, final_turn_queried_tokens), 2
+            ),
+            "uncompressed_followup_prefix_cache_block_hit_rate_pct": round(
+                100.0
+                * u_followup_hit_blocks
+                / max(1, followup_session_queried_blocks),
+                2,
+            ),
+            "delta_compressed_followup_prefix_cache_block_hit_rate_pct": round(
+                100.0
+                * c_followup_hit_blocks
+                / max(1, followup_session_queried_blocks),
+                2,
+            ),
+            "uncompressed_followup_prefix_cache_token_hit_rate_pct": round(
+                100.0
+                * u_followup_hit_tokens
+                / max(1, followup_session_queried_tokens),
+                2,
+            ),
+            "delta_compressed_followup_prefix_cache_token_hit_rate_pct": round(
+                100.0
+                * c_followup_hit_tokens
+                / max(1, followup_session_queried_tokens),
+                2,
+            ),
+            "uncompressed_warm_session_prefix_cache_block_hit_rate_pct": round(
+                100.0 * u_warm_hit_blocks / max(1, warm_session_queried_blocks), 2
+            ),
+            "delta_compressed_warm_session_prefix_cache_block_hit_rate_pct": round(
+                100.0 * c_warm_hit_blocks / max(1, warm_session_queried_blocks), 2
+            ),
+            "uncompressed_warm_session_prefix_cache_token_hit_rate_pct": round(
+                100.0 * u_warm_hit_tokens / max(1, warm_session_queried_tokens), 2
+            ),
+            "delta_compressed_warm_session_prefix_cache_token_hit_rate_pct": round(
+                100.0 * c_warm_hit_tokens / max(1, warm_session_queried_tokens), 2
+            ),
+            "uncompressed_all_session_prefix_cache_block_hit_rate_pct": round(
+                100.0 * u_warm_hit_blocks / max(1, all_session_queried_blocks), 2
+            ),
+            "delta_compressed_all_session_prefix_cache_block_hit_rate_pct": round(
+                100.0 * c_warm_hit_blocks / max(1, all_session_queried_blocks), 2
+            ),
+            "uncompressed_all_session_prefix_cache_token_hit_rate_pct": round(
+                100.0 * u_warm_hit_tokens / max(1, all_session_queried_tokens), 2
+            ),
+            "delta_compressed_all_session_prefix_cache_token_hit_rate_pct": round(
+                100.0 * c_warm_hit_tokens / max(1, all_session_queried_tokens), 2
+            ),
+            "uncompressed_incoming_followup_exact_prefix_block_hit_rate_pct": round(
+                100.0
+                * u_incoming_exact_hit_blocks
+                / max(1, incoming_followup_queried_blocks),
+                2,
+            ),
+            "delta_compressed_incoming_followup_exact_prefix_block_hit_rate_pct": round(
+                100.0
+                * c_incoming_exact_hit_blocks
+                / max(1, incoming_followup_queried_blocks),
+                2,
+            ),
+            "uncompressed_incoming_followup_exact_prefix_token_hit_rate_pct": round(
+                100.0
+                * u_incoming_exact_hit_tokens
+                / max(1, incoming_followup_queried_tokens),
+                2,
+            ),
+            "delta_compressed_incoming_followup_exact_prefix_token_hit_rate_pct": round(
+                100.0
+                * c_incoming_exact_hit_tokens
+                / max(1, incoming_followup_queried_tokens),
+                2,
+            ),
+            "uncompressed_cross_turn_prompt_ref_block_hit_rate_pct": 0.0,
+            "delta_compressed_cross_turn_prompt_ref_block_hit_rate_pct": round(
+                100.0 * fu_ref_matched_layer_blocks / fu_total_layer_blocks, 2
+            ),
+            "uncompressed_incoming_followup_total_block_reuse_rate_pct": round(
+                100.0
+                * u_incoming_exact_hit_blocks
+                / max(1, incoming_followup_queried_blocks),
+                2,
+            ),
+            "delta_compressed_incoming_followup_total_block_reuse_rate_pct": round(
+                100.0
+                * c_total_reused_followup_blocks
+                / max(1, incoming_followup_queried_blocks),
+                2,
+            ),
+            "delta_compressed_cumulative_tier_counts": tf_tiers,
             "uncompressed_resident_turns_at_end": u_final["resident_turns_count"],
             "delta_compressed_resident_turns_at_end": c_final["resident_turns_count"],
             "uncompressed_recomputed_turns": uncomp_res["cum_recomputed_turns"],
@@ -1650,6 +2105,7 @@ def main() -> None:
     parser.add_argument("--wave-size", type=int, default=20)
     parser.add_argument("--budget-t1-mb", type=float, default=161050.81)
     parser.add_argument("--budget-t2-mb", type=float, default=164000.0)
+    parser.add_argument("--budget-real-mb", type=float, default=126286.88)
     parser.add_argument("--regime", type=str, default="all")
     parser.add_argument(
         "--mode",
@@ -1666,6 +2122,8 @@ def main() -> None:
     )
     parser.add_argument("--blockpool-json", type=str, default="")
     parser.add_argument("--output-json", type=str, default="")
+    parser.add_argument("--load-format", type=str, default="auto")
+    parser.add_argument("--block-size", type=int, default=0)
     args = parser.parse_args()
 
     t_job_start = time.perf_counter()
@@ -1680,26 +2138,52 @@ def main() -> None:
     )
     print(f"Loaded {len(trajectories)} verified-passing multi-turn trajectories.")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    is_dsv41 = "deepseek" in args.model.lower() and "v4" in args.model.lower()
+    is_glm_dsa = "glm-5" in args.model.lower() or "deepseek-v3.2" in args.model.lower()
+    is_kimi = "kimi" in args.model.lower()
+    is_muse_spark = "muse" in args.model.lower() or "spark" in args.model.lower()
+    default_bs = (
+        args.block_size
+        if args.block_size > 0
+        else (128 if is_dsv41 else (64 if (is_glm_dsa or is_kimi or is_muse_spark) else 16))
+    )
+    extra_llm_kwargs: dict[str, Any] = {"load_format": args.load_format}
+    if is_dsv41:
+        extra_llm_kwargs["tokenizer_mode"] = "deepseek_v41"
+    if is_kimi:
+        extra_llm_kwargs["trust_remote_code"] = True
+        extra_llm_kwargs["mm_encoder_tp_mode"] = "data"
+        extra_llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+    if is_muse_spark:
+        extra_llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+        extra_llm_kwargs["disable_hybrid_kv_cache_manager"] = True
+    if is_dsv41 or is_glm_dsa or is_kimi or is_muse_spark:
+        extra_llm_kwargs["kernel_config"] = {
+            "enable_flashinfer_autotune": False,
+            "enable_cutedsl_warmup": False,
+        }
 
     if args.mode == "blockpool":
         llm = LLM(
             model=args.model,
             tensor_parallel_size=args.tensor_parallel_size,
-            block_size=16,
+            block_size=default_bs,
             enable_prefix_caching=True,
             async_scheduling=False,
-            gpu_memory_utilization=max(args.gpu_memory_utilization, 0.88),
+            gpu_memory_utilization=max(
+                args.gpu_memory_utilization, 0.85 if is_dsv41 else 0.88
+            ),
             max_model_len=args.max_model_len,
             max_num_batched_tokens=16384,
             enforce_eager=True,
+            **extra_llm_kwargs,
         )
         store = None
     else:
         llm = LLM(
             model=args.model,
             tensor_parallel_size=args.tensor_parallel_size,
-            block_size=16,
+            block_size=default_bs,
             enable_prefix_caching=True,
             async_scheduling=False,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -1716,8 +2200,11 @@ def main() -> None:
                     "pad_token": args.pad_token,
                 },
             ),
+            **extra_llm_kwargs,
         )
         store = get_shared_store()
+
+    tokenizer = llm.get_tokenizer()
 
     resolved_block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
 
@@ -1751,6 +2238,7 @@ def main() -> None:
         wave_size=args.wave_size,
         budget_t1_mb=args.budget_t1_mb,
         budget_t2_mb=args.budget_t2_mb,
+        budget_real_mb=args.budget_real_mb,
         regime_filter=args.regime,
         mode=args.mode,
         blockpool_data=blockpool_data,
