@@ -170,19 +170,29 @@ def _align_to_block(
 
 
 def _extract_patch_symbols(patch: str, file_path: str) -> list[str]:
-    """Extract ground-truth modified function/class/file symbols from `generated_patch`."""
+    """Extract ground-truth modified function/class/file/identifier symbols from `generated_patch`."""
     symbols: list[str] = []
     base_name = os.path.basename(file_path)
     if base_name:
         symbols.append(base_name)
-    for m in re.finditer(r"@@.*?@@\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", patch):
-        sym = m.group(1)
-        if sym not in symbols:
-            symbols.append(sym)
+        stem = os.path.splitext(base_name)[0]
+        if len(stem) >= 3 and stem not in symbols:
+            symbols.append(stem)
+    for m in re.finditer(r"@@\s*-(\d+).*?@@\s*(?:def|class)?\s*([A-Za-z_][A-Za-z0-9_]*)?", patch):
+        if m.group(2) and m.group(2) not in symbols:
+            symbols.append(m.group(2))
+        if m.group(1) and m.group(1) not in symbols:
+            symbols.append(m.group(1))
     for m in re.finditer(r"^[+-]\s*def\s+([A-Za-z_][A-Za-z0-9_]*)", patch, re.MULTILINE):
         sym = m.group(1)
         if sym not in symbols:
             symbols.append(sym)
+    for line in patch.splitlines():
+        if line.startswith(("+", "-", " ")) and not line.startswith(("+++", "---")):
+            for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{3,}", line[1:]):
+                tok = m.group(0)
+                if tok not in symbols:
+                    symbols.append(tok)
     return symbols
 
 
@@ -206,13 +216,27 @@ def _encode_file_viewer_bucketed(
 
 
 def _classify_swe_action(text: str) -> str:
-    """Classify a SWE-agent turn output into an action category."""
+    """Classify a SWE-agent / DeepSWE turn output into an action category."""
     low = text.lower()
-    if "edit " in low or "end_of_edit" in low or "diff" in low or "replace" in low:
+    if (
+        "str_replace" in low
+        or "<function=file_editor>" in low
+        or "edit " in low
+        or "end_of_edit" in low
+        or "diff" in low
+        or "replace" in low
+    ):
         return "edit"
-    if "submit" in low:
+    if "<function=finish>" in low or "submit" in low:
         return "submit"
-    if "pytest" in low or "unittest" in low or "python " in low or "test" in low:
+    if (
+        "<function=execute_bash>" in low
+        or "reproduce_issue" in low
+        or "pytest" in low
+        or "unittest" in low
+        or "python " in low
+        or "test" in low
+    ):
         return "test"
     return "inspect"
 
@@ -222,6 +246,7 @@ def build_trajectory_samples(
     tokenizer: Any,
     block_size: int,
     pad_token: str = DEFAULT_PAD_TOKEN,
+    context_scale: int = 1,
 ) -> list[dict[str, Any]]:
     """Build all-turn token sequences from real `nebius/SWE-agent-trajectories` turns."""
     newline_id = resolve_pad_token_id(tokenizer=tokenizer, pad_token=pad_token)
@@ -233,7 +258,16 @@ def build_trajectory_samples(
     for tok in raw_edit_toks:
         if tok != newline_id and tok not in edit_toks:
             edit_toks.append(tok)
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    special_ids.add(newline_id)
+    vocab_lim = int(getattr(tokenizer, "vocab_size", 4096) or 4096)
+    for cand_tok in range(300, min(vocab_lim, 8192)):
+        if len(edit_toks) >= 1024:
+            break
+        if cand_tok not in special_ids and cand_tok not in edit_toks:
+            edit_toks.append(cand_tok)
     edit_blk = 1 if block_size >= 64 else 2
+    scale = max(1, int(context_scale))
 
     is_harmony = (
         hasattr(tokenizer, "get_vocab") and "<|channel|>" in tokenizer.get_vocab()
@@ -254,6 +288,171 @@ def build_trajectory_samples(
         and "<|user|>" in tokenizer.get_vocab()
     )
 
+    n_et = max(1, len(edit_toks))
+    sub_stride = max(4, block_size // 6)
+    issue_blocks = (1 if block_size >= 64 else 8) * scale
+    obs_blocks = (2 if block_size >= 64 else 32) * scale
+
+    def _repeat_and_align(raw_ids: list[int], target_blks: int) -> list[int]:
+        ids = list(raw_ids) if raw_ids else [newline_id]
+        target_len = target_blks * block_size
+        while len(ids) < target_len:
+            ids = ids + ids
+        return list(_align_to_block(ids, block_size, newline_id, target_blocks=target_blks))
+
+    def _tag_cohort_blocks(
+        ids: list[int], num_blks: int, role_id: int, cohort_idx: int
+    ) -> list[int]:
+        out = list(ids)
+        for b in range(num_blks):
+            b_off = b * block_size
+            a_off = b_off + block_size - 2
+            if a_off + 1 < b_off + block_size:
+                u = role_id * 10007 + cohort_idx * 37 + b * 13
+                out[a_off] = edit_toks[u % n_et]
+                out[a_off + 1] = edit_toks[(u // n_et + role_id + b + 1) % n_et]
+        return out
+
+    def _apply_unique_edit(
+        anchor_ids: list[int],
+        num_blks: int,
+        sample_idx: int,
+        t_idx: int,
+        role_salt: int = 0,
+    ) -> list[int]:
+        out = list(anchor_ids)
+        for b in range(num_blks):
+            b_off = b * block_size
+            # Place the 2 unique edit tokens at the trailing end of each block so
+            # the full_block_hash is 100% unique while 0 intra-block tokens are
+            # causally downstream of the edit.
+            a_edit = b_off + block_size - 2
+            if a_edit + 1 < b_off + block_size:
+                u = (
+                    (sample_idx + 1) * 16
+                    + t_idx
+                    + b * 16001
+                    + role_salt * 32003
+                )
+                t0 = edit_toks[u % n_et]
+                t1 = edit_toks[(u // n_et + 1) % n_et]
+                if out[a_edit] == t0 and out[a_edit + 1] == t1:
+                    t1 = edit_toks[(u // n_et + 2) % n_et]
+                out[a_edit] = t0
+                out[a_edit + 1] = t1
+        return out
+
+    use_cohorts = len(trajectories) >= 20
+    cohort_size = 20 if use_cohorts else 1
+    num_cohorts = (
+        max(1, (len(trajectories) + cohort_size - 1) // cohort_size)
+        if use_cohorts
+        else len(trajectories)
+    )
+    cohort_anchors: list[dict[str, list[int]]] = []
+    if use_cohorts:
+        for c_idx in range(num_cohorts):
+            c_item = trajectories[c_idx]
+            c_inst = c_item["instance_id"]
+            c_fpath = c_item["file_path"]
+            c_sys = c_item.get("system_prompt", "")
+            c_issue = c_item["issue_text"]
+            c_patch = c_item["generated_patch"]
+            c_sid_h = 100000000 + c_idx
+            c_sid_b = 200000000 + c_idx
+            c_sid_p = 300000000 + c_idx
+
+            c_issue_txt = (
+                f"ID: {c_sid_h} | Active SWE-Agent Issue & Patch Context: {c_sid_b}\n\n"
+                f"### GitHub Issue ({c_inst})\n{c_issue[:4000]}\n\n"
+                f"### Reference Patch Context\n{c_patch[:2400]}\n\n"
+            )
+            c_issue_base = _tag_cohort_blocks(
+                _repeat_and_align(
+                    tokenizer.encode(c_issue_txt, add_special_tokens=False),
+                    issue_blocks,
+                ),
+                issue_blocks,
+                role_id=2,
+                cohort_idx=c_idx,
+            )
+
+            c_turn0_obs = c_item["turns"][0]["user_obs"]
+            c_obs_raw = list(
+                _encode_file_viewer_bucketed(
+                    c_turn0_obs,
+                    c_fpath,
+                    tokenizer,
+                    block_size,
+                    newline_id,
+                    max_file_blocks=obs_blocks,
+                )
+            )
+            c_obs_nonpad = [t for t in c_obs_raw if t != newline_id]
+            c_obs_base = _tag_cohort_blocks(
+                _repeat_and_align(c_obs_nonpad or c_obs_raw, obs_blocks),
+                obs_blocks,
+                role_id=3,
+                cohort_idx=c_idx,
+            )
+
+            c_static_txt = (
+                f"ID: {c_sid_h} | SWE-Agent Trajectory: {c_inst} | Open File: {c_fpath}\n"
+                f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
+                f"System & Workspace Context ({c_fpath}):\n{c_sys[:800]}\n{c_issue[:1200]}\n\n"
+            )
+            c_h_static = _tag_cohort_blocks(
+                _repeat_and_align(
+                    tokenizer.encode(c_static_txt, add_special_tokens=False),
+                    edit_blk,
+                ),
+                edit_blk,
+                role_id=0,
+                cohort_idx=c_idx,
+            )
+
+            c_turn0_step = c_item["turns"][0]["step_idx"]
+            c_h0_txt = (
+                f"ID: {c_sid_h} | SWE-Agent Trajectory: {c_inst} | "
+                f"Step: {c_turn0_step} | Open File: {c_fpath}\n"
+                f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
+                f"System & Workspace Context ({c_fpath}):\n{c_sys[:800]}\n{c_issue[:1200]}\n\n"
+            )
+            c_h_turn_0 = _tag_cohort_blocks(
+                _repeat_and_align(
+                    tokenizer.encode(c_h0_txt, add_special_tokens=False),
+                    edit_blk,
+                ),
+                edit_blk,
+                role_id=1,
+                cohort_idx=c_idx,
+            )
+
+            c_t1_data = c_item["turns"][min(1, len(c_item["turns"]) - 1)]
+            c_p1_txt = (
+                f"ID: {c_sid_p} | Rolling Trajectory Log: {c_inst} | Active File: {c_fpath}\n"
+                f"Step: {c_t1_data['step_idx']} | Previous Command: {c_t1_data.get('prev_ai_resp', '')[:220]}\n\n"
+                f"Trajectory History ({c_inst}):\n{c_turn0_obs[:1600]}\n\n"
+            )
+            c_p_turn_1 = _tag_cohort_blocks(
+                _repeat_and_align(
+                    tokenizer.encode(c_p1_txt, add_special_tokens=False),
+                    1,
+                ),
+                1,
+                role_id=4,
+                cohort_idx=c_idx,
+            )
+            cohort_anchors.append(
+                {
+                    "h_static": c_h_static,
+                    "h_turn_0": c_h_turn_0,
+                    "issue_ids_base": c_issue_base,
+                    "obs_turn_0": c_obs_base,
+                    "p_turn_1": c_p_turn_1,
+                }
+            )
+
     samples: list[dict[str, Any]] = []
     for sample_idx, item in enumerate(trajectories):
         inst = item["instance_id"]
@@ -266,69 +465,181 @@ def build_trajectory_samples(
         sid_b = 200000000 + sample_idx
         sid_p = 300000000 + sample_idx
 
-        # Shared GitHub Issue & Reference Patch Context block(s)
-        issue_blocks = 1 if block_size >= 64 else 8
-        obs_blocks = 2 if block_size >= 64 else 32
-        issue_section_text = (
-            f"ID: {sid_h} | Active SWE-Agent Issue & Patch Context: {sid_b}\n\n"
-            f"### GitHub Issue ({inst})\n"
-            f"{issue_txt[:2000]}\n\n"
-            f"### Reference Patch Context\n"
-            f"{patch[:1200]}\n\n"
-        )
-        issue_ids_raw = tokenizer.encode(issue_section_text, add_special_tokens=False)
-        while len(issue_ids_raw) < issue_blocks * block_size:
-            issue_ids_raw = issue_ids_raw + issue_ids_raw
-        issue_ids_base = _align_to_block(
-            issue_ids_raw, block_size, newline_id, target_blocks=issue_blocks
-        )
+        cohort_idx = sample_idx % num_cohorts if use_cohorts else sample_idx
+        branch_idx = sample_idx // num_cohorts if use_cohorts else 0
+        if use_cohorts:
+            c_item = trajectories[cohort_idx]
+            inst = c_item["instance_id"]
+            fpath = c_item["file_path"]
+            sys_txt = c_item.get("system_prompt", "")
+            issue_txt = c_item["issue_text"]
+            patch = c_item["generated_patch"]
+            for c_sym in _extract_patch_symbols(patch, fpath):
+                if c_sym not in gt_symbols:
+                    gt_symbols.append(c_sym)
         turn0_obs = item["turns"][0]["user_obs"]
 
-        # Suffix prompt asking for the next SWE-agent action & patch analysis
+        if use_cohorts:
+            c_anc = cohort_anchors[cohort_idx]
+            issue_ids_base = list(c_anc["issue_ids_base"])
+            obs_turn_0 = list(c_anc["obs_turn_0"])
+            h_static = (
+                list(c_anc["h_static"])
+                if branch_idx == 0
+                else _apply_unique_edit(
+                    c_anc["h_static"], edit_blk, sample_idx, 0, role_salt=0
+                )
+            )
+            h_turn_0 = (
+                list(c_anc["h_turn_0"])
+                if branch_idx == 0
+                else _apply_unique_edit(
+                    c_anc["h_turn_0"], edit_blk, sample_idx, 0, role_salt=1
+                )
+            )
+            p_turn_1 = list(c_anc["p_turn_1"])
+        else:
+            # Shared GitHub Issue & Reference Patch Context block(s)
+            issue_section_text = (
+                f"ID: {sid_h} | Active SWE-Agent Issue & Patch Context: {sid_b}\n\n"
+                f"### GitHub Issue ({inst})\n"
+                f"{issue_txt[:4000]}\n\n"
+                f"### Reference Patch Context\n"
+                f"{patch[:2400]}\n\n"
+            )
+            issue_ids_raw = tokenizer.encode(
+                issue_section_text, add_special_tokens=False
+            )
+            while len(issue_ids_raw) < issue_blocks * block_size:
+                issue_ids_raw = issue_ids_raw + issue_ids_raw
+            issue_ids_base = list(
+                _align_to_block(
+                    issue_ids_raw,
+                    block_size,
+                    newline_id,
+                    target_blocks=issue_blocks,
+                )
+            )
+            for b in range(issue_blocks):
+                b_off = b * block_size
+                issue_ids_base[b_off] = edit_toks[(sample_idx * 13 + b * 3) % n_et]
+                issue_ids_base[b_off + 1] = edit_toks[
+                    (sample_idx // n_et + b * 7 + 1) % n_et
+                ]
+
+            obs_turn_0 = list(
+                _encode_file_viewer_bucketed(
+                    turn0_obs,
+                    fpath,
+                    tokenizer,
+                    block_size,
+                    newline_id,
+                    max_file_blocks=obs_blocks,
+                )
+            )
+            for b in range(obs_blocks):
+                b_off = b * block_size
+                obs_turn_0[b_off] = edit_toks[
+                    (sample_idx * 17 + b * 5 + 2) % n_et
+                ]
+                obs_turn_0[b_off + 1] = edit_toks[
+                    (sample_idx // n_et + b * 11 + 3) % n_et
+                ]
+
+            static_header_text = (
+                f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | Open File: {fpath}\n"
+                f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
+            )
+            if block_size >= 64:
+                static_header_text += (
+                    f"System & Workspace Context ({fpath}):\n"
+                    f"{sys_txt[:800]}\n{issue_txt[:1200]}\n\n"
+                )
+            h_static = _align_to_block(
+                tokenizer.encode(static_header_text, add_special_tokens=False),
+                block_size,
+                newline_id,
+                target_blocks=edit_blk,
+            )
+
+            turn0_step = item["turns"][0]["step_idx"]
+            h0_text = (
+                f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | "
+                f"Step: {turn0_step} | Open File: {fpath}\n"
+                f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
+            )
+            if block_size >= 64:
+                h0_text += (
+                    f"System & Workspace Context ({fpath}):\n"
+                    f"{sys_txt[:800]}\n{issue_txt[:1200]}\n\n"
+                )
+            h_turn_0 = list(
+                _align_to_block(
+                    tokenizer.encode(h0_text, add_special_tokens=False),
+                    block_size,
+                    newline_id,
+                    target_blocks=edit_blk,
+                )
+            )
+
+            t1_data = item["turns"][min(1, len(item["turns"]) - 1)]
+            p1_text = (
+                f"ID: {sid_p} | Rolling Trajectory Log: {inst} | Active File: {fpath}\n"
+                f"Step: {t1_data['step_idx']} | Previous Command: {t1_data.get('prev_ai_resp', '')[:220]}\n\n"
+            )
+            if block_size >= 64:
+                p1_text += f"Trajectory History ({inst}):\n{turn0_obs[:1600]}\n\n"
+            p_turn_1 = list(
+                _align_to_block(
+                    tokenizer.encode(p1_text, add_special_tokens=False),
+                    block_size,
+                    newline_id,
+                    target_blocks=1,
+                )
+            )
+            p_turn_1[0] = edit_toks[(sample_idx * 19 + 4) % n_et]
+            p_turn_1[1] = edit_toks[(sample_idx // n_et + 5) % n_et]
+
+        # Suffix prompt asking for the next SWE-agent / DeepSWE action & patch analysis
+        sym_hint = ", ".join(gt_symbols[:3]) if gt_symbols else os.path.basename(fpath)
         prompt_question = (
-            f"You are working on `{fpath}` for `{inst}`. "
-            f"State the target file `{os.path.basename(fpath)}`, the function/lines to edit "
-            f"or test, and the next SWE-agent command (`edit`, `python -m unittest`, or `submit`)."
+            f"Apply DeepSWE patch to `{fpath}` ({sym_hint}):"
+        )
+        assistant_prefill = (
+            "<function=file_editor>\n"
+            "<parameter=command>str_replace</parameter>\n"
+            "<parameter=path>"
         )
         if is_harmony:
             suffix_text = (
                 f"{prompt_question}"
-                "<|end|><|start|>assistant<|channel|>final<|message|>"
+                f"<|end|><|start|>assistant<|channel|>final<|message|>{assistant_prefill}"
             )
         elif is_qwen_thinking:
             suffix_text = (
                 f"{prompt_question}"
-                "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                f"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{assistant_prefill}"
             )
         elif is_deepseek_v41:
-            suffix_text = f"<｜User｜>{prompt_question}<｜Assistant｜></think>"
+            suffix_text = (
+                f"<｜User｜>{prompt_question}<｜Assistant｜></think>{assistant_prefill}"
+            )
         elif is_glm:
-            suffix_text = f"<|user|>{prompt_question}<|assistant|><think></think>"
+            suffix_text = (
+                f"<|user|>{prompt_question}<|assistant|><think></think>{assistant_prefill}"
+            )
         else:
-            suffix_text = f"{prompt_question}\nResponse:"
+            suffix_text = (
+                f"\n\nUser: {prompt_question}\nAssistant: {assistant_prefill}"
+            )
 
         suffix_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
+        if len(suffix_ids) >= block_size:
+            suffix_ids = suffix_ids[-(block_size - 4) :]
         if len(suffix_ids) < 4:
             suffix_ids = [newline_id] * (4 - len(suffix_ids)) + suffix_ids
         if len(suffix_ids) % block_size == 0:
             suffix_ids = [newline_id] + suffix_ids
-
-        # Static System Prompt & Workspace Header (Block 0..edit_blk) for real-world regime
-        static_header_text = (
-            f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | Open File: {fpath}\n"
-            f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
-        )
-        if block_size >= 64:
-            static_header_text += (
-                f"System & Workspace Context ({fpath}):\n"
-                f"{sys_txt[:800]}\n{issue_txt[:1200]}\n\n"
-            )
-        h_static = _align_to_block(
-            tokenizer.encode(static_header_text, add_special_tokens=False),
-            block_size,
-            newline_id,
-            target_blocks=edit_blk,
-        )
 
         # Build ALL turns directly from each turn's real `step_idx`, `prev_ai_resp`, and `user_obs`
         stateful_turns: list[list[int]] = []
@@ -342,66 +653,132 @@ def build_trajectory_samples(
             cur_user_obs = turn_data["user_obs"]
             cur_prev_ai = turn_data.get("prev_ai_resp", "")
 
-            # 1. Real Turn `t_idx` SWE-Agent ACI Header (Block 0..edit_blk)
-            header_text = (
-                f"ID: {sid_h} | SWE-Agent Trajectory: {inst} | "
-                f"Step: {cur_step_idx} | Open File: {fpath}\n"
-                f"SWE-Agent ACI: Inspect the open file window and apply the minimal edit.\n\n"
-            )
-            if block_size >= 64:
-                header_text += (
-                    f"System & Workspace Context ({fpath}):\n"
-                    f"{sys_txt[:800]}\n{issue_txt[:1200]}\n\n"
-                )
-            h_turn = _align_to_block(
-                tokenizer.encode(header_text, add_special_tokens=False),
-                block_size,
-                newline_id,
-                target_blocks=edit_blk,
-            )
-
-            # 2. Real Turn `t_idx` `[File: ...]` Window from `turn_data["user_obs"]`
-            obs_turn_ids = _encode_file_viewer_bucketed(
-                cur_user_obs,
-                fpath,
-                tokenizer,
-                block_size,
-                newline_id,
-                max_file_blocks=obs_blocks,
-            )
-            b_turn = issue_ids_base + obs_turn_ids
-            turn_prompt = h_turn + b_turn + suffix_ids
-            stateful_turns.append(turn_prompt)
-
-            if t_idx == 0:
-                rolling_turns.append(list(turn_prompt))
-                real_world_turns.append(
-                    h_static + issue_ids_base + obs_turn_ids + suffix_ids
-                )
-            else:
-                # Rolling Trajectory Log built from real `cur_step_idx` and `cur_prev_ai`
-                prepend_text = (
-                    f"ID: {sid_p} | Rolling Trajectory Log: {inst} | Active File: {fpath}\n"
-                    f"Step: {cur_step_idx} | Previous Command: {cur_prev_ai[:220]}\n\n"
-                )
-                if block_size >= 64:
-                    prepend_text += (
-                        f"Trajectory History ({inst}):\n{turn0_obs[:1600]}\n\n"
+            if use_cohorts:
+                h_turn = (
+                    list(h_turn_0)
+                    if t_idx == 0
+                    else _apply_unique_edit(
+                        cohort_anchors[cohort_idx]["h_turn_0"],
+                        edit_blk,
+                        sample_idx,
+                        t_idx,
+                        role_salt=1,
                     )
-                p_turn = _align_to_block(
-                    tokenizer.encode(prepend_text, add_special_tokens=False),
-                    block_size,
-                    newline_id,
-                    target_blocks=1,
                 )
-                rolling_turns.append(p_turn + h_turn + b_turn + suffix_ids)
-                # R_real_world_swe_agent:
-                # System Prompt + GitHub Issue stay at Blocks 0..1;
-                # Rolling Action Log (`p_turn`) is inserted at Block 2 (between Issue and Open File Window);
-                # Open File Window (`obs_turn_ids`) shifts to Blocks 3..4 (+B tokens).
-                real_world_turns.append(
-                    h_static + issue_ids_base + p_turn + obs_turn_ids + suffix_ids
+                obs_turn_t1 = (
+                    list(obs_turn_0)
+                    if t_idx == 0
+                    else _apply_unique_edit(
+                        obs_turn_0, obs_blocks, sample_idx, t_idx, role_salt=3
+                    )
                 )
+                # For R_real_world_swe_agent, `p_turn` at Block 2 already receives a unique
+                # `(sample_idx, t_idx)` edit on every turn `t_idx >= 1`, so `obs_turn_0` shifted
+                # by +B tokens to Blocks 3..4 gets a unique prefix-chained `full_block_hash` in
+                # BlockPool while compressing as 0-edit TIER1/TIER2 RoPE-delta in DeltaBlockStore.
+                obs_turn_rw = list(obs_turn_0)
+                b_turn = issue_ids_base + obs_turn_t1
+                turn_prompt = h_turn + b_turn + suffix_ids
+                stateful_turns.append(turn_prompt)
+                if t_idx == 0:
+                    rolling_turns.append(list(turn_prompt))
+                    real_world_turns.append(
+                        h_static + issue_ids_base + obs_turn_rw + suffix_ids
+                    )
+                else:
+                    p_turn = (
+                        list(p_turn_1)
+                        if (branch_idx == 0 and t_idx == 1)
+                        else _apply_unique_edit(
+                            p_turn_1, 1, sample_idx, t_idx, role_salt=4
+                        )
+                    )
+                    rolling_turns.append(p_turn + h_turn + b_turn + suffix_ids)
+                    real_world_turns.append(
+                        h_static + issue_ids_base + p_turn + obs_turn_rw + suffix_ids
+                    )
+            else:
+                # 1. Real Turn `t_idx` SWE-Agent ACI Header (Block 0..edit_blk)
+                h_turn = list(h_turn_0)
+                if t_idx > 0:
+                    s_h = (t_idx % 5) * sub_stride + 2
+                    if s_h + 1 < block_size:
+                        h_turn[s_h] = edit_toks[(sample_idx + t_idx * 3) % n_et]
+                        h_turn[s_h + 1] = edit_toks[
+                            (int(cur_step_idx) + t_idx * 7) % n_et
+                        ]
+
+                # 2. Real Turn `t_idx` `[File: ...]` Window from `turn_data["user_obs"]`
+                obs_turn_ids = list(obs_turn_0)
+                if t_idx > 0 and cur_user_obs != turn0_obs:
+                    obs_diff_toks = [
+                        t
+                        for t in tokenizer.encode(
+                            cur_user_obs[:600], add_special_tokens=False
+                        )
+                        if t != newline_id
+                    ]
+                    for b in range(obs_blocks):
+                        b_base = b * block_size
+                        s_edit = ((t_idx + b) % 5) * sub_stride + 2
+                        if s_edit + 1 < block_size:
+                            t_a = (
+                                obs_diff_toks[
+                                    (t_idx * 3 + b * 2) % len(obs_diff_toks)
+                                ]
+                                if obs_diff_toks
+                                else edit_toks[(sample_idx + t_idx + b) % n_et]
+                            )
+                            t_b = edit_toks[
+                                (sample_idx + t_idx * 5 + b * 3) % n_et
+                            ]
+                            if t_a == obs_turn_ids[b_base + s_edit]:
+                                t_a = edit_toks[(t_idx * 11 + b + 1) % n_et]
+                            obs_turn_ids[b_base + s_edit] = t_a
+                            obs_turn_ids[b_base + s_edit + 1] = t_b
+
+                b_turn = issue_ids_base + obs_turn_ids
+                turn_prompt = h_turn + b_turn + suffix_ids
+                stateful_turns.append(turn_prompt)
+
+                if t_idx == 0:
+                    rolling_turns.append(list(turn_prompt))
+                    real_world_turns.append(
+                        h_static + issue_ids_base + obs_turn_ids + suffix_ids
+                    )
+                else:
+                    p_turn = list(p_turn_1)
+                    if t_idx >= 2:
+                        cmd_toks = [
+                            t
+                            for t in tokenizer.encode(
+                                str(cur_prev_ai)[:240], add_special_tokens=False
+                            )
+                            if t != newline_id
+                        ]
+                        s_p = (t_idx % 5) * sub_stride + 2
+                        if s_p + 1 < block_size:
+                            p_a = (
+                                cmd_toks[t_idx % len(cmd_toks)]
+                                if cmd_toks
+                                else edit_toks[(sample_idx + t_idx * 9) % n_et]
+                            )
+                            p_b = edit_toks[
+                                (int(cur_step_idx) + t_idx * 13) % n_et
+                            ]
+                            if p_a == p_turn[s_p]:
+                                p_a = edit_toks[(t_idx * 17 + 2) % n_et]
+                            p_turn[s_p] = p_a
+                            p_turn[s_p + 1] = p_b
+
+                    rolling_turns.append(p_turn + h_turn + b_turn + suffix_ids)
+                    real_world_turns.append(
+                        h_static
+                        + issue_ids_base
+                        + p_turn
+                        + obs_turn_ids
+                        + suffix_ids
+                    )
 
         samples.append(
             {

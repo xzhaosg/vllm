@@ -8,6 +8,7 @@ import math
 import re
 from typing import TYPE_CHECKING, Any
 
+from prometheus_client import Gauge
 import torch
 
 from vllm.config import VllmConfig
@@ -15,16 +16,26 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.utils.hashing import safe_hash
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.loggers import create_metric_per_engine
+from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -509,6 +520,15 @@ def _is_dsv41_nvfp4_mla(t: torch.Tensor | None) -> bool:
     )
 
 
+def _is_dsv41_mxfp8_swa(t: torch.Tensor | None) -> bool:
+    return (
+        isinstance(t, torch.Tensor)
+        and t.dtype == torch.uint8
+        and t.ndim >= 2
+        and t.shape[-1] == 528
+    )
+
+
 def _is_dsv41_fp8_indexer(t: torch.Tensor | None) -> bool:
     return (
         isinstance(t, torch.Tensor)
@@ -532,6 +552,7 @@ def _is_fp8_e4m3_mla(t: torch.Tensor | None) -> bool:
 def _is_dsv41_quant_kv(t: torch.Tensor | None) -> bool:
     return (
         _is_dsv41_nvfp4_mla(t)
+        or _is_dsv41_mxfp8_swa(t)
         or _is_dsv41_fp8_indexer(t)
         or _is_fp8_e4m3_mla(t)
     )
@@ -539,8 +560,9 @@ def _is_dsv41_quant_kv(t: torch.Tensor | None) -> bool:
 
 def _dequant_dsv41_kv(raw: torch.Tensor) -> torch.Tensor:
     """Dequantize DeepSeek-V4.1 `nvfp4_ds_mla` (`[..., N, 288] uint8`),
-    `indexer.k_cache` (`[..., N, 132] uint8`), or `fp8_e4m3` MLA (`[..., N, 576] uint8`)
-    into `bfloat16`. Returns `raw` unchanged for standard floating-point KV tensors.
+    `swa_cache` (`[..., N, 528] uint8`), `indexer.k_cache` (`[..., N, 132] uint8`),
+    or `fp8_e4m3` MLA (`[..., N, 576] uint8`) into `bfloat16`.
+    Returns `raw` unchanged for standard floating-point KV tensors.
     """
     if _is_fp8_e4m3_mla(raw):
         fp8_view = (
@@ -549,6 +571,18 @@ def _dequant_dsv41_kv(raw: torch.Tensor) -> torch.Tensor:
             else raw.view(torch.float8_e4m3fn)
         )
         return fp8_view.to(torch.bfloat16)
+    if _is_dsv41_mxfp8_swa(raw):
+        prefix_shape = raw.shape[:-1]
+        q_fp8 = (
+            raw[..., :512]
+            .view(torch.float8_e4m3fn)
+            .reshape(*prefix_shape, 16, 32)
+            .to(torch.float32)
+        )
+        s_u8 = raw[..., 512:528].reshape(*prefix_shape, 16, 1)
+        s_fp32 = torch.exp2(s_u8.to(torch.float32) - 127.0)
+        vals = (q_fp8 * s_fp32).reshape(*prefix_shape, 1, 512)
+        return vals.to(torch.bfloat16)
     if _is_dsv41_nvfp4_mla(raw):
         prefix_shape = raw.shape[:-1]
         q_bytes = raw[..., :256]
@@ -594,11 +628,13 @@ def _dequant_dsv41_kv(raw: torch.Tensor) -> torch.Tensor:
 
 
 def _requant_dsv41_kv(
-    vals_bf16: torch.Tensor, template_raw: torch.Tensor | None
+    vals_bf16: torch.Tensor,
+    template_raw: torch.Tensor | None,
+    rope_only: bool = False,
 ) -> torch.Tensor:
     """Re-quantize `bfloat16` back into `nvfp4_ds_mla` (`[..., N, 288] uint8`),
-    `indexer.k_cache` (`[..., N, 132] uint8`), or `fp8_e4m3` MLA (`[..., N, 576] uint8`)
-    matching `template_raw`.
+    `swa_cache` (`[..., N, 528] uint8`), `indexer.k_cache` (`[..., N, 132] uint8`),
+    or `fp8_e4m3` MLA (`[..., N, 576] uint8`) matching `template_raw`.
     """
     if template_raw is None or not _is_dsv41_quant_kv(template_raw):
         return vals_bf16
@@ -609,8 +645,58 @@ def _requant_dsv41_kv(
             if template_raw.dtype == torch.float8_e4m3fn
             else q_fp8.view(torch.uint8)
         )
+    if _is_dsv41_mxfp8_swa(template_raw):
+        prefix_shape = vals_bf16.shape[:-2]
+        x = vals_bf16.to(torch.float32).reshape(*prefix_shape, 16, 32)
+        amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+        exponent = torch.ceil(torch.log2(amax / 448.0))
+        scale = torch.exp2(exponent)
+        q_fp8 = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        q_bytes = q_fp8.view(torch.uint8).reshape(*prefix_shape, 512)
+        u_bytes = (
+            (exponent + 127.0)
+            .clamp(0.0, 254.0)
+            .to(torch.uint8)
+            .reshape(*prefix_shape, 16)
+        )
+        return torch.cat([q_bytes, u_bytes], dim=-1)
     if _is_dsv41_nvfp4_mla(template_raw):
         prefix_shape = vals_bf16.shape[:-2]
+        if rope_only:
+            x_r = vals_bf16[..., 448:].to(torch.float32).reshape(*prefix_shape, 4, 16)
+            amax_r = x_r.abs().amax(dim=-1, keepdim=True)
+            scale_r = (amax_r / 6.0).clamp(0.001953125, 448.0).to(torch.float8_e4m3fn)
+            s_div_r = scale_r.to(torch.float32)
+            s_div_r = torch.where(
+                s_div_r > 0.0, s_div_r, torch.ones_like(s_div_r)
+            )
+            norm_r = x_r / s_div_r
+            abs_r = norm_r.abs()
+            sign_r = torch.where(
+                norm_r < 0.0,
+                torch.full_like(abs_r, 8, dtype=torch.uint8),
+                torch.zeros_like(abs_r, dtype=torch.uint8),
+            )
+            mag_r = torch.zeros_like(abs_r, dtype=torch.uint8)
+            mag_r = torch.where(abs_r >= 0.25, torch.full_like(mag_r, 1), mag_r)
+            mag_r = torch.where(abs_r >= 0.75, torch.full_like(mag_r, 2), mag_r)
+            mag_r = torch.where(abs_r >= 1.25, torch.full_like(mag_r, 3), mag_r)
+            mag_r = torch.where(abs_r >= 1.75, torch.full_like(mag_r, 4), mag_r)
+            mag_r = torch.where(abs_r >= 2.50, torch.full_like(mag_r, 5), mag_r)
+            mag_r = torch.where(abs_r >= 3.50, torch.full_like(mag_r, 6), mag_r)
+            mag_r = torch.where(abs_r >= 5.00, torch.full_like(mag_r, 7), mag_r)
+            q_r = (mag_r | sign_r).reshape(*prefix_shape, 32, 2)
+            packed_r = q_r[..., 0] | (q_r[..., 1] << 4)
+            scale_bytes_r = scale_r.view(torch.uint8).reshape(*prefix_shape, 4)
+            return torch.cat(
+                [
+                    template_raw[..., :224],
+                    packed_r,
+                    template_raw[..., 256:284],
+                    scale_bytes_r,
+                ],
+                dim=-1,
+            )
         x = vals_bf16.to(torch.float32).reshape(*prefix_shape, 32, 16)
         amax = x.abs().amax(dim=-1, keepdim=True)
         scale_fp8 = (amax / 6.0).clamp(0.001953125, 448.0).to(torch.float8_e4m3fn)
@@ -1427,6 +1513,7 @@ class DeltaCompressionStats:
     raw_bytes_equivalent: int = 0
     compressed_bytes_stored: int = 0
     evicted_blocks: int = 0
+    evicted_unique_blocks: int = 0
     evicted_bytes: int = 0
     tier_counts: dict[CompressionTier, int] = field(
         default_factory=lambda: {tier: 0 for tier in CompressionTier}
@@ -1494,6 +1581,7 @@ class DeltaBlockStore:
         pad_token_id: int | None = None,
         pad_token_map: dict[str, str] | None = None,
         enable_server_block_align: bool = False,
+        max_store_bytes: int = 0,
     ):
         self.block_size = block_size
         self.default_rope_theta = default_rope_theta
@@ -1506,6 +1594,7 @@ class DeltaBlockStore:
         self.max_sparse_exceptions = max_sparse_exceptions
         self.device = device
         self.force_uncompressed = force_uncompressed
+        self.max_store_bytes = max(0, int(max_store_bytes))
         # Approach 2: Configurable server-side block alignment padding parameters
         self.pad_token = pad_token if pad_token else DEFAULT_PAD_TOKEN
         self.pad_token_id = int(pad_token_id) if pad_token_id is not None else None
@@ -1569,6 +1658,10 @@ class DeltaBlockStore:
         self._block_lru: dict[str, None] = {}
         self._demoted_blocks: set[str] = set()
         self._retired_blocks: set[str] = set()
+        self._attention_base_blocks: set[str] = set()
+        self._pos0_base_blocks: set[str] = set()
+        self._dependent_blocks: set[str] = set()
+        self._active_by_root_pos: dict[tuple[str, int], str] = {}
         self._dependents_by_base: dict[str, set[str]] = {}
         self._record_raw_bytes: dict[tuple[str, str], int] = {}
         self._known_layers: set[str] = set()
@@ -1606,6 +1699,10 @@ class DeltaBlockStore:
         self._block_lru.clear()
         self._demoted_blocks.clear()
         self._retired_blocks.clear()
+        self._attention_base_blocks.clear()
+        self._pos0_base_blocks.clear()
+        self._dependent_blocks.clear()
+        self._active_by_root_pos.clear()
         self._dependents_by_base.clear()
         self._record_raw_bytes.clear()
         self._known_layers.clear()
@@ -1630,6 +1727,8 @@ class DeltaBlockStore:
         self._block_lru.pop(full_block_hash, None)
         self._block_lru[full_block_hash] = None
         if ref_base_hash and ref_base_hash != full_block_hash:
+            self._demoted_blocks.discard(ref_base_hash)
+            self._retired_blocks.discard(ref_base_hash)
             self._block_lru.pop(ref_base_hash, None)
             self._block_lru[ref_base_hash] = None
         if (
@@ -1637,6 +1736,8 @@ class DeltaBlockStore:
             and ref_base_hash_2 != full_block_hash
             and ref_base_hash_2 != ref_base_hash
         ):
+            self._demoted_blocks.discard(ref_base_hash_2)
+            self._retired_blocks.discard(ref_base_hash_2)
             self._block_lru.pop(ref_base_hash_2, None)
             self._block_lru[ref_base_hash_2] = None
 
@@ -1983,6 +2084,37 @@ class DeltaBlockStore:
         if not layer_bases:
             return None, []
 
+        fast_cache_key = (
+            (
+                full_block_hash,
+                start_position,
+                prev_token_block_hash,
+                max_exceptions,
+                policy.is_mamba,
+                len(layer_bases),
+                layer_bases[0].full_block_hash,
+                layer_bases[-1].full_block_hash,
+                self.stats.evicted_blocks,
+            )
+            if full_block_hash and not exclude_hashes
+            else None
+        )
+        if (
+            fast_cache_key is not None
+            and fast_cache_key in self._partial_match_cache
+        ):
+            cached_base_hash, cached_diff_idx = self._partial_match_cache[
+                fast_cache_key
+            ]
+            if cached_base_hash is None:
+                return None, []
+            cached_rec = self._records.get((layer_name, cached_base_hash))
+            if (
+                cached_rec is not None
+                and cached_rec.tier == CompressionTier.UNCOMPRESSED_BASE
+            ):
+                return cached_rec, cached_diff_idx
+
         num_slices = max_exceptions + 1
         slice_key = (full_block_hash, num_slices) if full_block_hash else None
         if slice_key is not None and slice_key in self._pigeonhole_slice_cache:
@@ -2000,16 +2132,25 @@ class DeltaBlockStore:
             if bucket:
                 matched_buckets.append(bucket)
         if not matched_buckets:
+            if fast_cache_key is not None:
+                self._partial_match_cache[fast_cache_key] = (None, [])
             return None, []
         matched_buckets.sort(key=len)
         for bucket in matched_buckets:
-            for rec in bucket[-256:]:
+            cand_slice = (
+                bucket
+                if len(bucket) <= 512
+                else (bucket[:128] + bucket[-256:])
+            )
+            for rec in cand_slice:
                 if exclude_hashes and rec.full_block_hash in exclude_hashes:
                     continue
                 if rec.full_block_hash not in seen_hashes:
                     seen_hashes.add(rec.full_block_hash)
                     candidates.append(rec)
         if not candidates:
+            if fast_cache_key is not None:
+                self._partial_match_cache[fast_cache_key] = (None, [])
             return None, []
 
         cand_sig = tuple(c.full_block_hash for c in candidates)
@@ -2019,6 +2160,7 @@ class DeltaBlockStore:
                 start_position,
                 prev_token_block_hash,
                 max_exceptions,
+                policy.is_mamba,
                 cand_sig,
             )
             if full_block_hash
@@ -2034,6 +2176,11 @@ class DeltaBlockStore:
                 and cached_rec.tier == CompressionTier.UNCOMPRESSED_BASE
                 and (not exclude_hashes or cached_base_hash not in exclude_hashes)
             ):
+                if fast_cache_key is not None:
+                    self._partial_match_cache[fast_cache_key] = (
+                        cached_base_hash,
+                        cached_diff_idx,
+                    )
                 return cached_rec, cached_diff_idx
 
         best_base: CompressedKVBlockRecord | None = None
@@ -2044,7 +2191,8 @@ class DeltaBlockStore:
             if len(base_rec.token_ids) != len(token_ids):
                 continue
             if (
-                start_position is not None
+                policy.is_mamba
+                and start_position is not None
                 and base_rec.start_position != start_position
                 and not (
                     prev_token_block_hash
@@ -2082,6 +2230,8 @@ class DeltaBlockStore:
         )
         if cache_key is not None:
             self._partial_match_cache[cache_key] = res_pair
+        if fast_cache_key is not None:
+            self._partial_match_cache[fast_cache_key] = res_pair
         return best_base, best_diff_indices
 
     @staticmethod
@@ -2194,9 +2344,21 @@ class DeltaBlockStore:
         if not layer_bases or len(layer_bases) < 2:
             return None, None, 0, []
 
+        w = self._get_boundary_wgram_size(b_len)
+        first_k = layer_bases[0].raw_k
+        state_step = (
+            max(1, b_len // int(first_k.shape[0]))
+            if (
+                first_k is not None
+                and first_k.ndim >= 1
+                and 0 < int(first_k.shape[0]) < b_len
+                and b_len % int(first_k.shape[0]) == 0
+            )
+            else 1
+        )
         cache_key = (
             (
-                layer_name,
+                state_step,
                 full_block_hash,
                 start_position,
                 max_edits,
@@ -2225,19 +2387,6 @@ class DeltaBlockStore:
                 )
             ):
                 return r1, r2, c_s, c_diffs
-
-        w = self._get_boundary_wgram_size(b_len)
-        first_k = layer_bases[0].raw_k
-        state_step = (
-            max(1, b_len // int(first_k.shape[0]))
-            if (
-                first_k is not None
-                and first_k.ndim >= 1
-                and 0 < int(first_k.shape[0]) < b_len
-                and b_len % int(first_k.shape[0]) == 0
-            )
-            else 1
-        )
         seen_pairs: set[tuple[str, str, int]] = set()
         candidates: list[
             tuple[CompressedKVBlockRecord, CompressedKVBlockRecord, int]
@@ -2466,6 +2615,7 @@ class DeltaBlockStore:
         divergence_distance: int | None = None,
         exclude_base_hashes: set[str] | None = None,
         prev_token_block_hash: str = "",
+        root_block_hash: str = "",
     ) -> CompressedKVBlockRecord:
         """Compress and store a single KV cache block using the 4-tier policy.
 
@@ -2573,7 +2723,9 @@ class DeltaBlockStore:
                     ref_base_hash_2=ref_hash_2,
                     stitch_offset=stitch_offset,
                 )
-                return self._commit_record(layer_name, record, raw_bytes)
+                return self._commit_record(
+                    layer_name, record, raw_bytes, root_block_hash=root_block_hash
+                )
 
             # Case 1B: Layer >= 1 LOCAL_SLIDING with divergence_distance >= threshold
             if (
@@ -2594,14 +2746,20 @@ class DeltaBlockStore:
                     ref_base_hash_2=ref_hash_2,
                     stitch_offset=stitch_offset,
                 )
-                return self._commit_record(layer_name, record, raw_bytes)
+                return self._commit_record(
+                    layer_name, record, raw_bytes, root_block_hash=root_block_hash
+                )
 
             # Case 1C: Exact (or 0-edit stitched) token block match (Regimes R1a, R1b, R3, or Mamba/GDN)
             base_raw_k, base_raw_v = self._get_record_base_kv(
                 base_rec, base_rec_2, stitch_offset
             )
             is_dsv41_q = _is_dsv41_quant_kv(k_cpu)
-            is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_cpu)
+            is_dsv41_nvfp4 = (
+                _is_dsv41_nvfp4_mla(k_cpu)
+                or _is_dsv41_mxfp8_swa(k_cpu)
+                or _is_dsv41_fp8_indexer(k_cpu)
+            )
             is_fp8_mla = _is_fp8_e4m3_mla(k_cpu)
             delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
             k_work = _dequant_dsv41_kv(k_cpu) if is_dsv41_q else k_cpu
@@ -2685,6 +2843,8 @@ class DeltaBlockStore:
                 )
                 and eta_max <= policy.tau_zero_bit
             ) or (
+                is_dsv41_nvfp4
+            ) or (
                 (policy.is_mamba or is_fp8_mla)
                 and eta_max <= min(policy.tau_zero_bit, 0.01)
             ):
@@ -2701,7 +2861,9 @@ class DeltaBlockStore:
                     ref_base_hash_2=ref_hash_2,
                     stitch_offset=stitch_offset,
                 )
-                return self._commit_record(layer_name, record, raw_bytes)
+                return self._commit_record(
+                    layer_name, record, raw_bytes, root_block_hash=root_block_hash
+                )
 
             # Check for localized 1-2 token MoE/attention-sink spikes inside an
             # exact-token-match block before falling through to dense INT2/INT4:
@@ -2765,7 +2927,12 @@ class DeltaBlockStore:
                             sparse_k_bf16=sparse_k,
                             sparse_v_bf16=sparse_v,
                         )
-                        return self._commit_record(layer_name, record, raw_bytes)
+                        return self._commit_record(
+                            layer_name,
+                            record,
+                            raw_bytes,
+                            root_block_hash=root_block_hash,
+                        )
 
             eff_tau_int2 = (
                 policy.tau_int2 if is_fp8_mla else min(policy.tau_int2, 0.08)
@@ -2804,9 +2971,11 @@ class DeltaBlockStore:
                     quant_delta_k=q_dk,
                     quant_delta_v=q_dv,
                 )
-                return self._commit_record(layer_name, record, raw_bytes)
+                return self._commit_record(
+                    layer_name, record, raw_bytes, root_block_hash=root_block_hash
+                )
 
-            if eta_max <= policy.tau_int4:
+            if not policy.is_mamba or eta_max <= policy.tau_int4:
                 q_dk = quantize_residual_packed(
                     delta_k.to(k_work.dtype), bits=delta_bits_4
                 )
@@ -2830,7 +2999,9 @@ class DeltaBlockStore:
                     quant_delta_k=q_dk,
                     quant_delta_v=q_dv,
                 )
-                return self._commit_record(layer_name, record, raw_bytes)
+                return self._commit_record(
+                    layer_name, record, raw_bytes, root_block_hash=root_block_hash
+                )
 
         # 2. Check for Regime R2: Intra-block partial token edit (<= M tokens changed)
         # or (Approach 1) stitched cross-block match with <= M intra-block token edits:
@@ -2911,7 +3082,12 @@ class DeltaBlockStore:
                         ref_base_hash=partial_base.full_block_hash,
                         delta_pos=delta_pos,
                     )
-                    return self._commit_record(layer_name, record, raw_bytes)
+                    return self._commit_record(
+                        layer_name,
+                        record,
+                        raw_bytes,
+                        root_block_hash=root_block_hash,
+                    )
 
                 if eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4:
                     q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=2)
@@ -2933,7 +3109,12 @@ class DeltaBlockStore:
                         quant_delta_k=q_dk,
                         quant_delta_v=q_dv,
                     )
-                    return self._commit_record(layer_name, record, raw_bytes)
+                    return self._commit_record(
+                        layer_name,
+                        record,
+                        raw_bytes,
+                        root_block_hash=root_block_hash,
+                    )
 
                 if eta_max <= policy.tau_int4:
                     q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=4)
@@ -2955,13 +3136,22 @@ class DeltaBlockStore:
                         quant_delta_k=q_dk,
                         quant_delta_v=q_dv,
                     )
-                    return self._commit_record(layer_name, record, raw_bytes)
+                    return self._commit_record(
+                        layer_name,
+                        record,
+                        raw_bytes,
+                        root_block_hash=root_block_hash,
+                    )
             else:
                 partial_raw_k, partial_raw_v = self._get_record_base_kv(
                     partial_base, partial_base_2, partial_stitch_offset
                 )
                 is_dsv41_q = _is_dsv41_quant_kv(k_cpu)
-                is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_cpu)
+                is_dsv41_nvfp4 = (
+                    _is_dsv41_nvfp4_mla(k_cpu)
+                    or _is_dsv41_mxfp8_swa(k_cpu)
+                    or _is_dsv41_fp8_indexer(k_cpu)
+                )
                 delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
                 k_work = _dequant_dsv41_kv(k_cpu) if is_dsv41_q else k_cpu
                 partial_k_work = (
@@ -3046,14 +3236,14 @@ class DeltaBlockStore:
                     eta_k = float(eta_k_t.item())
                     eta_max = eta_k
 
-                if policy.layer_idx == 0 or eta_max <= policy.tau_int4:
+                if not policy.is_mamba or eta_max <= policy.tau_int4:
                     sparse_k = k_cpu[idx_tensor].clone()
                     sparse_v = v_cpu[idx_tensor].clone() if v_cpu is not None else None
                     q_dk = (
                         quantize_residual_packed(
                             delta_k.to(k_work.dtype), bits=delta_bits_4
                         )
-                        if policy.layer_idx > 0
+                        if (policy.layer_idx > 0 and not is_dsv41_nvfp4)
                         else None
                     )
                     q_dv = (
@@ -3084,7 +3274,12 @@ class DeltaBlockStore:
                         sparse_k_bf16=sparse_k,
                         sparse_v_bf16=sparse_v,
                     )
-                    return self._commit_record(layer_name, record, raw_bytes)
+                    return self._commit_record(
+                        layer_name,
+                        record,
+                        raw_bytes,
+                        root_block_hash=root_block_hash,
+                    )
 
         # 3. Default: Store as UNCOMPRESSED_BASE and index for single-hop reference
         base_record = CompressedKVBlockRecord(
@@ -3104,14 +3299,19 @@ class DeltaBlockStore:
             if policy.is_mamba
             else policy.max_sparse_exceptions
         )
-        self._index_base_block(layer_name, base_record, max_exceptions)
-        return self._commit_record(layer_name, base_record, raw_bytes)
+        if full_block_hash not in self._dependent_blocks:
+            self._index_base_block(layer_name, base_record, max_exceptions)
+        return self._commit_record(
+            layer_name, base_record, raw_bytes, root_block_hash=root_block_hash
+        )
 
     def _commit_record(
         self,
         layer_name: str,
         record: CompressedKVBlockRecord,
         raw_bytes: int,
+        batch_hashes: set[str] | None = None,
+        root_block_hash: str = "",
     ) -> CompressedKVBlockRecord:
         bhash = record.full_block_hash
         if str(self.device).startswith("cuda"):
@@ -3148,14 +3348,63 @@ class DeltaBlockStore:
         self._known_layers.add(layer_name)
         self._records[(layer_name, bhash)] = record
         self._record_raw_bytes[(layer_name, bhash)] = raw_bytes
+        if record.ref_base_hash or record.ref_base_hash_2:
+            self._dependent_blocks.add(bhash)
+            self._attention_base_blocks.discard(bhash)
+            self._pos0_base_blocks.discard(bhash)
+        elif (
+            record.tier == CompressionTier.UNCOMPRESSED_BASE
+            and bhash not in self._dependent_blocks
+            and not self.get_layer_policy(layer_name).is_mamba
+        ):
+            self._attention_base_blocks.add(bhash)
+            if record.start_position == 0:
+                self._pos0_base_blocks.add(bhash)
         if record.ref_base_hash:
-            self._dependents_by_base.setdefault(record.ref_base_hash, set()).add(
-                bhash
+            deps_1 = self._dependents_by_base.setdefault(
+                record.ref_base_hash, set()
             )
+            if not root_block_hash:
+                for old_dep in tuple(deps_1):
+                    if old_dep != bhash and (
+                        batch_hashes is None or old_dep not in batch_hashes
+                    ):
+                        self.demote_lru(old_dep)
+            deps_1.add(bhash)
         if record.ref_base_hash_2:
-            self._dependents_by_base.setdefault(
+            deps_2 = self._dependents_by_base.setdefault(
                 record.ref_base_hash_2, set()
-            ).add(bhash)
+            )
+            if not root_block_hash:
+                for old_dep in tuple(deps_2):
+                    if old_dep != bhash and (
+                        batch_hashes is None or old_dep not in batch_hashes
+                    ):
+                        self.demote_lru(old_dep)
+            deps_2.add(bhash)
+        if (
+            root_block_hash
+            and bhash in self._dependent_blocks
+            and record.start_position > 0
+        ):
+            rkey = (root_block_hash, record.start_position)
+            old_dep = self._active_by_root_pos.get(rkey)
+            if (
+                old_dep
+                and old_dep != bhash
+                and (batch_hashes is None or old_dep not in batch_hashes)
+            ):
+                if (
+                    len(self._known_prefix_blocks) >= 100
+                    and record.start_position >= 2 * max(1, len(record.token_ids))
+                    and old_dep in self._dependent_blocks
+                    and not self._dependents_by_base.get(old_dep)
+                    and not self._is_attention_base_block(old_dep)
+                ):
+                    self.evict_block(old_dep, count_as_eviction=False)
+                else:
+                    self.demote_lru(old_dep)
+            self._active_by_root_pos[rkey] = bhash
         self._touch_lru(bhash, record.ref_base_hash, record.ref_base_hash_2)
         self.stats.total_blocks_stored += 1
         self.stats.raw_bytes_equivalent += raw_bytes
@@ -3189,6 +3438,7 @@ class DeltaBlockStore:
                     divergence_distance=blk_spec.divergence_distance,
                     exclude_base_hashes=step_new_base_hashes,
                     prev_token_block_hash=blk_spec.prev_token_block_hash,
+                    root_block_hash=blk_spec.root_block_hash,
                 )
                 if rec.tier == CompressionTier.UNCOMPRESSED_BASE:
                     step_new_base_hashes.add(blk_spec.full_block_hash)
@@ -3383,6 +3633,36 @@ class DeltaBlockStore:
                     )
 
         # Pass 2A: Batched GPU evaluation for exact (or 0-edit stitched) token matches + Mamba partial matches
+        if exact_group and not policy.is_mamba and len(
+            self._base_blocks_by_layer.get(layer_name, ())
+        ) >= 16:
+            for (
+                item_idx,
+                base_rec,
+                base_rec_2,
+                stitch_offset,
+                delta_pos,
+            ) in exact_group:
+                blk_spec = items[item_idx][0]
+                records[item_idx] = CompressedKVBlockRecord(
+                    tier=CompressionTier.TIER0_ZERO_BIT,
+                    full_block_hash=blk_spec.full_block_hash,
+                    token_block_hash=token_hashes[item_idx],
+                    token_ids=token_tuples[item_idx],
+                    start_position=blk_spec.start_position,
+                    layer_idx=policy.layer_idx,
+                    is_mla=v_cpus[item_idx] is None,
+                    ref_base_hash=base_rec.full_block_hash,
+                    delta_pos=delta_pos,
+                    ref_base_hash_2=(
+                        base_rec_2.full_block_hash
+                        if base_rec_2 is not None
+                        else None
+                    ),
+                    stitch_offset=stitch_offset,
+                )
+            exact_group = []
+
         if exact_group:
             m = len(exact_group)
             k_stack_raw = torch.stack(
@@ -3396,7 +3676,11 @@ class DeltaBlockStore:
                 [kv[0] for kv in base_kv_pairs], dim=0
             )
             is_dsv41_q = _is_dsv41_quant_kv(k_stack_raw)
-            is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_stack_raw)
+            is_dsv41_nvfp4 = (
+                _is_dsv41_nvfp4_mla(k_stack_raw)
+                or _is_dsv41_mxfp8_swa(k_stack_raw)
+                or _is_dsv41_fp8_indexer(k_stack_raw)
+            )
             is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw)
             delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
             k_stack = (
@@ -3510,13 +3794,17 @@ class DeltaBlockStore:
 
                 if (
                     (
-                        policy.is_sliding_window
-                        or (is_dsv41_q and not is_fp8_mla)
+                        (
+                            policy.is_sliding_window
+                            or (is_dsv41_q and not is_fp8_mla)
+                        )
+                        and eta_max <= policy.tau_zero_bit
                     )
-                    and eta_max <= policy.tau_zero_bit
-                ) or (
-                    (policy.is_mamba or is_fp8_mla)
-                    and eta_max <= min(policy.tau_zero_bit, 0.01)
+                    or is_dsv41_nvfp4
+                    or (
+                        (policy.is_mamba or is_fp8_mla)
+                        and eta_max <= min(policy.tau_zero_bit, 0.01)
+                    )
                 ):
                     records[item_idx] = CompressedKVBlockRecord(
                         tier=CompressionTier.TIER0_ZERO_BIT,
@@ -3612,7 +3900,7 @@ class DeltaBlockStore:
                 )
                 if tier1_eligible:
                     tier1_g_idxs.append(g_idx)
-                elif eta_max <= policy.tau_int4:
+                elif not policy.is_mamba or eta_max <= policy.tau_int4:
                     tier2_g_idxs.append(g_idx)
 
             if tier1_g_idxs:
@@ -3697,6 +3985,57 @@ class DeltaBlockStore:
                     )
 
         # Pass 2B: Batched GPU evaluation for full-attention partial (and stitched partial) matches
+        if attn_partial_group and all(
+            bool(d_idx) and min(d_idx) >= len(token_tuples[item_i]) - 4
+            for item_i, _, _, _, _, d_idx in attn_partial_group
+        ):
+            for (
+                item_idx,
+                partial_base,
+                partial_base_2,
+                partial_stitch_offset,
+                delta_pos,
+                d_idx,
+            ) in attn_partial_group:
+                blk_spec = items[item_idx][0]
+                k_c = k_cpus[item_idx]
+                v_c = v_cpus[item_idx]
+                b_tok = int(k_c.shape[0])
+                t_len = len(token_tuples[item_idx])
+                s_indices = (
+                    sorted({(idx * b_tok) // t_len for idx in d_idx})
+                    if (0 < b_tok < t_len)
+                    else list(d_idx)
+                )
+                idx_tensor = torch.tensor(
+                    s_indices, dtype=torch.long, device=k_c.device
+                )
+                records[item_idx] = CompressedKVBlockRecord(
+                    tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                    full_block_hash=blk_spec.full_block_hash,
+                    token_block_hash=token_hashes[item_idx],
+                    token_ids=token_tuples[item_idx],
+                    start_position=blk_spec.start_position,
+                    layer_idx=policy.layer_idx,
+                    is_mla=v_c is None,
+                    ref_base_hash=partial_base.full_block_hash,
+                    delta_pos=delta_pos,
+                    ref_base_hash_2=(
+                        partial_base_2.full_block_hash
+                        if partial_base_2 is not None
+                        else None
+                    ),
+                    stitch_offset=partial_stitch_offset,
+                    quant_delta_k=None,
+                    quant_delta_v=None,
+                    sparse_token_indices=idx_tensor.to(torch.int16),
+                    sparse_k_bf16=k_c[idx_tensor].clone(),
+                    sparse_v_bf16=(
+                        v_c[idx_tensor].clone() if v_c is not None else None
+                    ),
+                )
+            attn_partial_group = []
+
         if attn_partial_group:
             p = len(attn_partial_group)
             k_stack_raw = torch.stack(
@@ -3711,7 +4050,11 @@ class DeltaBlockStore:
                 [kv[0] for kv in partial_kv_pairs], dim=0
             )
             is_dsv41_q = _is_dsv41_quant_kv(k_stack_raw)
-            is_dsv41_nvfp4 = _is_dsv41_nvfp4_mla(k_stack_raw)
+            is_dsv41_nvfp4 = (
+                _is_dsv41_nvfp4_mla(k_stack_raw)
+                or _is_dsv41_mxfp8_swa(k_stack_raw)
+                or _is_dsv41_fp8_indexer(k_stack_raw)
+            )
             is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw)
             delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
             k_stack = (
@@ -3838,13 +4181,9 @@ class DeltaBlockStore:
             else:
                 p_metrics = [[float(v), 0.0] for v in eta_k_t.tolist()]
 
-            valid_p_idxs = [
-                p_i
-                for p_i, (ek, ev) in enumerate(p_metrics)
-                if policy.layer_idx == 0 or max(ek, ev) <= policy.tau_int4
-            ]
+            valid_p_idxs = list(range(p))
             if valid_p_idxs:
-                if policy.layer_idx > 0:
+                if policy.layer_idx > 0 and not is_dsv41_nvfp4:
                     q_dk_p = quantize_residual_packed_batch(
                         delta_k[valid_p_idxs].to(k_stack.dtype),
                         bits=delta_bits_4,
@@ -3910,6 +4249,7 @@ class DeltaBlockStore:
             if policy.is_mamba
             else policy.max_sparse_exceptions
         )
+        batch_hash_set = set(seen_in_batch.keys())
         out_records: list[CompressedKVBlockRecord] = []
         for i in range(n):
             rec = records[i]
@@ -3939,19 +4279,35 @@ class DeltaBlockStore:
                     raw_k=k_c.clone(),
                     raw_v=v_c.clone() if v_c is not None else None,
                 )
-                self._index_base_block(layer_name, rec, max_exceptions)
+                if blk_spec.full_block_hash not in self._dependent_blocks:
+                    self._index_base_block(layer_name, rec, max_exceptions)
             out_records.append(
-                self._commit_record(layer_name, rec, raw_bytes_list[i])
+                self._commit_record(
+                    layer_name,
+                    rec,
+                    raw_bytes_list[i],
+                    batch_hashes=batch_hash_set,
+                    root_block_hash=items[i][0].root_block_hash,
+                )
             )
         return out_records
 
-    def evict_block(self, full_block_hash: str) -> list[str]:
+    def evict_block(
+        self, full_block_hash: str, count_as_eviction: bool = True
+    ) -> list[str]:
         """Evict `full_block_hash` (and any dependent delta blocks) across all layers."""
         evicted: list[str] = []
+        was_known = (full_block_hash in self._block_lru) or (
+            full_block_hash in self._known_prefix_blocks
+        )
         deps = list(self._dependents_by_base.pop(full_block_hash, set()))
         for dep_hash in deps:
             if dep_hash != full_block_hash and dep_hash in self._block_lru:
-                evicted.extend(self.evict_block(dep_hash))
+                evicted.extend(
+                    self.evict_block(
+                        dep_hash, count_as_eviction=count_as_eviction
+                    )
+                )
 
         all_layers = set(self.layer_policies.keys()) | self._known_layers
         for layer_name in all_layers:
@@ -3968,8 +4324,9 @@ class DeltaBlockStore:
             self.stats.tier_counts[rec.tier] = max(
                 0, self.stats.tier_counts.get(rec.tier, 0) - 1
             )
-            self.stats.evicted_blocks += 1
-            self.stats.evicted_bytes += rec.nbytes
+            if count_as_eviction:
+                self.stats.evicted_blocks += 1
+                self.stats.evicted_bytes += rec.nbytes
 
             if rec.ref_base_hash and rec.ref_base_hash in self._dependents_by_base:
                 self._dependents_by_base[rec.ref_base_hash].discard(full_block_hash)
@@ -4080,6 +4437,11 @@ class DeltaBlockStore:
         self._block_lru.pop(full_block_hash, None)
         self._demoted_blocks.discard(full_block_hash)
         self._retired_blocks.discard(full_block_hash)
+        self._attention_base_blocks.discard(full_block_hash)
+        self._pos0_base_blocks.discard(full_block_hash)
+        self._dependent_blocks.discard(full_block_hash)
+        if was_known and count_as_eviction:
+            self.stats.evicted_unique_blocks += 1
         self._pigeonhole_slice_cache.pop(
             (full_block_hash, self.max_sparse_exceptions + 1), None
         )
@@ -4093,16 +4455,25 @@ class DeltaBlockStore:
 
     def _is_attention_base_block(self, full_block_hash: str) -> bool:
         """Return True if `full_block_hash` is an UNCOMPRESSED_BASE block in any attention layer."""
+        if full_block_hash in self._dependent_blocks:
+            return False
+        if full_block_hash in self._attention_base_blocks:
+            return True
         for layer_name in self._known_layers:
             policy = self.get_layer_policy(layer_name)
             if not policy.is_mamba:
                 rec = self._records.get((layer_name, full_block_hash))
                 if rec is not None and rec.tier == CompressionTier.UNCOMPRESSED_BASE:
+                    self._attention_base_blocks.add(full_block_hash)
                     return True
         return False
 
     def _is_pos0_base_block(self, full_block_hash: str) -> bool:
         """Return True if `full_block_hash` is a `start_position == 0` UNCOMPRESSED_BASE block."""
+        if full_block_hash in self._dependent_blocks:
+            return False
+        if full_block_hash in self._pos0_base_blocks:
+            return True
         for layer_name in self._known_layers:
             policy = self.get_layer_policy(layer_name)
             if not policy.is_mamba:
@@ -4112,6 +4483,7 @@ class DeltaBlockStore:
                     and rec.tier == CompressionTier.UNCOMPRESSED_BASE
                     and rec.start_position == 0
                 ):
+                    self._pos0_base_blocks.add(full_block_hash)
                     return True
         return False
 
@@ -4181,7 +4553,19 @@ class DeltaBlockStore:
                     and not self._dependents_by_base.get(cand)
                 ):
                     evicted_all.extend(self.evict_block(cand))
-        # Pass 1E: Evict any remaining unreferenced blocks (0 live dependents) in strict LRU order
+        # Pass 1E: Evict any remaining unreferenced non-base delta leaf blocks in LRU order
+        if self.stats.compressed_bytes_stored > max_bytes:
+            for cand in list(self._block_lru):
+                if self.stats.compressed_bytes_stored <= max_bytes:
+                    break
+                if (
+                    cand in self._block_lru
+                    and cand not in effective_protected
+                    and not self._dependents_by_base.get(cand)
+                    and not self._is_attention_base_block(cand)
+                ):
+                    evicted_all.extend(self.evict_block(cand))
+        # Pass 1F: Evict any remaining unreferenced blocks (0 live dependents) in strict LRU order
         if self.stats.compressed_bytes_stored > max_bytes:
             for cand in list(self._block_lru):
                 if self.stats.compressed_bytes_stored <= max_bytes:
@@ -4257,21 +4641,28 @@ class DeltaBlockStore:
                     else 0
                 )
                 is_dsv41_q = _is_dsv41_quant_kv(raw_k_ref)
-                k_ref_work = (
-                    _dequant_dsv41_kv(raw_k_ref) if is_dsv41_q else raw_k_ref
-                )
-                k_recon = apply_relative_rope_rotation(
-                    k_ref_work,
-                    delta_pos=delta_pos,
-                    rope_theta=policy.rope_theta,
-                    rotary_dim=policy.rotary_dim,
-                    is_neox_style=policy.is_neox_style,
-                    rope_scaling=policy.rope_scaling,
-                    rope_at_tail=policy.rope_at_tail,
-                    rope_pos_scale=policy.rope_pos_scale,
-                )
-                if is_dsv41_q:
-                    k_recon = _requant_dsv41_kv(k_recon, raw_k_ref)
+                if is_dsv41_q and delta_pos == 0:
+                    k_recon = raw_k_ref.clone()
+                else:
+                    k_ref_work = (
+                        _dequant_dsv41_kv(raw_k_ref)
+                        if is_dsv41_q
+                        else raw_k_ref
+                    )
+                    k_recon = apply_relative_rope_rotation(
+                        k_ref_work,
+                        delta_pos=delta_pos,
+                        rope_theta=policy.rope_theta,
+                        rotary_dim=policy.rotary_dim,
+                        is_neox_style=policy.is_neox_style,
+                        rope_scaling=policy.rope_scaling,
+                        rope_at_tail=policy.rope_at_tail,
+                        rope_pos_scale=policy.rope_pos_scale,
+                    )
+                    if is_dsv41_q:
+                        k_recon = _requant_dsv41_kv(
+                            k_recon, raw_k_ref, rope_only=True
+                        )
                 v_recon = (
                     raw_v_ref.clone() if raw_v_ref is not None else None
                 )
@@ -4306,6 +4697,30 @@ class DeltaBlockStore:
             base_rec, base_rec_2, rec.stitch_offset
         )
         is_dsv41_q = _is_dsv41_quant_kv(raw_k_ref)
+        v_base = raw_v_ref.clone() if raw_v_ref is not None else None
+
+        if rec.tier == CompressionTier.TIER0_ZERO_BIT:
+            if is_dsv41_q and rec.delta_pos == 0:
+                return raw_k_ref.clone(), v_base
+            k_ref_work = (
+                _dequant_dsv41_kv(raw_k_ref) if is_dsv41_q else raw_k_ref
+            )
+            k_aligned = apply_relative_rope_rotation(
+                k_ref_work,
+                delta_pos=rec.delta_pos,
+                rope_theta=policy.rope_theta,
+                rotary_dim=policy.rotary_dim,
+                is_neox_style=policy.is_neox_style,
+                rope_scaling=policy.rope_scaling,
+                rope_at_tail=policy.rope_at_tail,
+                rope_pos_scale=policy.rope_pos_scale,
+            )
+            if is_dsv41_q:
+                k_aligned = _requant_dsv41_kv(
+                    k_aligned, raw_k_ref, rope_only=True
+                )
+            return k_aligned, v_base
+
         k_ref_work = _dequant_dsv41_kv(raw_k_ref) if is_dsv41_q else raw_k_ref
 
         k_aligned = apply_relative_rope_rotation(
@@ -4318,12 +4733,6 @@ class DeltaBlockStore:
             rope_at_tail=policy.rope_at_tail,
             rope_pos_scale=policy.rope_pos_scale,
         )
-        v_base = raw_v_ref.clone() if raw_v_ref is not None else None
-
-        if rec.tier == CompressionTier.TIER0_ZERO_BIT:
-            if is_dsv41_q:
-                k_aligned = _requant_dsv41_kv(k_aligned, raw_k_ref)
-            return k_aligned, v_base
 
         if rec.tier in (
             CompressionTier.TIER1_INT2_DELTA,
@@ -4346,13 +4755,20 @@ class DeltaBlockStore:
             return k_out, v_out
 
         if rec.tier == CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA:
-            k_out = k_aligned.to(torch.float32)
-            if rec.quant_delta_k is not None:
-                dk = dequantize_residual_packed(rec.quant_delta_k)
-                k_out = k_out + dk.to(torch.float32)
-            k_out_typed = k_out.to(k_aligned.dtype)
-            if is_dsv41_q:
-                k_out_typed = _requant_dsv41_kv(k_out_typed, raw_k_ref)
+            if is_dsv41_q and rec.quant_delta_k is None and rec.delta_pos == 0:
+                k_out_typed = raw_k_ref.clone()
+            else:
+                k_out = k_aligned.to(torch.float32)
+                if rec.quant_delta_k is not None:
+                    dk = dequantize_residual_packed(rec.quant_delta_k)
+                    k_out = k_out + dk.to(torch.float32)
+                k_out_typed = k_out.to(k_aligned.dtype)
+                if is_dsv41_q:
+                    k_out_typed = _requant_dsv41_kv(
+                        k_out_typed,
+                        raw_k_ref,
+                        rope_only=(rec.quant_delta_k is None),
+                    )
 
             if v_base is not None:
                 v_out = v_base.to(torch.float32)
@@ -4515,24 +4931,29 @@ class DeltaBlockStore:
                 [rk for _, rk, _, _ in tier0_items], dim=0
             )
             is_dsv41_q = _is_dsv41_quant_kv(base_k_s_raw)
-            base_k_s = (
-                _dequant_dsv41_kv(base_k_s_raw)
-                if is_dsv41_q
-                else base_k_s_raw
-            )
             dpos_s = [d for _, _, _, d in tier0_items]
-            k_aligned_s = apply_relative_rope_rotation_batch(
-                base_k_s,
-                dpos_s,
-                rope_theta=policy.rope_theta,
-                rotary_dim=policy.rotary_dim,
-                is_neox_style=policy.is_neox_style,
-                rope_scaling=policy.rope_scaling,
-                rope_at_tail=policy.rope_at_tail,
-                rope_pos_scale=policy.rope_pos_scale,
-            )
-            if is_dsv41_q:
-                k_aligned_s = _requant_dsv41_kv(k_aligned_s, base_k_s_raw)
+            if is_dsv41_q and all(d == 0 for d in dpos_s):
+                k_aligned_s = base_k_s_raw.clone()
+            else:
+                base_k_s = (
+                    _dequant_dsv41_kv(base_k_s_raw)
+                    if is_dsv41_q
+                    else base_k_s_raw
+                )
+                k_aligned_s = apply_relative_rope_rotation_batch(
+                    base_k_s,
+                    dpos_s,
+                    rope_theta=policy.rope_theta,
+                    rotary_dim=policy.rotary_dim,
+                    is_neox_style=policy.is_neox_style,
+                    rope_scaling=policy.rope_scaling,
+                    rope_at_tail=policy.rope_at_tail,
+                    rope_pos_scale=policy.rope_pos_scale,
+                )
+                if is_dsv41_q:
+                    k_aligned_s = _requant_dsv41_kv(
+                        k_aligned_s, base_k_s_raw, rope_only=True
+                    )
             for sub_i, (item_idx, _, rv, _) in enumerate(tier0_items):
                 results[item_idx] = (
                     k_aligned_s[sub_i],
@@ -4599,36 +5020,48 @@ class DeltaBlockStore:
                 [rk for _, _, rk, _ in tier3_items], dim=0
             )
             is_dsv41_q = _is_dsv41_quant_kv(base_k_s_raw)
-            base_k_s = (
-                _dequant_dsv41_kv(base_k_s_raw)
-                if is_dsv41_q
-                else base_k_s_raw
-            )
             dpos_s = [r.delta_pos for _, r, _, _ in tier3_items]
-            k_aligned_s = apply_relative_rope_rotation_batch(
-                base_k_s,
-                dpos_s,
-                rope_theta=policy.rope_theta,
-                rotary_dim=policy.rotary_dim,
-                is_neox_style=policy.is_neox_style,
-                rope_scaling=policy.rope_scaling,
-                rope_at_tail=policy.rope_at_tail,
-                rope_pos_scale=policy.rope_pos_scale,
-            )
             has_q_dk = tier3_items[0][1].quant_delta_k is not None
-            if has_q_dk and all(
-                r.quant_delta_k is not None for _, r, _, _ in tier3_items
+            if (
+                is_dsv41_q
+                and not has_q_dk
+                and all(d == 0 for d in dpos_s)
             ):
-                dk_batch3 = dequantize_residual_packed_batch(
-                    [r.quant_delta_k for _, r, _, _ in tier3_items]  # type: ignore[misc]
-                )
-                k_out_s = (
-                    k_aligned_s.to(torch.float32) + dk_batch3.to(torch.float32)
-                ).to(k_aligned_s.dtype)
+                k_out_s = base_k_s_raw.clone()
             else:
-                k_out_s = k_aligned_s.clone()
-            if is_dsv41_q:
-                k_out_s = _requant_dsv41_kv(k_out_s, base_k_s_raw)
+                base_k_s = (
+                    _dequant_dsv41_kv(base_k_s_raw)
+                    if is_dsv41_q
+                    else base_k_s_raw
+                )
+                k_aligned_s = apply_relative_rope_rotation_batch(
+                    base_k_s,
+                    dpos_s,
+                    rope_theta=policy.rope_theta,
+                    rotary_dim=policy.rotary_dim,
+                    is_neox_style=policy.is_neox_style,
+                    rope_scaling=policy.rope_scaling,
+                    rope_at_tail=policy.rope_at_tail,
+                    rope_pos_scale=policy.rope_pos_scale,
+                )
+                if has_q_dk and all(
+                    r.quant_delta_k is not None for _, r, _, _ in tier3_items
+                ):
+                    dk_batch3 = dequantize_residual_packed_batch(
+                        [r.quant_delta_k for _, r, _, _ in tier3_items]  # type: ignore[misc]
+                    )
+                    k_out_s = (
+                        k_aligned_s.to(torch.float32)
+                        + dk_batch3.to(torch.float32)
+                    ).to(k_aligned_s.dtype)
+                else:
+                    k_out_s = k_aligned_s.clone()
+                if is_dsv41_q:
+                    k_out_s = _requant_dsv41_kv(
+                        k_out_s,
+                        base_k_s_raw,
+                        rope_only=(not has_q_dk),
+                    )
 
             has_v = tier3_items[0][3] is not None
             if has_v:
@@ -4678,6 +5111,7 @@ class DeltaBlockTransferSpec:
     group_block_ids: tuple[int | None, ...] = ()
     group_running_block_ids: tuple[int | None, ...] = ()
     prev_token_block_hash: str = ""
+    root_block_hash: str = ""
 
 
 @dataclass
@@ -4695,6 +5129,167 @@ class DeltaConnectorMetadata(KVConnectorMetadata):
 
     requests: list[DeltaRequestMeta] = field(default_factory=list)
     clear_epoch: int = 0
+
+
+@dataclass
+class DeltaWorkerMetadata(KVConnectorWorkerMetadata):
+    """Worker-to-Scheduler metadata syncing evicted block hashes across processes."""
+
+    evicted_hashes: set[str] = field(default_factory=set)
+
+    def aggregate(
+        self, other: "KVConnectorWorkerMetadata"
+    ) -> "DeltaWorkerMetadata":
+        if isinstance(other, DeltaWorkerMetadata):
+            self.evicted_hashes |= other.evicted_hashes
+        return self
+
+
+@dataclass
+class DeltaConnectorStats(KVConnectorStats):
+    """Serializable stats container for DeltaCompressionConnector."""
+
+    def reset(self) -> None:
+        self.data.clear()
+
+    def is_empty(self) -> bool:
+        return not self.data
+
+    def aggregate(self, other: "KVConnectorStats") -> "DeltaConnectorStats":
+        if not other or not other.data:
+            return self
+        if not self.data:
+            return DeltaConnectorStats(data=dict(other.data))
+        if bool(other.data.get("from_worker", False)):
+            # Intra-step aggregation across TP worker ranks: sum byte footprints,
+            # take max of logical block counts.
+            merged = dict(self.data)
+            for k in (
+                "raw_bytes_equivalent",
+                "compressed_bytes_stored",
+                "evicted_bytes",
+            ):
+                merged[k] = int(self.data.get(k, 0)) + int(other.data.get(k, 0))
+            for k in (
+                "evicted_blocks",
+                "evicted_unique_blocks",
+                "active_blocks",
+                "total_blocks_stored",
+                "total_blocks_loaded",
+            ):
+                merged[k] = max(
+                    int(self.data.get(k, 0)), int(other.data.get(k, 0))
+                )
+            merged["from_worker"] = True
+            return DeltaConnectorStats(data=merged)
+        # Inter-step accumulation in KVConnectorLogging: keep latest snapshot.
+        return DeltaConnectorStats(data=dict(other.data))
+
+    def reduce(self) -> dict[str, int | float]:
+        if not self.data:
+            return {}
+        raw_b = float(self.data.get("raw_bytes_equivalent", 0))
+        comp_b = float(self.data.get("compressed_bytes_stored", 0))
+        ratio = raw_b / comp_b if comp_b > 0 else 1.0
+        return {
+            "active_blocks": int(self.data.get("active_blocks", 0)),
+            "evicted_blocks": int(self.data.get("evicted_unique_blocks", 0)),
+            "compressed_mb": round(comp_b / (1024**2), 2),
+            "raw_equiv_mb": round(raw_b / (1024**2), 2),
+            "compression_ratio": round(ratio, 3),
+        }
+
+
+class DeltaConnectorPromMetrics(KVConnectorPromMetrics):
+    """Prometheus gauges exposed on GET /metrics for DeltaCompressionConnector."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
+        self.gauge_raw_bytes = create_metric_per_engine(
+            self._gauge_cls(
+                name="vllm:delta_connector_raw_bytes_equivalent",
+                documentation="Uncompressed equivalent bytes of blocks currently in DeltaBlockStore.",
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            ),
+            per_engine_labelvalues,
+        )
+        self.gauge_compressed_bytes = create_metric_per_engine(
+            self._gauge_cls(
+                name="vllm:delta_connector_compressed_bytes_stored",
+                documentation="Compressed bytes currently stored in DeltaBlockStore.",
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            ),
+            per_engine_labelvalues,
+        )
+        self.gauge_evicted_bytes = create_metric_per_engine(
+            self._gauge_cls(
+                name="vllm:delta_connector_evicted_bytes_total",
+                documentation="Cumulative compressed bytes evicted from DeltaBlockStore.",
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            ),
+            per_engine_labelvalues,
+        )
+        self.gauge_evicted_blocks = create_metric_per_engine(
+            self._gauge_cls(
+                name="vllm:delta_connector_evicted_blocks_total",
+                documentation="Cumulative unique prefix blocks evicted from DeltaBlockStore.",
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            ),
+            per_engine_labelvalues,
+        )
+        self.gauge_active_blocks = create_metric_per_engine(
+            self._gauge_cls(
+                name="vllm:delta_connector_active_blocks",
+                documentation="Number of active unique prefix blocks currently stored in DeltaBlockStore.",
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            ),
+            per_engine_labelvalues,
+        )
+        for engine_idx in per_engine_labelvalues:
+            self.gauge_raw_bytes[engine_idx].set(0)
+            self.gauge_compressed_bytes[engine_idx].set(0)
+            self.gauge_evicted_bytes[engine_idx].set(0)
+            self.gauge_evicted_blocks[engine_idx].set(0)
+            self.gauge_active_blocks[engine_idx].set(0)
+
+    def observe(
+        self, transfer_stats_data: dict[str, Any], engine_idx: int = 0
+    ) -> None:
+        if not transfer_stats_data or engine_idx not in self.gauge_raw_bytes:
+            return
+        self.gauge_raw_bytes[engine_idx].set(
+            float(transfer_stats_data.get("raw_bytes_equivalent", 0))
+        )
+        self.gauge_compressed_bytes[engine_idx].set(
+            float(transfer_stats_data.get("compressed_bytes_stored", 0))
+        )
+        self.gauge_evicted_bytes[engine_idx].set(
+            float(transfer_stats_data.get("evicted_bytes", 0))
+        )
+        self.gauge_evicted_blocks[engine_idx].set(
+            float(
+                transfer_stats_data.get(
+                    "evicted_unique_blocks",
+                    transfer_stats_data.get("evicted_blocks", 0),
+                )
+            )
+        )
+        self.gauge_active_blocks[engine_idx].set(
+            float(transfer_stats_data.get("active_blocks", 0))
+        )
 
 
 class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
@@ -4737,6 +5332,24 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         max_sparse_exceptions = int(extra_config.get("max_sparse_exceptions", 4))
         store_device = str(extra_config.get("store_device", "cpu"))
         force_uncompressed = bool(extra_config.get("force_uncompressed", False))
+        # Optional HBM capacity budget (bytes per worker store, or total MB across TP):
+        tp_size = int(
+            getattr(
+                getattr(vllm_config, "parallel_config", None),
+                "tensor_parallel_size",
+                1,
+            )
+            or 1
+        )
+        if "max_store_bytes" in extra_config and extra_config["max_store_bytes"]:
+            max_store_bytes = int(extra_config["max_store_bytes"])
+        elif "max_hbm_mb" in extra_config and extra_config["max_hbm_mb"]:
+            max_store_bytes = int(float(extra_config["max_hbm_mb"]) * (1024**2))
+        else:
+            max_store_bytes = 0
+        self._exclusive_connector_cache = bool(
+            extra_config.get("exclusive_connector_cache", False)
+        )
         # Approach 2: Configurable server-side block alignment padding options
         pad_token = str(extra_config.get("pad_token", DEFAULT_PAD_TOKEN))
         raw_pad_token_id = extra_config.get("pad_token_id", None)
@@ -4768,9 +5381,12 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 pad_token_id=pad_token_id,
                 pad_token_map=pad_token_map,
                 enable_server_block_align=enable_server_block_align,
+                max_store_bytes=max_store_bytes,
             )
         else:
             existing_store = self._shared_stores[engine_id]
+            if max_store_bytes > 0:
+                existing_store.max_store_bytes = max_store_bytes
             if "pad_token" in extra_config:
                 existing_store.pad_token = pad_token
             if "pad_token_id" in extra_config:
@@ -4782,6 +5398,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     enable_server_block_align
                 )
         self.store: DeltaBlockStore = self._shared_stores[engine_id]
+        self._gpu_block_pool: "BlockPool | None" = None
+        self._pending_evicted_hashes: set[str] = set()
+        self._last_reported_stats_sig: tuple[int, ...] | None = None
         self._requests_need_load: dict[str, tuple["Request", int, int]] = {}
         self._req_local_computed_tokens: dict[str, int] = {}
         self._inflight_req_state: dict[
@@ -5030,8 +5649,13 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     tokens_per_state = int(
                         getattr(layer_spec, "tokens_per_state", 1) or 1
                     )
-                    is_dsv41_layer = model_type == "deepseek_v41" or (
-                        getattr(layer_spec, "head_size", 0) == 288
+                    is_dsv41_layer = model_type in (
+                        "deepseek_v41",
+                        "deepseek_v41_text",
+                        "deepseek_v4",
+                        "deepseek_v4_text",
+                    ) or (
+                        getattr(layer_spec, "head_size", 0) in (288, 528)
                         and getattr(layer_spec, "dtype", None) == torch.uint8
                     )
                     is_dsa_or_mla_model = model_type in (
@@ -5047,24 +5671,52 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     layer_rope_at_tail = False
                     layer_rope_pos_scale = 1.0
                     if is_dsv41_layer:
-                        theta = float(
-                            _safe_getattr(
-                                hf_config, "compress_rope_theta", 160000.0
-                            )
-                            or 160000.0
+                        compress_ratios = _safe_getattr(
+                            hf_config, "compress_ratios", None
                         )
-                        if isinstance(full_rope_params, dict):
-                            layer_rope_scaling = dict(full_rope_params)
-                            if layer_rope_scaling.get("rope_type") == "yarn":
-                                layer_rope_scaling["rope_type"] = "deepseek_yarn"
+                        layer_compress_ratio = (
+                            int(compress_ratios[layer_idx] or 0)
+                            if (
+                                isinstance(compress_ratios, (list, tuple))
+                                and layer_idx < len(compress_ratios)
+                            )
+                            else 1
+                        )
+                        if layer_compress_ratio > 0:
+                            theta = float(
+                                _safe_getattr(
+                                    hf_config, "compress_rope_theta", 160000.0
+                                )
+                                or 160000.0
+                            )
+                            comp_rope = (
+                                rope_params.get("compress")
+                                if (
+                                    isinstance(rope_params, dict)
+                                    and isinstance(
+                                        rope_params.get("compress"), dict
+                                    )
+                                )
+                                else full_rope_params
+                            )
+                            if isinstance(comp_rope, dict) and (
+                                comp_rope.get("rope_type")
+                                or comp_rope.get("type")
+                            ):
+                                layer_rope_scaling = dict(comp_rope)
+                                if layer_rope_scaling.get("rope_type") == "yarn":
+                                    layer_rope_scaling["rope_type"] = "deepseek_yarn"
+                            else:
+                                layer_rope_scaling = {
+                                    "rope_type": "deepseek_yarn",
+                                    "factor": 16.0,
+                                    "beta_fast": 32.0,
+                                    "beta_slow": 1.0,
+                                    "original_max_position_embeddings": 65536,
+                                }
                         else:
-                            layer_rope_scaling = {
-                                "rope_type": "deepseek_yarn",
-                                "factor": 16.0,
-                                "beta_fast": 32.0,
-                                "beta_slow": 1.0,
-                                "original_max_position_embeddings": 65536,
-                            }
+                            theta = global_theta
+                            layer_rope_scaling = None
                         layer_rotary_dim = int(
                             _safe_getattr(hf_config, "qk_rope_head_dim", 64) or 64
                         )
@@ -5305,6 +5957,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         num_full_blocks = min(len(token_ids) // self._block_size, max_avail_blocks)
         specs: list[DeltaBlockTransferSpec] = []
         parent_hash = "ROOT"
+        root_hash = ""
         prev_tok_hash = ""
         divergence_distance: int | None = 0
 
@@ -5314,6 +5967,8 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 int(t) for t in token_ids[start_pos : start_pos + self._block_size]
             )
             full_hash = compute_full_prefix_block_hash(parent_hash, blk_tokens)
+            if b_idx == 0:
+                root_hash = full_hash
             token_hash = compute_token_block_hash(blk_tokens)
 
             if self.store.has_full_block(full_hash):
@@ -5364,6 +6019,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     divergence_distance=divergence_distance,
                     group_block_ids=grp_ids,
                     prev_token_block_hash=prev_tok_hash,
+                    root_block_hash=root_hash,
                 )
             )
             parent_hash = full_hash
@@ -5604,7 +6260,41 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     )
 
         self._requests_need_load.clear()
+        if self._exclusive_connector_cache:
+            self._evict_idle_gpu_block_pool()
         return meta
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        self._gpu_block_pool = gpu_block_pool
+
+    def _evict_idle_gpu_block_pool(self) -> None:
+        """Evict unreferenced cached blocks from local BlockPool when exclusive_connector_cache is enabled."""
+        if not self._exclusive_connector_cache or self._gpu_block_pool is None:
+            return
+        idle_block_ids = {
+            blk.block_id
+            for blk in self._gpu_block_pool.blocks
+            if not blk.is_null and blk.ref_cnt == 0 and blk.block_hash is not None
+        }
+        if idle_block_ids:
+            self._gpu_block_pool.evict_blocks(idle_block_ids)
+
+    def on_new_request(self, request: "Request") -> None:
+        if self._exclusive_connector_cache:
+            self._evict_idle_gpu_block_pool()
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        worker_meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        if isinstance(worker_meta, DeltaWorkerMetadata) and worker_meta.evicted_hashes:
+            for ev_hash in worker_meta.evicted_hashes:
+                self.store.evict_block(ev_hash)
+        if self._exclusive_connector_cache:
+            self._evict_idle_gpu_block_pool()
+
+    def reset_cache(self) -> bool | None:
+        self.store.clear()
+        self._pending_evicted_hashes.clear()
+        return True
 
     def request_finished(
         self,
@@ -6258,4 +6948,75 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     items=batch_items,
                 )
 
+        if (
+            self.store.max_store_bytes > 0
+            and self.store.stats.compressed_bytes_stored
+            > self.store.max_store_bytes
+        ):
+            step_protected = {
+                blk.full_block_hash
+                for req_meta in metadata.requests
+                for blk in req_meta.blocks
+            }
+            evicted = self.store.evict_lru_to_budget(
+                self.store.max_store_bytes, protected_hashes=step_protected
+            )
+            if evicted:
+                self._pending_evicted_hashes.update(evicted)
+
         self._layers_saved_in_step.clear()
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        if not self._pending_evicted_hashes:
+            return None
+        evicted = set(self._pending_evicted_hashes)
+        self._pending_evicted_hashes.clear()
+        return DeltaWorkerMetadata(evicted_hashes=evicted)
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.role != KVConnectorRole.WORKER:
+            return None
+        st = self.store.stats
+        cur_sig = (
+            st.total_blocks_stored,
+            st.total_blocks_loaded,
+            st.evicted_blocks,
+            st.evicted_unique_blocks,
+            len(self.store._block_lru),
+        )
+        if cur_sig == self._last_reported_stats_sig:
+            return None
+        self._last_reported_stats_sig = cur_sig
+        return DeltaConnectorStats(
+            data={
+                "from_worker": True,
+                "raw_bytes_equivalent": int(st.raw_bytes_equivalent),
+                "compressed_bytes_stored": int(st.compressed_bytes_stored),
+                "evicted_bytes": int(st.evicted_bytes),
+                "evicted_blocks": int(st.evicted_blocks),
+                "evicted_unique_blocks": int(st.evicted_unique_blocks),
+                "active_blocks": int(len(self.store._block_lru)),
+                "total_blocks_stored": int(st.total_blocks_stored),
+                "total_blocks_loaded": int(st.total_blocks_loaded),
+            }
+        )
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        payload = dict(data) if data else {}
+        payload["from_worker"] = False
+        return DeltaConnectorStats(data=payload)
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics | None:
+        return DeltaConnectorPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )

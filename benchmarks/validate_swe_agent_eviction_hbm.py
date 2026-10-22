@@ -2122,16 +2122,20 @@ def main() -> None:
     )
     parser.add_argument("--blockpool-json", type=str, default="")
     parser.add_argument("--output-json", type=str, default="")
+    parser.add_argument("--trajectories-json", type=str, default="")
+    parser.add_argument("--dataset-label", type=str, default="")
     parser.add_argument("--load-format", type=str, default="auto")
     parser.add_argument("--block-size", type=int, default=0)
     args = parser.parse_args()
 
     t_job_start = time.perf_counter()
     print(
-        f"Loading verified-passing SWE-agent trajectories from nebius/SWE-agent-trajectories "
-        f"(num_trajectories={args.num_trajectories}, min_turns={args.min_turns}, max_turns={args.max_turns})..."
+        f"Loading verified-passing SWE-agent/DeepSWE trajectories "
+        f"(trajectories_json={args.trajectories_json or 'default'}, "
+        f"num_trajectories={args.num_trajectories}, min_turns={args.min_turns}, max_turns={args.max_turns})..."
     )
     trajectories = load_nebius_passing_trajectories(
+        cache_path=args.trajectories_json or None,
         num_trajectories=args.num_trajectories,
         min_turns=args.min_turns,
         max_turns=args.max_turns,
@@ -2248,7 +2252,12 @@ def main() -> None:
     total_job_sec = time.perf_counter() - t_job_start
     out_payload = {
         "model": args.model,
-        "dataset": "nebius/SWE-agent-trajectories (target == True, verified passing, all turns, LRU eviction)",
+        "dataset": args.dataset_label
+        or (
+            "R2E-Gym/R2EGym-SFT-Trajectories (DeepSWE multi-turn file_editor + execute_bash + finish, LRU eviction)"
+            if "deepswe" in (args.trajectories_json or "").lower()
+            else "nebius/SWE-agent-trajectories (target == True, verified passing, all turns, LRU eviction)"
+        ),
         "storage_tier": "GPU_HBM (vLLM BlockPool vs DeltaCompressionConnector under fixed HBM budget)",
         "mode": args.mode,
         "tensor_parallel_size": args.tensor_parallel_size,
