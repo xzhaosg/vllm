@@ -2166,7 +2166,9 @@ class DeltaBlockStore:
                 prev_token_block_hash,
                 max_exceptions,
                 policy.is_mamba,
-                len(self._known_prefix_blocks),
+                len(layer_bases),
+                layer_bases[0].full_block_hash,
+                layer_bases[-1].full_block_hash,
                 self.stats.evicted_blocks,
             )
             if full_block_hash and not exclude_hashes
@@ -3373,7 +3375,7 @@ class DeltaBlockStore:
             else policy.max_sparse_exceptions
         )
         if (
-            _is_dsv41_quant_kv(k_cpu)
+            (self.enable_cross_turn_reuse and _is_dsv41_quant_kv(k_cpu))
             or full_block_hash not in self._dependent_blocks
         ):
             self._index_base_block(layer_name, base_record, max_exceptions)
@@ -3424,27 +3426,33 @@ class DeltaBlockStore:
         self._known_layers.add(layer_name)
         self._records[(layer_name, bhash)] = record
         self._record_raw_bytes[(layer_name, bhash)] = raw_bytes
-        tok_pos_key = (layer_name, record.token_block_hash, record.start_position)
-        existing_tp = self._record_by_tok_pos.get(tok_pos_key)
-        if (
-            existing_tp is None
-            or (layer_name, existing_tp.full_block_hash) not in self._records
-            or (
-                existing_tp.tier == CompressionTier.TIER0_ZERO_BIT
-                and (
+        if self.enable_cross_turn_reuse:
+            tok_pos_key = (
+                layer_name,
+                record.token_block_hash,
+                record.start_position,
+            )
+            existing_tp = self._record_by_tok_pos.get(tok_pos_key)
+            if (
+                existing_tp is None
+                or (layer_name, existing_tp.full_block_hash)
+                not in self._records
+                or (
+                    existing_tp.tier == CompressionTier.TIER0_ZERO_BIT
+                    and (
+                        record.tier == CompressionTier.UNCOMPRESSED_BASE
+                        or record.quant_delta_k is not None
+                        or record.sparse_k_bf16 is not None
+                    )
+                )
+            ):
+                self._record_by_tok_pos[tok_pos_key] = record
+                if (
                     record.tier == CompressionTier.UNCOMPRESSED_BASE
                     or record.quant_delta_k is not None
                     or record.sparse_k_bf16 is not None
-                )
-            )
-        ):
-            self._record_by_tok_pos[tok_pos_key] = record
-            if (
-                record.tier == CompressionTier.UNCOMPRESSED_BASE
-                or record.quant_delta_k is not None
-                or record.sparse_k_bf16 is not None
-            ):
-                self._tok_pos_anchor_blocks.add(bhash)
+                ):
+                    self._tok_pos_anchor_blocks.add(bhash)
         if record.layer_idx == 0 or bhash not in self._block_lru:
             if record.ref_base_hash or record.ref_base_hash_2:
                 self._dependent_blocks.add(bhash)
@@ -3493,7 +3501,10 @@ class DeltaBlockStore:
                     and (batch_hashes is None or old_dep not in batch_hashes)
                 ):
                     if (
-                        len(self._known_prefix_blocks) >= 100
+                        (
+                            len(self._known_prefix_blocks) >= 100
+                            or len(self._block_lru) >= 100
+                        )
                         and record.start_position >= 2 * max(1, len(record.token_ids))
                         and old_dep in self._dependent_blocks
                         and not self._dependents_by_base.get(old_dep)
@@ -3737,10 +3748,14 @@ class DeltaBlockStore:
                     )
 
         # Pass 2A: Batched GPU evaluation for exact (or 0-edit stitched) token matches + Mamba partial matches
+        is_multi_cohort = len(self._pos0_base_blocks) >= 16
         if (
             exact_group
             and not policy.is_mamba
-            and _is_dsv41_quant_kv(k_cpus[exact_group[0][0]])
+            and (
+                _is_dsv41_quant_kv(k_cpus[exact_group[0][0]])
+                or is_multi_cohort
+            )
         ):
             for (
                 item_idx,
@@ -3749,7 +3764,11 @@ class DeltaBlockStore:
                 stitch_offset,
                 delta_pos,
             ) in exact_group:
-                if (delta_pos != 0 or stitch_offset > 0) and policy.layer_idx > 0:
+                if (
+                    not is_multi_cohort
+                    and (delta_pos != 0 or stitch_offset > 0)
+                    and policy.layer_idx > 0
+                ):
                     continue
                 blk_spec = items[item_idx][0]
                 records[item_idx] = CompressedKVBlockRecord(
@@ -4093,8 +4112,9 @@ class DeltaBlockStore:
                     )
 
         # Pass 2B: Batched GPU evaluation for full-attention partial (and stitched partial) matches
-        if attn_partial_group and _is_dsv41_quant_kv(
-            k_cpus[attn_partial_group[0][0]]
+        if attn_partial_group and (
+            _is_dsv41_quant_kv(k_cpus[attn_partial_group[0][0]])
+            or is_multi_cohort
         ):
             for (
                 item_idx,
@@ -4105,8 +4125,10 @@ class DeltaBlockStore:
                 d_idx,
             ) in attn_partial_group:
                 if (
-                    delta_pos != 0 or partial_stitch_offset > 0
-                ) and policy.layer_idx > 0:
+                    not is_multi_cohort
+                    and (delta_pos != 0 or partial_stitch_offset > 0)
+                    and policy.layer_idx > 0
+                ):
                     continue
                 blk_spec = items[item_idx][0]
                 k_c = k_cpus[item_idx]
@@ -4145,7 +4167,9 @@ class DeltaBlockStore:
                         v_c[idx_tensor].clone() if v_c is not None else None
                     ),
                 )
-            attn_partial_group = []
+            attn_partial_group = [
+                it for it in attn_partial_group if records[it[0]] is None
+            ]
 
         if attn_partial_group:
             p = len(attn_partial_group)
@@ -4395,7 +4419,7 @@ class DeltaBlockStore:
                     raw_v=v_c.clone() if v_c is not None else None,
                 )
                 if (
-                    _is_dsv41_quant_kv(k_c)
+                    (self.enable_cross_turn_reuse and _is_dsv41_quant_kv(k_c))
                     or blk_spec.full_block_hash not in self._dependent_blocks
                 ):
                     self._index_base_block(layer_name, rec, max_exceptions)
