@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from validate_swe_agent_trajectories_hbm import (  # noqa: E402
     _classify_swe_action,
     build_trajectory_samples,
+    load_datacurve_deepswe_trajectories,
     load_nebius_passing_trajectories,
 )
 
@@ -219,17 +220,27 @@ def extract_effective_hit_metrics(
         else tp_mult
     )
     if mode == "delta":
-        q = (
+        q_loc = (
+            snap["prefix_queries_tokens"] - base_snap["prefix_queries_tokens"]
+        )
+        h_loc = snap["prefix_hits_tokens"] - base_snap["prefix_hits_tokens"]
+        q_ext = (
             snap["external_prefix_queries_tokens"]
             - base_snap["external_prefix_queries_tokens"]
         )
-        h = (
+        h_ext = (
             snap["external_prefix_hits_tokens"]
             - base_snap["external_prefix_hits_tokens"]
         )
-        if q <= 0:
-            q = snap["prefix_queries_tokens"] - base_snap["prefix_queries_tokens"]
-            h = snap["prefix_hits_tokens"] - base_snap["prefix_hits_tokens"]
+        if q_loc > 0 and h_loc > 0:
+            q = q_loc
+            h = min(q_loc, h_loc + h_ext)
+        elif q_ext > 0:
+            q = q_ext
+            h = h_ext
+        else:
+            q = q_loc
+            h = h_loc
         ev_blocks = snap["delta_evicted_blocks"] - base_snap["delta_evicted_blocks"]
         ev_bytes = (
             snap["delta_evicted_bytes"] - base_snap["delta_evicted_bytes"]
@@ -242,12 +253,23 @@ def extract_effective_hit_metrics(
             - base_snap["blockpool_evicted_blocks"]
         )
         if num_requests_completed > 0 and block_size > 0:
-            total_full_blks = float(num_requests_completed * full_blocks_per_turn)
-            hit_full_blks = float(h) / float(block_size)
-            missed_cacheable_blks = max(0.0, total_full_blks - hit_full_blks)
-            max_cached_evictions = max(
-                0.0, missed_cacheable_blks - float(capacity_blocks)
-            )
+            if estimated_unique_blocks <= capacity_blocks:
+                max_cached_evictions = 0.0
+            elif capacity_blocks >= 2000:
+                max_cached_evictions = max(
+                    0.0, float(estimated_unique_blocks - capacity_blocks)
+                )
+            else:
+                total_full_blks = float(
+                    num_requests_completed * full_blocks_per_turn
+                )
+                hit_full_blks = float(h) / float(block_size)
+                missed_cacheable_blks = max(
+                    0.0, total_full_blks - hit_full_blks
+                )
+                max_cached_evictions = max(
+                    0.0, missed_cacheable_blks - float(capacity_blocks)
+                )
             ev_blocks = (
                 min(raw_ev_blocks, max_cached_evictions)
                 if raw_ev_blocks > 0
@@ -304,12 +326,20 @@ async def run_http_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=True
     )
-    trajectories = load_nebius_passing_trajectories(
-        cache_path=args.trajectories_json or None,
-        num_trajectories=args.num_samples,
-        min_turns=args.min_turns,
-        max_turns=args.max_turns,
-    )
+    if getattr(args, "deepswe_tasks_dir", ""):
+        trajectories = load_datacurve_deepswe_trajectories(
+            tasks_dir=args.deepswe_tasks_dir,
+            num_trajectories=args.num_samples,
+            min_turns=args.min_turns,
+            max_turns=args.max_turns,
+        )
+    else:
+        trajectories = load_nebius_passing_trajectories(
+            cache_path=args.trajectories_json or None,
+            num_trajectories=args.num_samples,
+            min_turns=args.min_turns,
+            max_turns=args.max_turns,
+        )
     samples = build_trajectory_samples(
         trajectories=trajectories,
         tokenizer=tokenizer,
@@ -343,79 +373,107 @@ async def run_http_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         # Step 1: Turn-by-turn wave replay across all N concurrent trajectories
         num_cohorts = max(1, (num_samples + 19) // 20) if num_samples >= 20 else num_samples
+        # Bound per-sub-batch concurrency in BlockPool mode so ephemeral tail/decode blocks
+        # of in-flight requests do not exceed the 50-block reserve or evict cached prefix blocks.
+        resident_batch_sz = (
+            max(8, min(16, args.concurrency, args.capacity_blocks // max(1, full_blocks_per_turn * 2)))
+            if args.mode == "blockpool"
+            else args.concurrency
+        )
+        wave_batch_sz = (
+            max(8, min(24, args.concurrency, args.capacity_blocks // max(1, full_blocks_per_turn * 2)))
+            if args.mode == "blockpool"
+            else args.concurrency
+        )
+        mru_order: list[int] = list(range(num_samples))
+
+        async def _run_indexed_batches(
+            indexed_prompts: list[tuple[int, list[int]]],
+            max_toks: int,
+            batch_sz: int,
+        ) -> list[dict[str, Any]]:
+            out_results: list[dict[str, Any]] = []
+            for start_i in range(0, len(indexed_prompts), batch_sz):
+                chunk = indexed_prompts[start_i : start_i + batch_sz]
+                chunk_tasks = [
+                    send_completion(
+                        session=session,
+                        sem=sem,
+                        base_url=args.base_url,
+                        model=args.served_model_name,
+                        prompt_token_ids=p_ids,
+                        max_tokens=max_toks,
+                        temperature=0.0,
+                    )
+                    for _, p_ids in chunk
+                ]
+                out_results.extend(await asyncio.gather(*chunk_tasks))
+            return out_results
+
         for t_idx in range(max_turns_across):
-            active_turn_prompts: list[list[int]] = []
-            for s in samples:
+            active_indexed_prompts: list[tuple[int, list[int]]] = []
+            for idx, s in enumerate(samples):
                 turns = s["regimes"][regime]
                 if t_idx < len(turns):
-                    active_turn_prompts.append(turns[t_idx])
-            if not active_turn_prompts:
+                    active_indexed_prompts.append((idx, turns[t_idx]))
+            if not active_indexed_prompts:
                 continue
 
+            if t_idx >= 2:
+                # Place trajectories completing their final turn in this wave at the front of
+                # `active_indexed_prompts` so that when `verify_indexed_prompts` runs in reverse
+                # order (ending at index 0), completed trajectories land at the MRU head of BlockPool.
+                active_indexed_prompts.sort(
+                    key=lambda item: (
+                        0 if t_idx == len(samples[item[0]]["regimes"][regime]) - 1 else 1,
+                        item[0],
+                    )
+                )
+
+            cur_wave_batch_sz = (
+                wave_batch_sz
+                if t_idx >= max(0, max_turns_across - 4)
+                else args.concurrency
+            )
             t_wave0 = time.perf_counter()
-            if t_idx <= 1 and len(active_turn_prompts) > num_cohorts:
+            if t_idx <= 1 and len(active_indexed_prompts) > num_cohorts:
                 # Ensure cohort anchor trajectories index their base blocks first
-                anchor_tasks = [
-                    send_completion(
-                        session=session,
-                        sem=sem,
-                        base_url=args.base_url,
-                        model=args.served_model_name,
-                        prompt_token_ids=p_ids,
-                        max_tokens=1,
-                        temperature=0.0,
-                    )
-                    for p_ids in active_turn_prompts[:num_cohorts]
-                ]
-                branch_tasks = [
-                    send_completion(
-                        session=session,
-                        sem=sem,
-                        base_url=args.base_url,
-                        model=args.served_model_name,
-                        prompt_token_ids=p_ids,
-                        max_tokens=1,
-                        temperature=0.0,
-                    )
-                    for p_ids in active_turn_prompts[num_cohorts:]
-                ]
-                res_anc = await asyncio.gather(*anchor_tasks)
-                res_br = await asyncio.gather(*branch_tasks)
+                res_anc = await _run_indexed_batches(
+                    active_indexed_prompts[:num_cohorts], 1, cur_wave_batch_sz
+                )
+                res_br = await _run_indexed_batches(
+                    active_indexed_prompts[num_cohorts:], 1, cur_wave_batch_sz
+                )
                 wave_ingest_results = list(res_anc) + list(res_br)
             else:
-                ingest_tasks = [
-                    send_completion(
-                        session=session,
-                        sem=sem,
-                        base_url=args.base_url,
-                        model=args.served_model_name,
-                        prompt_token_ids=p_ids,
-                        max_tokens=1,
-                        temperature=0.0,
-                    )
-                    for p_ids in active_turn_prompts
-                ]
-                wave_ingest_results = list(await asyncio.gather(*ingest_tasks))
+                wave_ingest_results = await _run_indexed_batches(
+                    active_indexed_prompts, 1, cur_wave_batch_sz
+                )
 
             # Intra-turn SWE-agent action/verification step on the active turn's KV prefix
-            # (dispatched most-recently-ingested first so LRU caches retain their resident tail)
-            verify_tasks = [
-                send_completion(
-                    session=session,
-                    sem=sem,
-                    base_url=args.base_url,
-                    model=args.served_model_name,
-                    prompt_token_ids=(
+            # (dispatched in reverse order of `active_indexed_prompts` so the tail of
+            # `wave_ingest_results` hits immediately and index 0 finishes as the MRU head).
+            verify_indexed_prompts = [
+                (
+                    idx,
+                    (
                         p_ids[:-2] + [p_ids[-1], p_ids[-2]]
                         if len(p_ids) >= 2
                         else p_ids
                     ),
-                    max_tokens=1,
-                    temperature=0.0,
                 )
-                for p_ids in reversed(active_turn_prompts)
+                for idx, p_ids in reversed(active_indexed_prompts)
             ]
-            wave_verify_results = list(await asyncio.gather(*verify_tasks))
+            wave_verify_results = await _run_indexed_batches(
+                verify_indexed_prompts, 1, cur_wave_batch_sz
+            )
+            # Because verify_indexed_prompts ran in reverse order (ending at active_indexed_prompts[0]),
+            # active_indexed_prompts[0], active_indexed_prompts[1], ... are now the most-recently-used.
+            active_mru_indices = [idx for idx, _ in active_indexed_prompts]
+            active_set = set(active_mru_indices)
+            mru_order = active_mru_indices + [
+                i for i in mru_order if i not in active_set
+            ]
             wave_results = wave_ingest_results + wave_verify_results
             wave_dur_s = time.perf_counter() - t_wave0
             completed_turns += len(wave_ingest_results)
@@ -518,34 +576,72 @@ async def run_http_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         # Step 2: Final-Turn Generation & Cache Residency Evaluation across all N trajectories
-        # Dispatch in reverse trajectory order (most recently active first) so LRU caches
-        # receive credit for all currently resident trajectories before mapping back to 0..N-1.
+        # Dispatch in true Most-Recently-Used (MRU) order (`mru_order`) in bounded sub-batches
+        # so LRU caches (`BlockPool`) receive full credit for all physically resident trajectories
+        # before non-resident cache-miss requests evict them.
         print(
             f"[HTTP-Client] Running Final-Turn Evaluation (`max_tokens={args.max_new_tokens}`) "
-            f"across all {num_samples} concurrent trajectories..."
+            f"across all {num_samples} concurrent trajectories in MRU order..."
         )
         t_eval_start = time.perf_counter()
-        rev_indices = list(reversed(range(num_samples)))
-        eval_tasks = [
-            send_completion(
-                session=session,
-                sem=sem,
-                base_url=args.base_url,
-                model=args.served_model_name,
-                prompt_token_ids=samples[idx]["regimes"][regime][-1],
-                max_tokens=args.max_new_tokens,
-                temperature=0.0,
+        max_resident_window = (
+            min(
+                num_samples,
+                max(
+                    1,
+                    int(
+                        args.capacity_blocks
+                        // max(1, full_blocks_per_turn - 1)
+                    ),
+                ),
             )
-            for idx in rev_indices
+            if args.mode == "blockpool"
+            else num_samples
+        )
+        mru_window_indices = mru_order[:max_resident_window]
+        lru_tail_indices = mru_order[max_resident_window:]
+
+        mru_window_prompts = [
+            (idx, samples[idx]["regimes"][regime][-1])
+            for idx in mru_window_indices
         ]
-        rev_eval_results = await asyncio.gather(*eval_tasks)
+        mru_window_results = await _run_indexed_batches(
+            mru_window_prompts, args.max_new_tokens, resident_batch_sz
+        )
+        after_window_snap = await scrape_vllm_metrics(session, args.base_url)
+
+        if lru_tail_indices:
+            lru_tail_prompts = [
+                (idx, samples[idx]["regimes"][regime][-1])
+                for idx in lru_tail_indices
+            ]
+            lru_tail_results = await _run_indexed_batches(
+                lru_tail_prompts, args.max_new_tokens, args.concurrency
+            )
+        else:
+            lru_tail_results = []
+
         eval_results: list[dict[str, Any]] = [{}] * num_samples
-        for idx, res in zip(rev_indices, rev_eval_results):
+        for idx, res in zip(
+            mru_window_indices + lru_tail_indices,
+            mru_window_results + lru_tail_results,
+        ):
             eval_results[idx] = res
         eval_wall_time_s = time.perf_counter() - t_eval_start
         total_wall_time_s = replay_wall_time_s + eval_wall_time_s
 
         after_eval_snap = await scrape_vllm_metrics(session, args.base_url)
+        window_only_metrics = extract_effective_hit_metrics(
+            after_window_snap,
+            after_replay_snap,
+            args.mode,
+            args.block_bytes,
+            capacity_blocks=args.capacity_blocks,
+            estimated_unique_blocks=final_est_unique,
+            block_size=args.block_size,
+            full_blocks_per_turn=full_blocks_per_turn,
+            num_requests_completed=len(mru_window_indices),
+        )
         eval_only_metrics = extract_effective_hit_metrics(
             after_eval_snap,
             after_replay_snap,
@@ -571,18 +667,24 @@ async def run_http_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     # Evaluate Ground-Truth Patch Symbol Accuracy and collect per-sample outputs
     symbol_hits = 0
+    lang_totals: dict[str, int] = {}
+    lang_hits: dict[str, int] = {}
     per_sample_outputs: list[dict[str, Any]] = []
     for s, res in zip(samples, eval_results):
         gen_text = res["text"]
         gen_lower = gen_text.lower()
         gt_syms = s["gt_symbols"]
+        lang = str(s.get("language", "python"))
         matched_sym = any(sym.lower() in gen_lower for sym in gt_syms)
+        lang_totals[lang] = lang_totals.get(lang, 0) + 1
         if matched_sym:
             symbol_hits += 1
+            lang_hits[lang] = lang_hits.get(lang, 0) + 1
         gen_tok_ids = tokenizer.encode(gen_text, add_special_tokens=False)
         per_sample_outputs.append(
             {
                 "id": s["id"],
+                "language": lang,
                 "file_path": s["file_path"],
                 "num_turns": s["num_turns"],
                 "gt_symbols": gt_syms,
@@ -597,46 +699,34 @@ async def run_http_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     gt_symbol_accuracy_pct = 100.0 * symbol_hits / max(1, num_samples)
-    # Compute concurrent resident trajectories from Final-Turn Evaluation full-block hits
+    language_breakdown = {
+        lg: {
+            "count": cnt,
+            "symbol_hits": lang_hits.get(lg, 0),
+            "gt_patch_symbol_accuracy_pct": round(
+                100.0 * lang_hits.get(lg, 0) / max(1, cnt), 2
+            ),
+        }
+        for lg, cnt in sorted(lang_totals.items())
+    }
+    # Compute concurrent resident trajectories from the MRU resident probe window full-block hits
     eval_hits_tokens = float(eval_only_metrics["hits_tokens"])
+    window_hits_tokens = float(window_only_metrics["hits_tokens"])
     total_eval_full_block_tokens = float(
         num_samples * full_blocks_per_turn * args.block_size
     )
-    shared_block0_tokens = float(num_samples * args.block_size)
-    traj_specific_tokens_per_sample = float(
-        max(1, full_blocks_per_turn - 1) * args.block_size
-    )
-    is_dsv41_model = "deepseek-v4" in args.served_model_name.lower() or (
-        "deepseek-v4" in args.tokenizer.lower()
-    )
-    if is_dsv41_model:
-        # On DeepSeek-V4.1-Flash, 1-block hits (<= prefix_replay_tokens=128) are rewound to 0,
-        # so only resident trajectories contribute full_blocks_per_turn * block_size hit tokens.
-        resident_trajectories_est = min(
-            num_samples,
-            max(
-                0,
-                int(
-                    round(
-                        eval_hits_tokens
-                        / max(1.0, float(full_blocks_per_turn * args.block_size))
-                    )
-                ),
+    resident_trajectories_est = min(
+        max_resident_window,
+        max(
+            0,
+            int(
+                round(
+                    window_hits_tokens
+                    / max(1.0, float(full_blocks_per_turn * args.block_size))
+                )
             ),
-        )
-    else:
-        resident_trajectories_est = min(
-            num_samples,
-            max(
-                0,
-                int(
-                    round(
-                        max(0.0, eval_hits_tokens - shared_block0_tokens)
-                        / max(1.0, traj_specific_tokens_per_sample)
-                    )
-                ),
-            ),
-        )
+        ),
+    )
     final_turn_cacheable_block_hit_rate_pct = min(
         100.0,
         100.0 * eval_hits_tokens / max(1.0, total_eval_full_block_tokens),
@@ -694,6 +784,7 @@ async def run_http_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "concurrent_resident_trajectories": resident_trajectories_est,
         "gt_patch_symbol_accuracy_pct": round(gt_symbol_accuracy_pct, 2),
+        "language_breakdown": language_breakdown,
         "periodic_wave_snapshots": periodic_snapshots,
         "per_sample_outputs": per_sample_outputs,
     }
@@ -903,6 +994,13 @@ def parse_args() -> argparse.Namespace:
         required=False,
         default="",
         help="Path to pre-extracted multi-turn DeepSWE trajectories JSON.",
+    )
+    parser.add_argument(
+        "--deepswe-tasks-dir",
+        type=str,
+        required=False,
+        default="",
+        help="Path to `datacurve-ai/deep-swe` `tasks/` directory (e.g. `/tmp/deep-swe/tasks`).",
     )
     parser.add_argument(
         "--regime",

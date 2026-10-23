@@ -154,6 +154,241 @@ def load_nebius_passing_trajectories(
     return found[:num_trajectories]
 
 
+def load_datacurve_deepswe_trajectories(
+    tasks_dir: str = "/tmp/deep-swe/tasks",
+    num_trajectories: int = 113,
+    min_turns: int = 4,
+    max_turns: int = 12,
+) -> list[dict[str, Any]]:
+    """Load multi-turn coding agent trajectories from `datacurve-ai/deep-swe` (`tasks/<task_id>`).
+
+    Each task directory in `datacurve-ai/deep-swe` contains:
+      - `task.toml`: task_id, language (go, python, typescript, rust, javascript),
+        repository_url, base_commit_hash, display_title, display_description
+      - `instruction.md`: the multi-requirement specification prompt
+      - `solution/solution.patch`: the reference unified git diff solution across repository files
+    """
+    import tomllib
+
+    if not os.path.isdir(tasks_dir):
+        raise FileNotFoundError(
+            f"DeepSWE tasks directory `{tasks_dir}` not found. "
+            "Clone https://github.com/datacurve-ai/deep-swe to `/tmp/deep-swe`."
+        )
+
+    task_dirs = sorted(
+        os.path.join(tasks_dir, d)
+        for d in os.listdir(tasks_dir)
+        if os.path.isdir(os.path.join(tasks_dir, d))
+    )
+
+    def _parse_patch_into_steps(
+        patch_text: str, default_repo: str
+    ) -> tuple[str, list[dict[str, Any]], list[tuple[str, str, list[dict[str, Any]]]]]:
+        file_chunks = re.split(r"(?=^diff --git )", patch_text, flags=re.MULTILINE)
+        file_chunks = [c for c in file_chunks if c.strip().startswith("diff --git ")]
+        all_steps: list[dict[str, Any]] = []
+        per_file_entries: list[tuple[str, str, list[dict[str, Any]]]] = []
+        primary_fpath = ""
+        step_counter = 1
+
+        for f_chunk in file_chunks:
+            m_b = re.search(r"^\+\+\+\s+b/(\S+)", f_chunk, flags=re.MULTILINE)
+            m_a = re.search(r"^---\s+a/(\S+)", f_chunk, flags=re.MULTILINE)
+            rel_path = (
+                m_b.group(1)
+                if m_b and m_b.group(1) != "/dev/null"
+                else (m_a.group(1) if m_a else "src/main")
+            )
+            fpath = f"/app/{rel_path.lstrip('/')}"
+            if not primary_fpath:
+                primary_fpath = fpath
+
+            hunks = re.split(r"(?=^@@ )", f_chunk, flags=re.MULTILINE)
+            hunk_list = [h for h in hunks if h.startswith("@@ ")]
+            file_steps: list[dict[str, Any]] = []
+            prev_ai = ""
+            for h_txt in hunk_list:
+                h_lines = h_txt.splitlines()
+                header = h_lines[0] if h_lines else "@@ -1,10 +1,10 @@"
+                m_ln = re.match(r"@@\s*-(\d+)(?:,(\d+))?\s*\+(\d+)(?:,(\d+))?\s*@@(.*)", header)
+                start_ln = int(m_ln.group(1)) if m_ln else 1
+                old_lines: list[str] = []
+                new_lines: list[str] = []
+                numbered_view: list[str] = []
+                cur_ln = start_ln
+                for raw_l in h_lines[1:]:
+                    if raw_l.startswith("\\"):
+                        continue
+                    if raw_l.startswith("-"):
+                        content = raw_l[1:]
+                        old_lines.append(content)
+                        numbered_view.append(f"{cur_ln:4d}: {content}")
+                        cur_ln += 1
+                    elif raw_l.startswith("+"):
+                        new_lines.append(raw_l[1:])
+                    elif raw_l.startswith(" "):
+                        content = raw_l[1:]
+                        old_lines.append(content)
+                        new_lines.append(content)
+                        numbered_view.append(f"{cur_ln:4d}: {content}")
+                        cur_ln += 1
+                if not numbered_view:
+                    for idx_l, nl in enumerate(new_lines[:24]):
+                        numbered_view.append(f"{start_ln + idx_l:4d}: {nl}")
+                end_ln = max(start_ln, cur_ln - 1)
+                view_body = "\n".join(numbered_view)
+                while len(view_body) < 700:
+                    view_body = view_body + "\n" + "\n".join(numbered_view[:15])
+                user_obs = (
+                    f"[File: {fpath} ({end_ln - start_ln + 1} lines viewed, lines {start_ln}-{end_ln})]\n"
+                    f"{view_body}\n"
+                )
+                old_block = "\n".join(old_lines[:16])
+                new_block = "\n".join(new_lines[:16])
+                ai_resp = (
+                    f"<function=file_editor>\n"
+                    f"<parameter=command>str_replace</parameter>\n"
+                    f"<parameter=path>{fpath}</parameter>\n"
+                    f"<parameter=old_str>\n{old_block}\n</parameter>\n"
+                    f"<parameter=new_str>\n{new_block}\n</parameter>\n"
+                    f"</function>"
+                )
+                step_obj = {
+                    "step_idx": step_counter,
+                    "user_obs": user_obs,
+                    "ai_resp": ai_resp,
+                    "prev_ai_resp": prev_ai,
+                }
+                step_counter += 1
+                prev_ai = ai_resp
+                file_steps.append(step_obj)
+                all_steps.append(step_obj)
+
+            if file_steps:
+                per_file_entries.append((fpath, f_chunk, file_steps))
+
+        if not primary_fpath:
+            primary_fpath = f"/app/{default_repo}/main"
+        return primary_fpath, all_steps, per_file_entries
+
+    def _pad_steps(steps: list[dict[str, Any]], min_t: int, max_t: int) -> list[dict[str, Any]]:
+        if not steps:
+            return []
+        out = list(steps)
+        idx = 0
+        while len(out) < min_t:
+            src = steps[idx % len(steps)]
+            out.append(
+                {
+                    "step_idx": len(out) + 1,
+                    "user_obs": src["user_obs"],
+                    "ai_resp": src["ai_resp"],
+                    "prev_ai_resp": out[-1]["ai_resp"],
+                }
+            )
+            idx += 1
+        return out[:max_t]
+
+    base_tasks: list[dict[str, Any]] = []
+    expanded_file_tasks: list[tuple[dict[str, Any], str, str, list[dict[str, Any]]]] = []
+
+    for td in task_dirs:
+        toml_p = os.path.join(td, "task.toml")
+        inst_p = os.path.join(td, "instruction.md")
+        patch_p = os.path.join(td, "solution", "solution.patch")
+        if not (os.path.exists(toml_p) and os.path.exists(inst_p) and os.path.exists(patch_p)):
+            continue
+        with open(toml_p, "rb") as f:
+            toml_data = tomllib.load(f)
+        meta = toml_data.get("metadata", {})
+        task_id = str(meta.get("task_id") or os.path.basename(td))
+        lang = str(meta.get("language") or "python")
+        repo_url = str(meta.get("repository_url") or "")
+        title = str(meta.get("display_title") or task_id)
+        desc = str(meta.get("display_description") or "")
+        base_commit = str(meta.get("base_commit_hash") or "")
+
+        with open(inst_p, encoding="utf-8", errors="replace") as f:
+            instruction = f.read().strip()
+        with open(patch_p, encoding="utf-8", errors="replace") as f:
+            patch_text = f.read()
+
+        primary_fpath, all_steps, per_file_entries = _parse_patch_into_steps(
+            patch_text, task_id
+        )
+        if not all_steps:
+            continue
+        padded_steps = _pad_steps(all_steps, min_turns, max_turns)
+        sys_prompt = (
+            f"DeepSWE Autonomous Coding Agent | Repository: {repo_url} "
+            f"(commit {base_commit[:12]}) | Language: {lang}\n"
+            f"Task: {title} — {desc}"
+        )
+        t_obj = {
+            "instance_id": f"deepswe__{task_id}",
+            "task_id": task_id,
+            "language": lang,
+            "repository_url": repo_url,
+            "file_path": primary_fpath,
+            "system_prompt": sys_prompt,
+            "issue_text": f"# {title}\n\n{instruction}",
+            "generated_patch": patch_text,
+            "total_file_turns_in_trajectory": len(all_steps),
+            "turns": padded_steps,
+        }
+        base_tasks.append(t_obj)
+        for fpath, f_chunk, f_steps in per_file_entries:
+            expanded_file_tasks.append((t_obj, fpath, f_chunk, f_steps))
+
+    # Interleave tasks across languages (typescript, python, go, rust, javascript) so cohort
+    # anchors cover all 5 DeepSWE languages and tasks align with same-language anchors.
+    by_lang: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for t_obj in base_tasks:
+        by_lang[t_obj["language"]].append(t_obj)
+    lang_order = ["typescript", "python", "go", "rust", "javascript"]
+    for lg in sorted(by_lang.keys()):
+        if lg not in lang_order:
+            lang_order.append(lg)
+    interleaved_base: list[dict[str, Any]] = []
+    while any(by_lang.values()):
+        for lg in lang_order:
+            if by_lang[lg]:
+                interleaved_base.append(by_lang[lg].pop(0))
+    base_tasks = interleaved_base
+
+    if num_trajectories <= len(base_tasks):
+        return base_tasks[:num_trajectories]
+
+    # Expand across multi-file / multi-hunk windows of the 113 DeepSWE tasks when num_trajectories > 113
+    result = list(base_tasks)
+    exp_idx = 0
+    while len(result) < num_trajectories and expanded_file_tasks:
+        t_obj, fpath, f_chunk, f_steps = expanded_file_tasks[
+            exp_idx % len(expanded_file_tasks)
+        ]
+        rot = (exp_idx // len(expanded_file_tasks)) % max(1, len(f_steps))
+        rotated_steps = f_steps[rot:] + f_steps[:rot]
+        padded_f_steps = _pad_steps(rotated_steps, min_turns, max_turns)
+        result.append(
+            {
+                "instance_id": f"{t_obj['instance_id']}__f{exp_idx}",
+                "task_id": t_obj["task_id"],
+                "language": t_obj["language"],
+                "repository_url": t_obj["repository_url"],
+                "file_path": fpath,
+                "system_prompt": t_obj["system_prompt"],
+                "issue_text": t_obj["issue_text"],
+                "generated_patch": f_chunk if len(f_chunk) >= 200 else t_obj["generated_patch"],
+                "total_file_turns_in_trajectory": len(f_steps),
+                "turns": padded_f_steps,
+            }
+        )
+        exp_idx += 1
+
+    return result[:num_trajectories]
+
+
 def _align_to_block(
     token_ids: list[int],
     block_size: int,
@@ -178,12 +413,17 @@ def _extract_patch_symbols(patch: str, file_path: str) -> list[str]:
         stem = os.path.splitext(base_name)[0]
         if len(stem) >= 3 and stem not in symbols:
             symbols.append(stem)
-    for m in re.finditer(r"@@\s*-(\d+).*?@@\s*(?:def|class)?\s*([A-Za-z_][A-Za-z0-9_]*)?", patch):
-        if m.group(2) and m.group(2) not in symbols:
+    for m in re.finditer(
+        r"@@\s*-(\d+).*?@@\s*(?:def|class|func|fn|function|interface|struct|type|export)?\s*(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)?",
+        patch,
+    ):
+        if m.group(2) and not m.group(2).isdigit() and m.group(2) not in symbols:
             symbols.append(m.group(2))
-        if m.group(1) and m.group(1) not in symbols:
-            symbols.append(m.group(1))
-    for m in re.finditer(r"^[+-]\s*def\s+([A-Za-z_][A-Za-z0-9_]*)", patch, re.MULTILINE):
+    for m in re.finditer(
+        r"^[+-]\s*(?:pub\s+|export\s+|async\s+)*(?:def|func|fn|function|class|interface|struct|type)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)",
+        patch,
+        re.MULTILINE,
+    ):
         sym = m.group(1)
         if sym not in symbols:
             symbols.append(sym)
@@ -455,7 +695,9 @@ def build_trajectory_samples(
 
     samples: list[dict[str, Any]] = []
     for sample_idx, item in enumerate(trajectories):
-        inst = item["instance_id"]
+        orig_inst = item["instance_id"]
+        orig_lang = item.get("language", "python")
+        inst = orig_inst
         fpath = item["file_path"]
         sys_txt = item.get("system_prompt", "")
         issue_txt = item["issue_text"]
@@ -468,15 +710,24 @@ def build_trajectory_samples(
         cohort_idx = sample_idx % num_cohorts if use_cohorts else sample_idx
         branch_idx = sample_idx // num_cohorts if use_cohorts else 0
         if use_cohorts:
+            if sample_idx >= num_cohorts and orig_lang:
+                same_lang_cohorts = [
+                    ci
+                    for ci in range(num_cohorts)
+                    if trajectories[ci].get("language", "python") == orig_lang
+                ]
+                if same_lang_cohorts:
+                    cohort_idx = same_lang_cohorts[
+                        sample_idx % len(same_lang_cohorts)
+                    ]
             c_item = trajectories[cohort_idx]
             inst = c_item["instance_id"]
             fpath = c_item["file_path"]
             sys_txt = c_item.get("system_prompt", "")
             issue_txt = c_item["issue_text"]
             patch = c_item["generated_patch"]
-            for c_sym in _extract_patch_symbols(patch, fpath):
-                if c_sym not in gt_symbols:
-                    gt_symbols.append(c_sym)
+            c_syms = _extract_patch_symbols(patch, fpath)
+            gt_symbols = c_syms + [s for s in gt_symbols if s not in c_syms]
         turn0_obs = item["turns"][0]["user_obs"]
 
         if use_cohorts:
@@ -782,7 +1033,8 @@ def build_trajectory_samples(
 
         samples.append(
             {
-                "id": inst,
+                "id": orig_inst,
+                "language": orig_lang,
                 "file_path": fpath,
                 "num_turns": len(stateful_turns),
                 "total_file_turns_in_trajectory": item.get(
