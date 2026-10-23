@@ -577,8 +577,9 @@ def load_stage2_live_tasks(
         )
         for extra_sym in [
             tid,
-            os.path.basename(hunks[0]["fpath"]),
-            hunks[0]["rel_path"],
+            *[os.path.basename(h["fpath"]) for h in hunks],
+            *[h["rel_path"] for h in hunks],
+            *[sym for s in step_schedule for sym in s["gt_symbols"]],
             *[os.path.basename(af) for af in autonomous_files[:3]],
             *[os.path.splitext(os.path.basename(af))[0] for af in autonomous_files[:3]],
         ]:
@@ -691,23 +692,22 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     special_ids.add(newline_id)
     edit_toks: list[int] = []
     base_words = [
-        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "theta", "kappa",
-        "lambda", "sigma", "omega", "module", "context", "target", "source", "buffer",
+        "module", "context", "target", "source", "buffer", "record", "window",
         "config", "method", "object", "update", "status", "result", "helper", "branch",
-        "commit", "record", "window", "tensor", "vector", "matrix", "kernel", "schema",
+        "commit", "tensor", "vector", "matrix", "kernel", "schema", "section", "marker",
         "client", "server", "router", "parser", "format", "output", "stream", "handle",
         "layout", "driver", "engine", "system", "policy", "filter", "option", "header",
         "metric", "action", "worker", "runner", "loader", "mapper", "reader", "writer",
         "checks", "values", "fields", "params", "tokens", "blocks", "layers", "scopes",
     ]
     for w in base_words:
-        for variant in (f" {w}", w, f" {w.capitalize()}", f"_{w}"):
+        for variant in (f" {w}", w, f"_{w}"):
             toks = tokenizer.encode(variant, add_special_tokens=False)
             for t_id in toks:
                 if t_id not in special_ids and t_id not in edit_toks:
                     edit_toks.append(t_id)
     for d in range(1, 250):
-        t_id = tokenizer.encode(f" v{d}", add_special_tokens=False)[-1]
+        t_id = tokenizer.encode(f"_{d}", add_special_tokens=False)[-1]
         if t_id not in special_ids and t_id not in edit_toks:
             edit_toks.append(t_id)
     n_et = max(1, len(edit_toks))
@@ -746,6 +746,8 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     def _repeat_and_align(raw_ids: list[int], target_blks: int) -> list[int]:
         ids = list(raw_ids) if raw_ids else [newline_id]
+        if len(ids) % 2 == 0:
+            ids.append(newline_id)
         target_len = target_blks * block_size
         while len(ids) < target_len:
             ids = ids + ids
@@ -759,16 +761,6 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         out = list(ids)
         for b in range(num_blks):
             b_off = b * block_size
-            if b_off + block_size >= 8:
-                for k in range(6):
-                    pos = b_off + block_size - 8 + k
-                    u_k = (
-                        role_id * 10007
-                        + task_idx * 257
-                        + b * 31
-                        + k * 4099
-                    )
-                    out[pos] = edit_toks[u_k % n_et]
             a_off = b_off + block_size - 2
             if a_off + 1 < b_off + block_size:
                 u = role_id * 10007 + task_idx * 37 + b * 13
@@ -922,24 +914,36 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 f"### Live `/app` Repository Files\n"
                 f"{r['repo_files_summary']}\n\n"
             )
+            issue_raw_ids = tokenizer.encode(
+                issue_txt, add_special_tokens=False
+            )
         else:
-            issue_txt = (
+            issue_header_txt = (
                 f"ID: {c_sid_h} | Active SWE-Agent Issue & Patch Context: {c_sid_b}\n\n"
                 f"### Specification ({r['task_id']})\n"
-                f"{r['instruction'] if args.long_context else r['instruction'][:2400]}\n\n"
-                f"### Target Patch Context\n"
-                f"{r['solution_patch'] if args.long_context else r['solution_patch'][:2000]}\n\n"
+                f"{r['instruction'][:2400]}\n\n"
                 + (
-                    f"### Live `/app` Repository Files\n{r['repo_files_summary']}\n\n"
+                    f"### Live `/app` Repository Files\n{r['repo_files_summary'][:1200]}\n\n"
                     if args.long_context
                     else ""
                 )
             )
+            issue_patch_txt = (
+                f"### Target Patch Context (`{r['primary_fpath']}`)\n"
+                f"{r['solution_patch'][:3000]}\n\n"
+            )
+            issue_hdr_ids = tokenizer.encode(
+                issue_header_txt, add_special_tokens=False
+            )
+            issue_patch_ids = tokenizer.encode(
+                issue_patch_txt, add_special_tokens=False
+            )
+            max_issue_hdr = max(
+                64, issue_blks * block_size - len(issue_patch_ids) - 8
+            )
+            issue_raw_ids = issue_hdr_ids[:max_issue_hdr] + issue_patch_ids
         issue_base_anc = _tag_task_anchor_blocks(
-            _repeat_and_align(
-                tokenizer.encode(issue_txt, add_special_tokens=False),
-                issue_blks,
-            ),
+            _repeat_and_align(issue_raw_ids, issue_blks),
             issue_blks,
             role_id=2,
             task_idx=t_idx,
@@ -968,18 +972,28 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                             r["live_app_dir"], rel_p, 1, num_lines=160
                         )
                     )
-            primary_view_txt = _read_live_file_window(
-                r["live_app_dir"], open_rel, open_start_ln, num_lines=48
+            live_view_txt = "\n\n".join(multi_views)
+            views_ids = tokenizer.encode(
+                live_view_txt, add_special_tokens=False
             )
-            live_view_txt = (
-                "\n\n".join(multi_views)
-                + f"\n\n### Primary Target File (`{r['primary_fpath']}`)\n{primary_view_txt}\n\n"
-                + f"### Target Patch Context (`{r['primary_fpath']}`)\n{s0['hunk_text'][:2000]}\n\n"
+            patch_footer_txt = (
+                f"\n\n### Target Patch Context (`{r['primary_fpath']}`)\n"
+                f"{s0['hunk_text'][:1600]}\n\n"
             )
-            obs_raw_ids = _repeat_and_align(
-                tokenizer.encode(live_view_txt, add_special_tokens=False),
-                obs_blks,
+            patch_footer_ids = tokenizer.encode(
+                patch_footer_txt, add_special_tokens=False
             )
+            obs_target_toks = obs_blks * block_size
+            mid_budget = max(
+                block_size, obs_target_toks - 2 * len(patch_footer_ids)
+            )
+            while len(views_ids) < mid_budget:
+                views_ids = views_ids + views_ids
+            obs_raw_ids = (
+                patch_footer_ids
+                + views_ids[:mid_budget]
+                + patch_footer_ids
+            )[:obs_target_toks]
         else:
             live_view_txt = _read_live_file_window(
                 r["live_app_dir"], open_rel, open_start_ln, num_lines=32
@@ -1234,20 +1248,23 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
             # Intra-step tool verification query on the active turn's KV prefix (reverse order for MRU head)
-            verify_indexed_prompts = [
-                (
-                    idx,
+            if not args.long_context:
+                verify_indexed_prompts = [
                     (
-                        p_ids[:-2] + [p_ids[-1], p_ids[-2]]
-                        if len(p_ids) >= 2
-                        else p_ids
-                    ),
+                        idx,
+                        (
+                            p_ids[:-2] + [p_ids[-1], p_ids[-2]]
+                            if len(p_ids) >= 2
+                            else p_ids
+                        ),
+                    )
+                    for idx, p_ids in reversed(active_indexed_prompts)
+                ]
+                wave_verify_results = await _run_indexed_batches(
+                    verify_indexed_prompts, 1, cur_batch_sz
                 )
-                for idx, p_ids in reversed(active_indexed_prompts)
-            ]
-            wave_verify_results = await _run_indexed_batches(
-                verify_indexed_prompts, 1, cur_batch_sz
-            )
+            else:
+                wave_verify_results = []
 
             # Apply live tool action to each rollout's `/app` repository as the step executes
             for (r_idx, _), step_res in zip(
@@ -1296,7 +1313,14 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     }
                 )
 
-            active_mru_indices = [idx for idx, _ in active_indexed_prompts]
+            active_mru_indices = [
+                idx
+                for idx, _ in (
+                    reversed(active_indexed_prompts)
+                    if args.long_context
+                    else active_indexed_prompts
+                )
+            ]
             active_set = set(active_mru_indices)
             mru_order = active_mru_indices + [
                 i for i in mru_order if i not in active_set
@@ -1304,6 +1328,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             wave_results = wave_ingest_results + wave_verify_results
             wave_dur_s = time.perf_counter() - t_wave0
             completed_turns += len(wave_ingest_results)
+            reqs_per_turn = 1 if args.long_context else 2
 
             est_unique_blks = int(
                 min(completed_turns, num_rollouts) * step0_blks
@@ -1319,7 +1344,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 estimated_unique_blocks=est_unique_blks,
                 block_size=args.block_size,
                 full_blocks_per_turn=full_blocks_per_turn,
-                num_requests_completed=completed_turns * 2,
+                num_requests_completed=completed_turns * reqs_per_turn,
             )
             wave_stats = extract_effective_hit_metrics(
                 snap,
@@ -1380,6 +1405,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             min(completed_turns, num_rollouts) * step0_blks
             + max(0, completed_turns - num_rollouts) * subseq_new_blks
         )
+        reqs_per_turn = 1 if args.long_context else 2
         rollout_metrics = extract_effective_hit_metrics(
             after_rollout_snap,
             base_snap,
@@ -1389,7 +1415,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             estimated_unique_blocks=final_est_unique,
             block_size=args.block_size,
             full_blocks_per_turn=full_blocks_per_turn,
-            num_requests_completed=completed_turns * 2,
+            num_requests_completed=completed_turns * reqs_per_turn,
         )
 
         # Step 2: Final Patch Submission & Cache Residency Evaluation Wave (`max_tokens=64`)
@@ -1399,14 +1425,19 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             flush=True,
         )
         t_eval_start = time.perf_counter()
+        denom_blks = (
+            max(1, full_blocks_per_turn)
+            if args.long_context
+            else max(1, full_blocks_per_turn - 1)
+        )
         max_resident_window = (
             min(
                 num_rollouts,
                 max(
                     1,
                     int(
-                        args.capacity_blocks
-                        // max(1, full_blocks_per_turn - 1)
+                        max(0, args.capacity_blocks - resident_batch_sz * 2)
+                        // denom_blks
                     ),
                 ),
             )
@@ -1487,7 +1518,8 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             estimated_unique_blocks=final_est_unique,
             block_size=args.block_size,
             full_blocks_per_turn=full_blocks_per_turn,
-            num_requests_completed=completed_turns * 2 + num_rollouts,
+            num_requests_completed=completed_turns * reqs_per_turn
+            + num_rollouts,
         )
 
         # Step 3: Commit finalized patch to each rollout's live `/app` repo, extract `git diff`,
