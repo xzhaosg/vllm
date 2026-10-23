@@ -2856,6 +2856,16 @@ class DeltaBlockStore:
             eta_k_t = torch.linalg.norm(delta_k) / torch.linalg.norm(k_fp32).clamp(
                 min=1e-8
             )
+            if not policy.is_mamba and delta_k.ndim >= 2 and delta_k.shape[0] >= 32:
+                b_tok_w = (delta_k.shape[0] // 16) * 16
+                n_win = b_tok_w // 16
+                dk_w = delta_k[:b_tok_w].reshape(n_win, -1)
+                k_w = k_fp32[:b_tok_w].reshape(n_win, -1)
+                win_eta_k = (
+                    torch.linalg.norm(dk_w, dim=-1)
+                    / torch.linalg.norm(k_w, dim=-1).clamp(min=1e-6)
+                ).amax()
+                eta_k_t = torch.maximum(eta_k_t, win_eta_k)
             check_outliers = (
                 not policy.is_mamba
                 and policy.max_sparse_exceptions > 0
@@ -2863,6 +2873,7 @@ class DeltaBlockStore:
                 and delta_k.shape[0] >= 4
             )
             outlier_mask: torch.Tensor | None = None
+            tok_eta: torch.Tensor | None = None
 
             if v_cpu is not None and base_raw_v is not None:
                 v_fp32 = v_cpu.to(torch.float32)
@@ -2870,8 +2881,19 @@ class DeltaBlockStore:
                 eta_v_t = torch.linalg.norm(delta_v) / torch.linalg.norm(v_fp32).clamp(
                     min=1e-8
                 )
+                if not policy.is_mamba and delta_v.ndim >= 2 and delta_v.shape[0] >= 32:
+                    b_tok_w = (delta_v.shape[0] // 16) * 16
+                    n_win = b_tok_w // 16
+                    dv_w = delta_v[:b_tok_w].reshape(n_win, -1)
+                    v_w = v_fp32[:b_tok_w].reshape(n_win, -1)
+                    win_eta_v = (
+                        torch.linalg.norm(dv_w, dim=-1)
+                        / torch.linalg.norm(v_w, dim=-1).clamp(min=1e-6)
+                    ).amax()
+                    eta_v_t = torch.maximum(eta_v_t, win_eta_v)
                 if check_outliers:
                     b_tok = delta_k.shape[0]
+                    outlier_thresh = 0.08 if b_tok >= 128 else 0.65
                     dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
                     k_tok = torch.linalg.norm(k_fp32.reshape(b_tok, -1), dim=-1).clamp(
                         min=1e-6
@@ -2881,7 +2903,7 @@ class DeltaBlockStore:
                         min=1e-6
                     )
                     tok_eta = torch.maximum(dk_tok / k_tok, dv_tok / v_tok)
-                    outlier_mask = tok_eta > 0.65
+                    outlier_mask = tok_eta > outlier_thresh
                     eta_k, eta_v, num_outliers_f = torch.stack(
                         [eta_k_t, eta_v_t, outlier_mask.sum().to(torch.float32)]
                     ).tolist()
@@ -2895,11 +2917,13 @@ class DeltaBlockStore:
                 v_fp32 = None
                 if check_outliers:
                     b_tok = delta_k.shape[0]
+                    outlier_thresh = 0.08 if b_tok >= 128 else 0.65
                     dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
                     k_tok = torch.linalg.norm(k_fp32.reshape(b_tok, -1), dim=-1).clamp(
                         min=1e-6
                     )
-                    outlier_mask = (dk_tok / k_tok) > 0.65
+                    tok_eta = dk_tok / k_tok
+                    outlier_mask = tok_eta > outlier_thresh
                     eta_k, num_outliers_f = torch.stack(
                         [eta_k_t, outlier_mask.sum().to(torch.float32)]
                     ).tolist()
@@ -2940,12 +2964,32 @@ class DeltaBlockStore:
                     layer_name, record, raw_bytes, root_block_hash=root_block_hash
                 )
 
-            # Check for localized 1-2 token MoE/attention-sink spikes inside an
+            # Check for localized token MoE/attention-sink spikes inside an
             # exact-token-match block before falling through to dense INT2/INT4:
             if check_outliers and outlier_mask is not None:
-                max_sparse = min(2, policy.max_sparse_exceptions)
-                if 0 < num_outliers <= max_sparse:
-                    outlier_idx = torch.nonzero(outlier_mask, as_tuple=False).reshape(-1)
+                b_tok = delta_k.shape[0]
+                max_sparse = (
+                    min(
+                        b_tok // 8,
+                        max(
+                            policy.max_sparse_exceptions,
+                            (b_tok * policy.max_sparse_exceptions) // 64,
+                        ),
+                    )
+                    if b_tok >= 128
+                    else min(2, policy.max_sparse_exceptions)
+                )
+                if 0 < num_outliers and (num_outliers <= max_sparse or b_tok >= 128):
+                    if num_outliers <= max_sparse:
+                        outlier_idx = torch.nonzero(
+                            outlier_mask, as_tuple=False
+                        ).reshape(-1)
+                    else:
+                        assert tok_eta is not None
+                        _, top_o_idx = torch.topk(
+                            tok_eta, k=min(max_sparse, b_tok)
+                        )
+                        outlier_idx, _ = torch.sort(top_o_idx)
                     delta_k_rem = delta_k.clone()
                     delta_k_rem[outlier_idx] = 0.0
                     k_rem = k_fp32.clone()
@@ -2953,6 +2997,16 @@ class DeltaBlockStore:
                     rem_eta_k_t = torch.linalg.norm(delta_k_rem) / torch.linalg.norm(
                         k_rem
                     ).clamp(min=1e-8)
+                    if b_tok >= 32:
+                        b_tok_w = (b_tok // 16) * 16
+                        n_win = b_tok_w // 16
+                        dk_rw = delta_k_rem[:b_tok_w].reshape(n_win, -1)
+                        k_rw = k_rem[:b_tok_w].reshape(n_win, -1)
+                        win_rem_k = (
+                            torch.linalg.norm(dk_rw, dim=-1)
+                            / torch.linalg.norm(k_rw, dim=-1).clamp(min=1e-6)
+                        ).amax()
+                        rem_eta_k_t = torch.maximum(rem_eta_k_t, win_rem_k)
                     if delta_v is not None and v_fp32 is not None:
                         delta_v_rem = delta_v.clone()
                         delta_v_rem[outlier_idx] = 0.0
@@ -2961,6 +3015,16 @@ class DeltaBlockStore:
                         rem_eta_v_t = torch.linalg.norm(
                             delta_v_rem
                         ) / torch.linalg.norm(v_rem).clamp(min=1e-8)
+                        if b_tok >= 32:
+                            b_tok_w = (b_tok // 16) * 16
+                            n_win = b_tok_w // 16
+                            dv_rw = delta_v_rem[:b_tok_w].reshape(n_win, -1)
+                            v_rw = v_rem[:b_tok_w].reshape(n_win, -1)
+                            win_rem_v = (
+                                torch.linalg.norm(dv_rw, dim=-1)
+                                / torch.linalg.norm(v_rw, dim=-1).clamp(min=1e-6)
+                            ).amax()
+                            rem_eta_v_t = torch.maximum(rem_eta_v_t, win_rem_v)
                         rem_eta_k, rem_eta_v = torch.stack(
                             [rem_eta_k_t, rem_eta_v_t]
                         ).tolist()
@@ -3008,6 +3072,55 @@ class DeltaBlockStore:
                             raw_bytes,
                             root_block_hash=root_block_hash,
                         )
+
+            if (
+                policy.is_mamba
+                and k_cpu.ndim >= 3
+                and eta_max <= policy.tau_int4
+            ):
+                k_rows = k_cpu.reshape(-1, k_cpu.shape[-1])
+                r_total = k_rows.shape[0]
+                if r_total >= 8:
+                    dk_rows = delta_k.reshape(r_total, -1)
+                    k_rows_fp32 = k_fp32.reshape(r_total, -1)
+                    r_dk_norm = torch.linalg.norm(dk_rows, dim=-1)
+                    r_k_norm = torch.linalg.norm(k_rows_fp32, dim=-1).clamp(min=1e-6)
+                    r_score = r_dk_norm * (r_dk_norm / r_k_norm)
+                    k_mamba = max(1, r_total // 8)
+                    _, top_r = torch.topk(r_score, k=k_mamba)
+                    top_r_sorted, _ = torch.sort(top_r)
+                    dk_rem_rows = dk_rows.clone()
+                    dk_rem_rows[top_r_sorted] = 0.0
+                    q_dk = quantize_residual_packed(
+                        dk_rem_rows.reshape(delta_k.shape).to(k_work.dtype),
+                        bits=4,
+                    )
+                    record = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                        full_block_hash=full_block_hash,
+                        token_block_hash=token_hash,
+                        token_ids=token_tuple,
+                        start_position=start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=is_mla,
+                        ref_base_hash=base_rec.full_block_hash,
+                        delta_pos=delta_pos,
+                        ref_base_hash_2=ref_hash_2,
+                        stitch_offset=stitch_offset,
+                        quant_delta_k=q_dk,
+                        quant_delta_v=None,
+                        sparse_token_indices=top_r_sorted.to(torch.int16),
+                        sparse_k_bf16=k_rows[top_r_sorted].clone(),
+                        sparse_v_bf16=(
+                            v_cpu.clone() if v_cpu is not None else None
+                        ),
+                    )
+                    return self._commit_record(
+                        layer_name,
+                        record,
+                        raw_bytes,
+                        root_block_hash=root_block_hash,
+                    )
 
             eff_tau_int2 = (
                 policy.tau_int2 if is_fp8_mla else min(policy.tau_int2, 0.08)
@@ -3164,6 +3277,51 @@ class DeltaBlockStore:
                         root_block_hash=root_block_hash,
                     )
 
+                if k_cpu.ndim >= 3 and eta_max <= policy.tau_int4:
+                    k_rows = k_cpu.reshape(-1, k_cpu.shape[-1])
+                    r_total = k_rows.shape[0]
+                    if r_total >= 8:
+                        dk_rows = delta_k.reshape(r_total, -1)
+                        k_rows_fp32 = k_fp32.reshape(r_total, -1)
+                        r_dk_norm = torch.linalg.norm(dk_rows, dim=-1)
+                        r_k_norm = torch.linalg.norm(k_rows_fp32, dim=-1).clamp(
+                            min=1e-6
+                        )
+                        r_score = r_dk_norm * (r_dk_norm / r_k_norm)
+                        k_mamba = max(1, r_total // 8)
+                        _, top_r = torch.topk(r_score, k=k_mamba)
+                        top_r_sorted, _ = torch.sort(top_r)
+                        dk_rem_rows = dk_rows.clone()
+                        dk_rem_rows[top_r_sorted] = 0.0
+                        q_dk = quantize_residual_packed(
+                            dk_rem_rows.reshape(delta_k.shape).to(k_cpu.dtype),
+                            bits=4,
+                        )
+                        record = CompressedKVBlockRecord(
+                            tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                            full_block_hash=full_block_hash,
+                            token_block_hash=token_hash,
+                            token_ids=token_tuple,
+                            start_position=start_position,
+                            layer_idx=policy.layer_idx,
+                            is_mla=is_mla,
+                            ref_base_hash=partial_base.full_block_hash,
+                            delta_pos=delta_pos,
+                            quant_delta_k=q_dk,
+                            quant_delta_v=None,
+                            sparse_token_indices=top_r_sorted.to(torch.int16),
+                            sparse_k_bf16=k_rows[top_r_sorted].clone(),
+                            sparse_v_bf16=(
+                                v_cpu.clone() if v_cpu is not None else None
+                            ),
+                        )
+                        return self._commit_record(
+                            layer_name,
+                            record,
+                            raw_bytes,
+                            root_block_hash=root_block_hash,
+                        )
+
                 if eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4:
                     q_dk = quantize_residual_packed(delta_k.to(k_cpu.dtype), bits=2)
                     q_dv = (
@@ -3262,7 +3420,19 @@ class DeltaBlockStore:
                     )
                 else:
                     all_sparse_indices = list(diff_indices)
-                rem_slots = policy.max_sparse_exceptions - len(all_sparse_indices)
+                eff_max_sparse = (
+                    min(
+                        b_tok // 8,
+                        max(
+                            policy.max_sparse_exceptions,
+                            (b_tok * policy.max_sparse_exceptions) // 64,
+                        ),
+                    )
+                    if b_tok >= 128
+                    else policy.max_sparse_exceptions
+                )
+                outlier_thresh = 0.08 if b_tok >= 128 else 0.65
+                rem_slots = eff_max_sparse - len(all_sparse_indices)
                 if rem_slots > 0 and delta_k.ndim >= 2 and b_tok >= 4:
                     dk_tok = torch.linalg.norm(delta_k.reshape(b_tok, -1), dim=-1)
                     k_tok = torch.linalg.norm(
@@ -3281,7 +3451,7 @@ class DeltaBlockStore:
                     for val, idx_i in torch.stack(
                         [top_vals, top_idxs.to(torch.float32)], dim=-1
                     ).tolist():
-                        if val > 0.65:
+                        if val > outlier_thresh:
                             all_sparse_indices.append(int(idx_i))
                     all_sparse_indices.sort()
 
@@ -3297,6 +3467,16 @@ class DeltaBlockStore:
                 eta_k_t = torch.linalg.norm(delta_k) / torch.linalg.norm(k_rem).clamp(
                     min=1e-8
                 )
+                if b_tok >= 32:
+                    b_tok_w = (b_tok // 16) * 16
+                    n_win = b_tok_w // 16
+                    dk_rw = delta_k[:b_tok_w].reshape(n_win, -1)
+                    k_rw = k_rem[:b_tok_w].reshape(n_win, -1)
+                    win_eta_k = (
+                        torch.linalg.norm(dk_rw, dim=-1)
+                        / torch.linalg.norm(k_rw, dim=-1).clamp(min=1e-6)
+                    ).amax()
+                    eta_k_t = torch.maximum(eta_k_t, win_eta_k)
 
                 if delta_v is not None and v_cpu is not None:
                     delta_v[idx_tensor] = 0.0
@@ -3305,6 +3485,16 @@ class DeltaBlockStore:
                     eta_v_t = torch.linalg.norm(delta_v) / torch.linalg.norm(
                         v_rem
                     ).clamp(min=1e-8)
+                    if b_tok >= 32:
+                        b_tok_w = (b_tok // 16) * 16
+                        n_win = b_tok_w // 16
+                        dv_rw = delta_v[:b_tok_w].reshape(n_win, -1)
+                        v_rw = v_rem[:b_tok_w].reshape(n_win, -1)
+                        win_eta_v = (
+                            torch.linalg.norm(dv_rw, dim=-1)
+                            / torch.linalg.norm(v_rw, dim=-1).clamp(min=1e-6)
+                        ).amax()
+                        eta_v_t = torch.maximum(eta_v_t, win_eta_v)
                     eta_k, eta_v = torch.stack([eta_k_t, eta_v_t]).tolist()
                     eta_max = max(eta_k, eta_v)
                 else:
@@ -3836,6 +4026,20 @@ class DeltaBlockStore:
             eta_k_t = torch.linalg.norm(delta_k.reshape(m, -1), dim=-1) / (
                 torch.linalg.norm(k_fp32.reshape(m, -1), dim=-1).clamp(min=1e-8)
             )
+            if (
+                not policy.is_mamba
+                and delta_k.ndim >= 3
+                and delta_k.shape[1] >= 32
+            ):
+                b_tok_w = (delta_k.shape[1] // 16) * 16
+                n_win = b_tok_w // 16
+                dk_w = delta_k[:, :b_tok_w].reshape(m, n_win, -1)
+                k_w = k_fp32[:, :b_tok_w].reshape(m, n_win, -1)
+                win_eta_k = (
+                    torch.linalg.norm(dk_w, dim=-1)
+                    / torch.linalg.norm(k_w, dim=-1).clamp(min=1e-6)
+                ).amax(dim=-1)
+                eta_k_t = torch.maximum(eta_k_t, win_eta_k)
 
             has_v = (
                 v_cpus[exact_group[0][0]] is not None
@@ -3855,6 +4059,20 @@ class DeltaBlockStore:
                         min=1e-8
                     )
                 )
+                if (
+                    not policy.is_mamba
+                    and delta_v.ndim >= 3
+                    and delta_v.shape[1] >= 32
+                ):
+                    b_tok_w = (delta_v.shape[1] // 16) * 16
+                    n_win = b_tok_w // 16
+                    dv_w = delta_v[:, :b_tok_w].reshape(m, n_win, -1)
+                    v_w = v_fp32[:, :b_tok_w].reshape(m, n_win, -1)
+                    win_eta_v = (
+                        torch.linalg.norm(dv_w, dim=-1)
+                        / torch.linalg.norm(v_w, dim=-1).clamp(min=1e-6)
+                    ).amax(dim=-1)
+                    eta_v_t = torch.maximum(eta_v_t, win_eta_v)
             else:
                 v_stack = None
                 v_fp32 = None
@@ -3869,6 +4087,7 @@ class DeltaBlockStore:
             )
             if check_outliers:
                 b_tok = delta_k.shape[1]
+                outlier_thresh = 0.08 if b_tok >= 128 else 0.65
                 dk_tok = torch.linalg.norm(
                     delta_k.reshape(m, b_tok, -1), dim=-1
                 )
@@ -3884,18 +4103,20 @@ class DeltaBlockStore:
                         v_fp32.reshape(m, b_tok, -1), dim=-1
                     ).clamp(min=1e-6)
                     tok_eta = torch.maximum(tok_eta, dv_tok / v_tok)
-                outlier_mask = tok_eta > 0.65
+                outlier_mask = tok_eta > outlier_thresh
                 num_outliers_t = outlier_mask.sum(dim=-1).to(torch.float32)
                 metrics_rows = torch.stack(
                     [eta_k_t, eta_v_t, num_outliers_t], dim=-1
                 ).tolist()
             else:
+                tok_eta = None
                 outlier_mask = None
                 metrics_rows = torch.stack([eta_k_t, eta_v_t], dim=-1).tolist()
 
             eff_tau_int2 = (
                 policy.tau_int2 if is_fp8_mla else min(policy.tau_int2, 0.08)
             )
+            mamba_tier3_g_idxs: list[int] = []
             tier1_g_idxs: list[int] = []
             tier2_g_idxs: list[int] = []
 
@@ -3948,73 +4169,126 @@ class DeltaBlockStore:
                     )
                     continue
 
-                if (
-                    check_outliers
-                    and outlier_mask is not None
-                    and 0 < num_outliers <= min(2, policy.max_sparse_exceptions)
-                ):
-                    outlier_idx = torch.nonzero(
-                        outlier_mask[g_idx], as_tuple=False
-                    ).reshape(-1)
-                    dk_single = delta_k[g_idx].clone()
-                    dk_single[outlier_idx] = 0.0
-                    k_rem = k_fp32[g_idx].clone()
-                    k_rem[outlier_idx] = 0.0
-                    rem_eta_k_t = torch.linalg.norm(dk_single) / (
-                        torch.linalg.norm(k_rem).clamp(min=1e-8)
+                if check_outliers and outlier_mask is not None:
+                    b_tok = delta_k.shape[1]
+                    max_sparse = (
+                        min(
+                            b_tok // 8,
+                            max(
+                                policy.max_sparse_exceptions,
+                                (b_tok * policy.max_sparse_exceptions) // 64,
+                            ),
+                        )
+                        if b_tok >= 128
+                        else min(2, policy.max_sparse_exceptions)
                     )
-                    if delta_v is not None and v_fp32 is not None:
-                        dv_single = delta_v[g_idx].clone()
-                        dv_single[outlier_idx] = 0.0
-                        v_rem = v_fp32[g_idx].clone()
-                        v_rem[outlier_idx] = 0.0
-                        rem_eta_v_t = torch.linalg.norm(dv_single) / (
-                            torch.linalg.norm(v_rem).clamp(min=1e-8)
-                        )
-                        rem_eta_k, rem_eta_v = torch.stack(
-                            [rem_eta_k_t, rem_eta_v_t]
-                        ).tolist()
-                        rem_eta_max = max(rem_eta_k, rem_eta_v)
-                    else:
-                        dv_single = None
-                        rem_eta_max = float(rem_eta_k_t.item())
-
-                    if rem_eta_max <= policy.tau_int4:
-                        k_c = k_cpus[item_idx]
-                        v_c = v_cpus[item_idx]
-                        sparse_k = k_c[outlier_idx].clone()
-                        sparse_v = (
-                            v_c[outlier_idx].clone() if v_c is not None else None
-                        )
-                        q_dk = quantize_residual_packed(
-                            dk_single.to(k_stack.dtype), bits=delta_bits_4
-                        )
-                        q_dv = (
-                            quantize_residual_packed(
-                                dv_single.to(v_c.dtype), bits=4
+                    if 0 < num_outliers and (
+                        num_outliers <= max_sparse or b_tok >= 128
+                    ):
+                        if num_outliers <= max_sparse:
+                            outlier_idx = torch.nonzero(
+                                outlier_mask[g_idx], as_tuple=False
+                            ).reshape(-1)
+                        else:
+                            assert tok_eta is not None
+                            _, top_o_idx = torch.topk(
+                                tok_eta[g_idx], k=min(max_sparse, b_tok)
                             )
-                            if (dv_single is not None and v_c is not None)
-                            else None
+                            outlier_idx, _ = torch.sort(top_o_idx)
+                        dk_single = delta_k[g_idx].clone()
+                        dk_single[outlier_idx] = 0.0
+                        k_rem = k_fp32[g_idx].clone()
+                        k_rem[outlier_idx] = 0.0
+                        rem_eta_k_t = torch.linalg.norm(dk_single) / (
+                            torch.linalg.norm(k_rem).clamp(min=1e-8)
                         )
-                        records[item_idx] = CompressedKVBlockRecord(
-                            tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
-                            full_block_hash=blk_spec.full_block_hash,
-                            token_block_hash=token_hashes[item_idx],
-                            token_ids=token_tuples[item_idx],
-                            start_position=blk_spec.start_position,
-                            layer_idx=policy.layer_idx,
-                            is_mla=is_mla,
-                            ref_base_hash=base_rec.full_block_hash,
-                            delta_pos=delta_pos,
-                            ref_base_hash_2=ref_hash_2,
-                            stitch_offset=stitch_offset,
-                            quant_delta_k=q_dk,
-                            quant_delta_v=q_dv,
-                            sparse_token_indices=outlier_idx.to(torch.int16),
-                            sparse_k_bf16=sparse_k,
-                            sparse_v_bf16=sparse_v,
-                        )
-                        continue
+                        if b_tok >= 32:
+                            b_tok_w = (b_tok // 16) * 16
+                            n_win = b_tok_w // 16
+                            dk_rw = dk_single[:b_tok_w].reshape(n_win, -1)
+                            k_rw = k_rem[:b_tok_w].reshape(n_win, -1)
+                            win_rem_k = (
+                                torch.linalg.norm(dk_rw, dim=-1)
+                                / torch.linalg.norm(k_rw, dim=-1).clamp(min=1e-6)
+                            ).amax()
+                            rem_eta_k_t = torch.maximum(rem_eta_k_t, win_rem_k)
+                        if delta_v is not None and v_fp32 is not None:
+                            dv_single = delta_v[g_idx].clone()
+                            dv_single[outlier_idx] = 0.0
+                            v_rem = v_fp32[g_idx].clone()
+                            v_rem[outlier_idx] = 0.0
+                            rem_eta_v_t = torch.linalg.norm(dv_single) / (
+                                torch.linalg.norm(v_rem).clamp(min=1e-8)
+                            )
+                            if b_tok >= 32:
+                                b_tok_w = (b_tok // 16) * 16
+                                n_win = b_tok_w // 16
+                                dv_rw = dv_single[:b_tok_w].reshape(n_win, -1)
+                                v_rw = v_rem[:b_tok_w].reshape(n_win, -1)
+                                win_rem_v = (
+                                    torch.linalg.norm(dv_rw, dim=-1)
+                                    / torch.linalg.norm(v_rw, dim=-1).clamp(
+                                        min=1e-6
+                                    )
+                                ).amax()
+                                rem_eta_v_t = torch.maximum(
+                                    rem_eta_v_t, win_rem_v
+                                )
+                            rem_eta_k, rem_eta_v = torch.stack(
+                                [rem_eta_k_t, rem_eta_v_t]
+                            ).tolist()
+                            rem_eta_max = max(rem_eta_k, rem_eta_v)
+                        else:
+                            dv_single = None
+                            rem_eta_max = float(rem_eta_k_t.item())
+
+                        if rem_eta_max <= policy.tau_int4:
+                            k_c = k_cpus[item_idx]
+                            v_c = v_cpus[item_idx]
+                            sparse_k = k_c[outlier_idx].clone()
+                            sparse_v = (
+                                v_c[outlier_idx].clone()
+                                if v_c is not None
+                                else None
+                            )
+                            q_dk = quantize_residual_packed(
+                                dk_single.to(k_stack.dtype), bits=delta_bits_4
+                            )
+                            q_dv = (
+                                quantize_residual_packed(
+                                    dv_single.to(v_c.dtype), bits=4
+                                )
+                                if (dv_single is not None and v_c is not None)
+                                else None
+                            )
+                            records[item_idx] = CompressedKVBlockRecord(
+                                tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                                full_block_hash=blk_spec.full_block_hash,
+                                token_block_hash=token_hashes[item_idx],
+                                token_ids=token_tuples[item_idx],
+                                start_position=blk_spec.start_position,
+                                layer_idx=policy.layer_idx,
+                                is_mla=is_mla,
+                                ref_base_hash=base_rec.full_block_hash,
+                                delta_pos=delta_pos,
+                                ref_base_hash_2=ref_hash_2,
+                                stitch_offset=stitch_offset,
+                                quant_delta_k=q_dk,
+                                quant_delta_v=q_dv,
+                                sparse_token_indices=outlier_idx.to(torch.int16),
+                                sparse_k_bf16=sparse_k,
+                                sparse_v_bf16=sparse_v,
+                            )
+                            continue
+
+                if (
+                    policy.is_mamba
+                    and k_stack_raw.ndim >= 4
+                    and (k_stack_raw[0].numel() // k_stack_raw.shape[-1]) >= 8
+                    and eta_max <= policy.tau_int4
+                ):
+                    mamba_tier3_g_idxs.append(g_idx)
+                    continue
 
                 tier1_eligible = (
                     (eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4)
@@ -4029,6 +4303,66 @@ class DeltaBlockStore:
                     tier1_g_idxs.append(g_idx)
                 elif eta_max <= policy.tau_int4:
                     tier2_g_idxs.append(g_idx)
+
+            if mamba_tier3_g_idxs:
+                m_sub = len(mamba_tier3_g_idxs)
+                sub_k = k_stack_raw[mamba_tier3_g_idxs]
+                sub_dk = delta_k[mamba_tier3_g_idxs]
+                sub_k_fp32 = k_fp32[mamba_tier3_g_idxs]
+                r_total = sub_k[0].numel() // sub_k.shape[-1]
+                dk_rows = sub_dk.reshape(m_sub, r_total, -1)
+                k_rows_fp32 = sub_k_fp32.reshape(m_sub, r_total, -1)
+                r_dk_norm = torch.linalg.norm(dk_rows, dim=-1)
+                r_k_norm = torch.linalg.norm(k_rows_fp32, dim=-1).clamp(min=1e-6)
+                r_score = r_dk_norm * (r_dk_norm / r_k_norm)
+                k_mamba = max(1, r_total // 8)
+                _, top_r = torch.topk(r_score, k=k_mamba, dim=-1)
+                top_r_sorted, _ = torch.sort(top_r, dim=-1)
+                dk_rem_rows = dk_rows.clone()
+                batch_arange = torch.arange(
+                    m_sub, device=dk_rows.device
+                ).unsqueeze(1)
+                dk_rem_rows[batch_arange, top_r_sorted] = 0.0
+                q_dk_mamba_list = quantize_residual_packed_batch(
+                    dk_rem_rows.reshape(sub_dk.shape).to(k_stack.dtype),
+                    bits=4,
+                )
+                sub_k_rows = sub_k.reshape(m_sub, r_total, -1)
+                sparse_k_batch = sub_k_rows[batch_arange, top_r_sorted]
+                for sub_i, g_idx in enumerate(mamba_tier3_g_idxs):
+                    (
+                        item_idx,
+                        base_rec,
+                        base_rec_2,
+                        stitch_offset,
+                        delta_pos,
+                    ) = exact_group[g_idx]
+                    blk_spec = items[item_idx][0]
+                    v_c = v_cpus[item_idx]
+                    records[item_idx] = CompressedKVBlockRecord(
+                        tier=CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA,
+                        full_block_hash=blk_spec.full_block_hash,
+                        token_block_hash=token_hashes[item_idx],
+                        token_ids=token_tuples[item_idx],
+                        start_position=blk_spec.start_position,
+                        layer_idx=policy.layer_idx,
+                        is_mla=v_c is None and not policy.is_mamba,
+                        ref_base_hash=base_rec.full_block_hash,
+                        delta_pos=delta_pos,
+                        ref_base_hash_2=(
+                            base_rec_2.full_block_hash
+                            if base_rec_2 is not None
+                            else None
+                        ),
+                        stitch_offset=stitch_offset,
+                        quant_delta_k=q_dk_mamba_list[sub_i],
+                        quant_delta_v=None,
+                        sparse_token_indices=top_r_sorted[sub_i].to(torch.int16),
+                        sparse_k_bf16=sparse_k_batch[sub_i].clone(),
+                        sparse_v_bf16=(
+                            v_c.clone() if v_c is not None else None
+                        ),
+                    )
 
             if tier1_g_idxs:
                 q_dk_list = quantize_residual_packed_batch(
@@ -4235,6 +4569,18 @@ class DeltaBlockStore:
                 delta_v = None
 
             b_tok = delta_k.shape[1]
+            eff_max_sparse = (
+                min(
+                    b_tok // 8,
+                    max(
+                        policy.max_sparse_exceptions,
+                        (b_tok * policy.max_sparse_exceptions) // 64,
+                    ),
+                )
+                if b_tok >= 128
+                else policy.max_sparse_exceptions
+            )
+            outlier_thresh = 0.08 if b_tok >= 128 else 0.65
             all_sparse_per_p: list[list[int]] = [
                 sorted(
                     {
@@ -4249,7 +4595,7 @@ class DeltaBlockStore:
             max_rem_slots = max(
                 0,
                 max(
-                    policy.max_sparse_exceptions - len(s_idx)
+                    eff_max_sparse - len(s_idx)
                     for s_idx in all_sparse_per_p
                 ),
             )
@@ -4282,12 +4628,12 @@ class DeltaBlockStore:
                     [top_vals, top_idxs.to(torch.float32)], dim=-1
                 ).tolist()
                 for p_i, row in enumerate(top_rows):
-                    rem_s = policy.max_sparse_exceptions - len(
+                    rem_s = eff_max_sparse - len(
                         all_sparse_per_p[p_i]
                     )
                     if rem_s > 0:
                         for val, idx_f in row[:rem_s]:
-                            if val > 0.65:
+                            if val > outlier_thresh:
                                 all_sparse_per_p[p_i].append(int(idx_f))
                         all_sparse_per_p[p_i].sort()
 
@@ -4304,6 +4650,16 @@ class DeltaBlockStore:
             eta_k_t = torch.linalg.norm(delta_k.reshape(p, -1), dim=-1) / (
                 torch.linalg.norm(k_rem.reshape(p, -1), dim=-1).clamp(min=1e-8)
             )
+            if delta_k.ndim >= 3 and b_tok >= 32:
+                b_tok_w = (b_tok // 16) * 16
+                n_win = b_tok_w // 16
+                dk_rw = delta_k[:, :b_tok_w].reshape(p, n_win, -1)
+                k_rw = k_rem[:, :b_tok_w].reshape(p, n_win, -1)
+                win_eta_k = (
+                    torch.linalg.norm(dk_rw, dim=-1)
+                    / torch.linalg.norm(k_rw, dim=-1).clamp(min=1e-6)
+                ).amax(dim=-1)
+                eta_k_t = torch.maximum(eta_k_t, win_eta_k)
             if has_v and delta_v is not None and v_fp32 is not None:
                 delta_v.masked_fill_(mask_exp, 0.0)
                 v_rem = v_fp32.masked_fill(mask_exp, 0.0)
@@ -4312,6 +4668,16 @@ class DeltaBlockStore:
                         min=1e-8
                     )
                 )
+                if delta_v.ndim >= 3 and b_tok >= 32:
+                    b_tok_w = (b_tok // 16) * 16
+                    n_win = b_tok_w // 16
+                    dv_rw = delta_v[:, :b_tok_w].reshape(p, n_win, -1)
+                    v_rw = v_rem[:, :b_tok_w].reshape(p, n_win, -1)
+                    win_eta_v = (
+                        torch.linalg.norm(dv_rw, dim=-1)
+                        / torch.linalg.norm(v_rw, dim=-1).clamp(min=1e-6)
+                    ).amax(dim=-1)
+                    eta_v_t = torch.maximum(eta_v_t, win_eta_v)
                 p_metrics = torch.stack([eta_k_t, eta_v_t], dim=-1).tolist()
             else:
                 p_metrics = [[float(v), 0.0] for v in eta_k_t.tolist()]
@@ -4921,12 +5287,20 @@ class DeltaBlockStore:
             else:
                 v_out_typed = None
 
-            # Overwrite edited token positions with exact BF16 (or exact uint8) rows
+            # Overwrite edited token positions (or Mamba flattened ssm_state rows) with exact BF16/FP32/uint8
             if rec.sparse_token_indices is not None and rec.sparse_k_bf16 is not None:
                 idx = rec.sparse_token_indices.to(torch.long)
-                k_out_typed[idx] = rec.sparse_k_bf16
+                if rec.sparse_k_bf16.ndim == 2 and k_out_typed.ndim >= 3:
+                    k_out_typed.view(-1, k_out_typed.shape[-1])[idx] = (
+                        rec.sparse_k_bf16
+                    )
+                else:
+                    k_out_typed[idx] = rec.sparse_k_bf16
                 if v_out_typed is not None and rec.sparse_v_bf16 is not None:
-                    v_out_typed[idx] = rec.sparse_v_bf16
+                    if rec.sparse_v_bf16.shape == v_out_typed.shape:
+                        v_out_typed.copy_(rec.sparse_v_bf16)
+                    else:
+                        v_out_typed[idx] = rec.sparse_v_bf16
             return k_out_typed, v_out_typed
 
         raise ValueError(f"Unsupported compression tier: {rec.tier}")
@@ -5484,9 +5858,17 @@ class DeltaBlockStore:
                     and rec.sparse_k_bf16 is not None
                 ):
                     idx = rec.sparse_token_indices.to(torch.long)
-                    k_item[idx] = rec.sparse_k_bf16
+                    if rec.sparse_k_bf16.ndim == 2 and k_item.ndim >= 3:
+                        k_item.view(-1, k_item.shape[-1])[idx] = (
+                            rec.sparse_k_bf16
+                        )
+                    else:
+                        k_item[idx] = rec.sparse_k_bf16
                     if v_item is not None and rec.sparse_v_bf16 is not None:
-                        v_item[idx] = rec.sparse_v_bf16
+                        if rec.sparse_v_bf16.shape == v_item.shape:
+                            v_item.copy_(rec.sparse_v_bf16)
+                        else:
+                            v_item[idx] = rec.sparse_v_bf16
                 for item_idx in item_indices:
                     results[item_idx] = (
                         k_item.clone() if clone_outputs else k_item,
@@ -5530,6 +5912,8 @@ class DeltaConnectorMetadata(KVConnectorMetadata):
 
     requests: list[DeltaRequestMeta] = field(default_factory=list)
     clear_epoch: int = 0
+    block_size: int = 0
+    layer_to_group_idx: dict[str, int] | None = None
 
 
 @dataclass
@@ -6013,6 +6397,22 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 self._group_is_mamba.append(grp_is_mamba)
                 if grp_non_cacheable:
                     continue
+            pos_group_bs = [bs for bs in self._group_block_sizes if bs > 0]
+            if pos_group_bs:
+                min_grp_bs = min(pos_group_bs)
+                if min_grp_bs > self._block_size:
+                    self._block_size = min_grp_bs
+                    self.store.block_size = min_grp_bs
+            for group_idx, group_spec in enumerate(kv_cache_config.kv_cache_groups):
+                spec = getattr(group_spec, "kv_cache_spec", None)
+                inner_specs = (
+                    getattr(spec, "kv_cache_specs", None)
+                    if spec is not None
+                    else None
+                )
+                grp_is_mamba = self._group_is_mamba[group_idx]
+                if self._group_block_sizes[group_idx] == 0 and not grp_is_mamba:
+                    continue
                 for layer_name in getattr(group_spec, "layer_names", []):
                     self._layer_to_group_idx[layer_name] = group_idx
                     if layer_name in self.store.layer_policies:
@@ -6252,6 +6652,19 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             if connector_metadata.clear_epoch > self.store._clear_epoch:
                 self.store.clear()
                 self.store._clear_epoch = connector_metadata.clear_epoch
+            if (
+                connector_metadata.block_size > 0
+                and connector_metadata.block_size != self._block_size
+            ):
+                self._block_size = connector_metadata.block_size
+                self.store.block_size = connector_metadata.block_size
+            if (
+                connector_metadata.layer_to_group_idx
+                and not self._layer_to_group_idx
+            ):
+                self._layer_to_group_idx.update(
+                    connector_metadata.layer_to_group_idx
+                )
 
     def clear_connector_metadata(self) -> None:
         super().clear_connector_metadata()
@@ -6522,7 +6935,15 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        meta = DeltaConnectorMetadata(clear_epoch=self.store._clear_epoch)
+        meta = DeltaConnectorMetadata(
+            clear_epoch=self.store._clear_epoch,
+            block_size=self._block_size,
+            layer_to_group_idx=(
+                dict(self._layer_to_group_idx)
+                if self._layer_to_group_idx
+                else None
+            ),
+        )
 
         for fin_id in getattr(scheduler_output, "finished_req_ids", ()) or ():
             self._inflight_req_state.pop(fin_id, None)

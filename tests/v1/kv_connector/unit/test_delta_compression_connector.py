@@ -677,11 +677,14 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         worker_conn.wait_for_save()
         worker_conn.clear_connector_metadata()
 
-        # Verify that P_B's shared Block 1 in GDN was delta-compressed (TIER2_INT4_DELTA)
+        # Verify that P_B's shared Block 1 in GDN was delta-compressed (TIER3_SPARSE_BF16_INT4_DELTA)
         # and FullAttention was delta-compressed (TIER1_INT2_DELTA)
         self.assertGreaterEqual(
             worker_conn.store.stats.tier_counts[CompressionTier.TIER1_INT2_DELTA]
-            + worker_conn.store.stats.tier_counts[CompressionTier.TIER2_INT4_DELTA],
+            + worker_conn.store.stats.tier_counts[CompressionTier.TIER2_INT4_DELTA]
+            + worker_conn.store.stats.tier_counts[
+                CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA
+            ],
             2,
         )
 
@@ -1760,6 +1763,103 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         # Banner is 1 block (0..16), Bucket 0 (lines 1..10) is 6 blocks (16..112),
         # Bucket 1 (lines 11..20) and Bucket 2 (lines 21..30) start at token 112 and must be identical!
         self.assertEqual(ids_v1[112:], ids_v2[112:])
+
+    def test_large_block_size_windowed_norm_and_mamba_tier3_fidelity(self) -> None:
+        """Verifies large block_size=2096 windowed L2 norm + sparse outliers and 3D Mamba TIER3."""
+        torch.manual_seed(2026)
+        b_size = 2096
+        store_single = DeltaBlockStore(block_size=b_size, max_sparse_exceptions=4)
+        store_batch = DeltaBlockStore(block_size=b_size, max_sparse_exceptions=4)
+
+        attn_layer = "model.language_model.layers.3.self_attn.attn"
+        mamba_layer = "model.language_model.layers.2.linear_attn"
+        tokens = tuple(range(10000, 10000 + b_size))
+
+        # 1. FullAttention block (2096 tokens): first 2020 tokens have tiny noise (~0.01),
+        # final 76 tokens ([Risk Factors]) have 0.35 drift. Global L2 norm is diluted to ~0.068,
+        # which previously fell into TIER1_INT2_DELTA without BF16 outliers.
+        k_base = torch.randn(b_size, 2, 128, dtype=torch.bfloat16)
+        v_base = torch.randn(b_size, 2, 128, dtype=torch.bfloat16)
+        k_target = k_base + 0.01 * torch.randn_like(k_base)
+        v_target = v_base + 0.01 * torch.randn_like(v_base)
+        k_target[-76:] = k_base[-76:] + 0.35 * torch.randn_like(k_base[-76:])
+        v_target[-76:] = v_base[-76:] + 0.35 * torch.randn_like(v_base[-76:])
+
+        # 2. Mamba/GDN 3D ssm_state [8, 64, 64] + conv_state [1024, 3]
+        ssm_base = torch.randn(8, 64, 64, dtype=torch.bfloat16)
+        conv_base = torch.randn(1024, 3, dtype=torch.bfloat16)
+        ssm_target = ssm_base + 0.04 * torch.randn_like(ssm_base)
+        # 16 rows across heads have large state updates (0.45)
+        ssm_target.view(-1, 64)[:16] += 0.45 * torch.randn(
+            16, 64, dtype=torch.bfloat16
+        )
+        conv_target = conv_base + 0.25 * torch.randn_like(conv_base)
+
+        for s in (store_single, store_batch):
+            s.store_block(attn_layer, "h_attn_base", tokens, b_size, k_base, v_base)
+            s.store_block(
+                mamba_layer, "h_mamba_base", tokens, b_size, ssm_base, conv_base
+            )
+
+        rec_attn_s = store_single.store_block(
+            attn_layer, "h_attn_tgt", tokens, b_size, k_target, v_target
+        )
+        rec_mamba_s = store_single.store_block(
+            mamba_layer, "h_mamba_tgt", tokens, b_size, ssm_target, conv_target
+        )
+
+        spec_attn = DeltaBlockTransferSpec(
+            full_block_hash="h_attn_tgt",
+            token_ids=tokens,
+            start_position=b_size,
+            physical_block_id=2,
+        )
+        spec_mamba = DeltaBlockTransferSpec(
+            full_block_hash="h_mamba_tgt",
+            token_ids=tokens,
+            start_position=b_size,
+            physical_block_id=2,
+        )
+        rec_attn_b = store_batch.store_blocks_batch(
+            attn_layer, [(spec_attn, k_target, v_target), (spec_attn, k_target, v_target)]
+        )[0]
+        rec_mamba_b = store_batch.store_blocks_batch(
+            mamba_layer,
+            [(spec_mamba, ssm_target, conv_target), (spec_mamba, ssm_target, conv_target)],
+        )[0]
+
+        self.assertEqual(rec_attn_s.tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+        self.assertEqual(rec_attn_b.tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+        self.assertEqual(rec_mamba_s.tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+        self.assertEqual(rec_mamba_b.tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+
+        # Verify all 76 drifted tail tokens in FullAttention are preserved bitwise in BF16!
+        k_rec_s, v_rec_s = store_single.reconstruct_block(attn_layer, "h_attn_tgt")
+        k_rec_b, v_rec_b = store_batch.reconstruct_blocks_batch(
+            attn_layer, [spec_attn, spec_attn]
+        )[0]
+        assert v_rec_s is not None and v_rec_b is not None
+        self.assertTrue(torch.equal(k_rec_s[-76:], k_target[-76:]))
+        self.assertTrue(torch.equal(v_rec_s[-76:], v_target[-76:]))
+        self.assertTrue(torch.equal(k_rec_b[-76:], k_target[-76:]))
+        self.assertTrue(torch.equal(v_rec_b[-76:], v_target[-76:]))
+
+        # Verify Mamba conv_state is preserved bitwise and top-drift ssm_state rows are exact!
+        ssm_rec_s, conv_rec_s = store_single.reconstruct_block(
+            mamba_layer, "h_mamba_tgt"
+        )
+        ssm_rec_b, conv_rec_b = store_batch.reconstruct_blocks_batch(
+            mamba_layer, [spec_mamba, spec_mamba]
+        )[0]
+        assert conv_rec_s is not None and conv_rec_b is not None
+        self.assertTrue(torch.equal(conv_rec_s, conv_target))
+        self.assertTrue(torch.equal(conv_rec_b, conv_target))
+        self.assertTrue(
+            torch.equal(ssm_rec_s.view(-1, 64)[:16], ssm_target.view(-1, 64)[:16])
+        )
+        self.assertTrue(
+            torch.equal(ssm_rec_b.view(-1, 64)[:16], ssm_target.view(-1, 64)[:16])
+        )
 
 
 if __name__ == "__main__":
