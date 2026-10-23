@@ -1583,6 +1583,7 @@ class DeltaBlockStore:
         enable_server_block_align: bool = False,
         max_store_bytes: int = 0,
         enable_cross_turn_reuse: bool = False,
+        multi_cohort_threshold: int = 32,
     ):
         self.block_size = block_size
         self.default_rope_theta = default_rope_theta
@@ -1597,6 +1598,7 @@ class DeltaBlockStore:
         self.force_uncompressed = force_uncompressed
         self.max_store_bytes = max(0, int(max_store_bytes))
         self.enable_cross_turn_reuse = bool(enable_cross_turn_reuse)
+        self.multi_cohort_threshold = int(multi_cohort_threshold)
         # Approach 2: Configurable server-side block alignment padding parameters
         self.pad_token = pad_token if pad_token else DEFAULT_PAD_TOKEN
         self.pad_token_id = int(pad_token_id) if pad_token_id is not None else None
@@ -1671,6 +1673,10 @@ class DeltaBlockStore:
         self._retired_blocks: set[str] = set()
         self._attention_base_blocks: set[str] = set()
         self._pos0_base_blocks: set[str] = set()
+        self._pos0_blocks: set[str] = set()
+        self._pre_multi_cohort_exact_matches: dict[
+            tuple[str, str], tuple[str, str | None, int, int]
+        ] = {}
         self._dependent_blocks: set[str] = set()
         self._active_by_root_pos: dict[tuple[str, int], str] = {}
         self._dependents_by_base: dict[str, set[str]] = {}
@@ -1715,6 +1721,8 @@ class DeltaBlockStore:
         self._retired_blocks.clear()
         self._attention_base_blocks.clear()
         self._pos0_base_blocks.clear()
+        self._pos0_blocks.clear()
+        self._pre_multi_cohort_exact_matches.clear()
         self._dependent_blocks.clear()
         self._active_by_root_pos.clear()
         self._dependents_by_base.clear()
@@ -2782,9 +2790,21 @@ class DeltaBlockStore:
             delta_pos = start_position - (
                 base_rec.start_position + stitch_offset
             )
+            total_pos0_cohorts = len(self._pos0_blocks) + (
+                1
+                if start_position == 0 and full_block_hash not in self._pos0_blocks
+                else 0
+            )
+            is_multi_cohort = (
+                self.multi_cohort_threshold > 0
+                and total_pos0_cohorts >= self.multi_cohort_threshold
+                and not self.enable_cross_turn_reuse
+            )
+            if is_multi_cohort and self._pre_multi_cohort_exact_matches:
+                self._promote_pre_multi_cohort_exact_matches()
 
-            # Case 1A: Layer 0 non-recurrent attention -> Always Tier 0 Zero-Bit Reuse!
-            if policy.layer_idx == 0 and not policy.is_mamba:
+            # Case 1A: Layer 0 non-recurrent attention or multi-cohort exact match -> Tier 0 Zero-Bit Reuse!
+            if (policy.layer_idx == 0 or is_multi_cohort) and not policy.is_mamba:
                 record = CompressedKVBlockRecord(
                     tier=CompressionTier.TIER0_ZERO_BIT,
                     full_block_hash=full_block_hash,
@@ -2800,6 +2820,19 @@ class DeltaBlockStore:
                 )
                 return self._commit_record(
                     layer_name, record, raw_bytes, root_block_hash=root_block_hash
+                )
+            if (
+                not policy.is_mamba
+                and self.multi_cohort_threshold > 0
+                and not self.enable_cross_turn_reuse
+            ):
+                self._pre_multi_cohort_exact_matches[
+                    (layer_name, full_block_hash)
+                ] = (
+                    base_rec.full_block_hash,
+                    ref_hash_2,
+                    stitch_offset,
+                    delta_pos,
                 )
 
             # Case 1B: Layer >= 1 LOCAL_SLIDING with divergence_distance >= threshold
@@ -3566,12 +3599,85 @@ class DeltaBlockStore:
         )
         if (
             (self.enable_cross_turn_reuse and _is_dsv41_quant_kv(k_cpu))
-            or full_block_hash not in self._dependent_blocks
+            or (
+                full_block_hash not in self._dependent_blocks
+                and base_rec is None
+            )
         ):
             self._index_base_block(layer_name, base_record, max_exceptions)
         return self._commit_record(
             layer_name, base_record, raw_bytes, root_block_hash=root_block_hash
         )
+
+    def _promote_pre_multi_cohort_exact_matches(self) -> None:
+        """Retroactively promote exact-token-match blocks from pre-threshold cohorts
+        to TIER0_ZERO_BIT once total_pos0_cohorts reaches self.multi_cohort_threshold.
+        """
+        if not self._pre_multi_cohort_exact_matches:
+            return
+        pending = list(self._pre_multi_cohort_exact_matches.items())
+        self._pre_multi_cohort_exact_matches.clear()
+        promoted_bhashes: set[str] = set()
+        for (layer_name, bhash), (ref_h1, ref_h2, s_off, d_pos) in pending:
+            rec = self._records.get((layer_name, bhash))
+            if rec is None or rec.tier == CompressionTier.TIER0_ZERO_BIT:
+                continue
+            if self._dependents_by_base.get(bhash):
+                continue
+            b1 = self._records.get((layer_name, ref_h1))
+            if b1 is None or b1.tier != CompressionTier.UNCOMPRESSED_BASE:
+                continue
+            if ref_h2 is not None:
+                b2 = self._records.get((layer_name, ref_h2))
+                if b2 is None or b2.tier != CompressionTier.UNCOMPRESSED_BASE:
+                    continue
+            old_nbytes = rec.nbytes
+            old_tier = rec.tier
+            new_rec = CompressedKVBlockRecord(
+                tier=CompressionTier.TIER0_ZERO_BIT,
+                full_block_hash=rec.full_block_hash,
+                token_block_hash=rec.token_block_hash,
+                token_ids=rec.token_ids,
+                start_position=rec.start_position,
+                layer_idx=rec.layer_idx,
+                is_mla=rec.is_mla,
+                prev_token_block_hash=rec.prev_token_block_hash,
+                ref_base_hash=ref_h1,
+                delta_pos=d_pos,
+                ref_base_hash_2=ref_h2,
+                stitch_offset=s_off,
+            )
+            self._records[(layer_name, bhash)] = new_rec
+            self.stats.compressed_bytes_stored = max(
+                0, self.stats.compressed_bytes_stored - old_nbytes + new_rec.nbytes
+            )
+            if self.stats.tier_counts.get(old_tier, 0) > 0:
+                self.stats.tier_counts[old_tier] -= 1
+            self.stats.tier_counts[CompressionTier.TIER0_ZERO_BIT] += 1
+            if self.stats.cumulative_tier_counts.get(old_tier, 0) > 0:
+                self.stats.cumulative_tier_counts[old_tier] -= 1
+            self.stats.cumulative_tier_counts[CompressionTier.TIER0_ZERO_BIT] += 1
+            self._dependent_blocks.add(bhash)
+            self._attention_base_blocks.discard(bhash)
+            self._pos0_base_blocks.discard(bhash)
+            self._dependents_by_base.setdefault(ref_h1, set()).add(bhash)
+            if ref_h2 is not None:
+                self._dependents_by_base.setdefault(ref_h2, set()).add(bhash)
+            promoted_bhashes.add(bhash)
+
+        if promoted_bhashes and not self.has_mamba_layers:
+            for bhash in promoted_bhashes:
+                if all(
+                    (
+                        r := self._records.get((l_name, bhash))
+                    ) is None
+                    or r.tier == CompressionTier.TIER0_ZERO_BIT
+                    for l_name in self._known_layers
+                ):
+                    for dev in self._known_slab_devices:
+                        bkey = (dev, bhash)
+                        self._gpu_slabs_by_block.pop(bkey, None)
+                        self._gpu_slab_offsets_by_block.pop(bkey, None)
 
     def _commit_record(
         self,
@@ -3644,6 +3750,11 @@ class DeltaBlockStore:
                 ):
                     self._tok_pos_anchor_blocks.add(bhash)
         if record.layer_idx == 0 or bhash not in self._block_lru:
+            if (
+                record.start_position == 0
+                and not self.get_layer_policy(layer_name).is_mamba
+            ):
+                self._pos0_blocks.add(bhash)
             if record.ref_base_hash or record.ref_base_hash_2:
                 self._dependent_blocks.add(bhash)
                 self._attention_base_blocks.discard(bhash)
@@ -3938,7 +4049,44 @@ class DeltaBlockStore:
                     )
 
         # Pass 2A: Batched GPU evaluation for exact (or 0-edit stitched) token matches + Mamba partial matches
-        is_multi_cohort = len(self._pos0_base_blocks) >= 16
+        batch_pos0_hashes = {
+            items[i][0].full_block_hash
+            for i in range(n)
+            if not already_committed[i] and items[i][0].start_position == 0
+        }
+        total_pos0_cohorts = len(self._pos0_blocks | batch_pos0_hashes)
+        is_multi_cohort = (
+            self.multi_cohort_threshold > 0
+            and total_pos0_cohorts >= self.multi_cohort_threshold
+            and not self.enable_cross_turn_reuse
+        )
+        if is_multi_cohort and self._pre_multi_cohort_exact_matches:
+            self._promote_pre_multi_cohort_exact_matches()
+        exact_group_indices = {it[0] for it in exact_group}
+        if (
+            exact_group
+            and not policy.is_mamba
+            and self.multi_cohort_threshold > 0
+            and not self.enable_cross_turn_reuse
+            and not is_multi_cohort
+        ):
+            for (
+                item_idx,
+                base_rec,
+                base_rec_2,
+                stitch_offset,
+                delta_pos,
+            ) in exact_group:
+                self._pre_multi_cohort_exact_matches[
+                    (layer_name, items[item_idx][0].full_block_hash)
+                ] = (
+                    base_rec.full_block_hash,
+                    base_rec_2.full_block_hash
+                    if base_rec_2 is not None
+                    else None,
+                    stitch_offset,
+                    delta_pos,
+                )
         if (
             exact_group
             and not policy.is_mamba
@@ -4169,7 +4317,15 @@ class DeltaBlockStore:
                     )
                     continue
 
-                if check_outliers and outlier_mask is not None:
+                if (
+                    check_outliers
+                    and outlier_mask is not None
+                    and (
+                        delta_k.shape[1] < 32
+                        or delta_k.shape[1] >= 128
+                        or (eta_max > policy.tau_int4 and total_pos0_cohorts < 2)
+                    )
+                ):
                     b_tok = delta_k.shape[1]
                     max_sparse = (
                         min(
@@ -4474,6 +4630,10 @@ class DeltaBlockStore:
                     if (0 < b_tok < t_len)
                     else list(d_idx)
                 )
+                if s_indices:
+                    tail_end = min(b_tok, s_indices[-1] + 4)
+                    if tail_end - s_indices[0] <= 16:
+                        s_indices = list(range(s_indices[0], tail_end))
                 idx_tensor = torch.tensor(
                     s_indices, dtype=torch.long, device=k_c.device
                 )
@@ -4786,7 +4946,10 @@ class DeltaBlockStore:
                 )
                 if (
                     (self.enable_cross_turn_reuse and _is_dsv41_quant_kv(k_c))
-                    or blk_spec.full_block_hash not in self._dependent_blocks
+                    or (
+                        blk_spec.full_block_hash not in self._dependent_blocks
+                        and i not in exact_group_indices
+                    )
                 ):
                     self._index_base_block(layer_name, rec, max_exceptions)
             out_records.append(
@@ -4947,6 +5110,7 @@ class DeltaBlockStore:
         self._retired_blocks.discard(full_block_hash)
         self._attention_base_blocks.discard(full_block_hash)
         self._pos0_base_blocks.discard(full_block_hash)
+        self._pos0_blocks.discard(full_block_hash)
         self._dependent_blocks.discard(full_block_hash)
         if was_known and count_as_eviction:
             self.stats.evicted_unique_blocks += 1
@@ -6153,6 +6317,9 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         enable_cross_turn_reuse = bool(
             extra_config.get("enable_cross_turn_reuse", False)
         )
+        multi_cohort_threshold = int(
+            extra_config.get("multi_cohort_threshold", 32)
+        )
 
         if engine_id not in self._shared_stores:
             self._shared_stores[engine_id] = DeltaBlockStore(
@@ -6171,6 +6338,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 enable_server_block_align=enable_server_block_align,
                 max_store_bytes=max_store_bytes,
                 enable_cross_turn_reuse=enable_cross_turn_reuse,
+                multi_cohort_threshold=multi_cohort_threshold,
             )
         else:
             existing_store = self._shared_stores[engine_id]
@@ -6190,6 +6358,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 existing_store.enable_cross_turn_reuse = (
                     enable_cross_turn_reuse
                 )
+            if "multi_cohort_threshold" in extra_config:
+                existing_store.multi_cohort_threshold = (
+                    multi_cohort_threshold
+                )
         self.store: DeltaBlockStore = self._shared_stores[engine_id]
         self._gpu_block_pool: "BlockPool | None" = None
         self._pending_evicted_hashes: set[str] = set()
@@ -6197,7 +6369,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         self._requests_need_load: dict[str, tuple["Request", int, int]] = {}
         self._req_local_computed_tokens: dict[str, int] = {}
         self._inflight_req_state: dict[
-            str, tuple[list[int], list[list[int]], int]
+            str, tuple[list[int], list[list[int]], int, int]
         ] = {}
         self._registered_kv_caches: dict[
             str, torch.Tensor | tuple[torch.Tensor, ...]
@@ -6949,6 +7121,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             self._inflight_req_state.pop(fin_id, None)
             self._req_local_computed_tokens.pop(fin_id, None)
 
+        num_sched_map = (
+            getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        )
+
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = list(new_req.prompt_token_ids or [])
             block_ids = list(new_req.block_ids[0]) if new_req.block_ids else []
@@ -6961,14 +7137,45 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 token_ids, block_ids, all_group_block_ids=all_group_block_ids
             )
             total_prompt_full_blocks = len(token_ids) // self._block_size
-            if all_group_block_ids and len(specs) < total_prompt_full_blocks:
+            sched_toks = (
+                num_sched_map.get(new_req.req_id, 0)
+                if isinstance(num_sched_map, dict)
+                else 0
+            )
+            if new_req.req_id in self._requests_need_load:
+                _, local_toks_peek, num_ext_peek = self._requests_need_load[
+                    new_req.req_id
+                ]
+            else:
+                local_toks_peek = self._req_local_computed_tokens.get(
+                    new_req.req_id, 0
+                )
+                num_ext_peek = 0
+            computed_after_step = (
+                local_toks_peek + num_ext_peek + sched_toks
+                if sched_toks > 0
+                else len(token_ids)
+            )
+            if sched_toks > 0 and computed_after_step < len(token_ids):
+                max_valid_blocks = computed_after_step // self._block_size
+                if max_valid_blocks < len(specs):
+                    specs = specs[:max_valid_blocks]
+            if len(specs) < total_prompt_full_blocks and (
+                all_group_block_ids or block_ids
+            ):
                 self._inflight_req_state[new_req.req_id] = (
                     token_ids,
-                    [list(g) for g in all_group_block_ids],
+                    (
+                        [list(g) for g in all_group_block_ids]
+                        if all_group_block_ids
+                        else [list(block_ids)]
+                    ),
                     len(specs),
+                    computed_after_step,
                 )
             if not specs:
-                self._req_local_computed_tokens.pop(new_req.req_id, None)
+                if new_req.req_id not in self._inflight_req_state:
+                    self._req_local_computed_tokens.pop(new_req.req_id, None)
                 continue
 
             if new_req.req_id in self._requests_need_load:
@@ -6980,15 +7187,6 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 load_specs = specs[num_local_blocks:end_load_block]
                 if load_specs:
                     if all_group_block_ids:
-                        num_sched_map = (
-                            getattr(scheduler_output, "num_scheduled_tokens", None)
-                            or {}
-                        )
-                        sched_toks = (
-                            num_sched_map.get(new_req.req_id, 0)
-                            if isinstance(num_sched_map, dict)
-                            else 0
-                        )
                         running_ids: list[int | None] = []
                         for g_blks in all_group_block_ids:
                             curr_idx = (
@@ -7036,7 +7234,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                     )
 
-        # Handle multi-step prefill continuations (e.g. Mamba block-aligned splits)
+        # Handle multi-step prefill continuations (e.g. Mamba block-aligned splits or chunked prefill)
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if cached_reqs is not None and self._inflight_req_state:
             c_req_ids = getattr(cached_reqs, "req_ids", []) or []
@@ -7045,7 +7243,19 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
             for idx, req_id in enumerate(c_req_ids):
                 if req_id not in self._inflight_req_state:
                     continue
-                token_ids, group_lists, prev_stored = self._inflight_req_state[req_id]
+                token_ids, group_lists, prev_stored, prev_computed = (
+                    self._inflight_req_state[req_id]
+                )
+                sched_toks = (
+                    num_sched_map.get(req_id, 0)
+                    if isinstance(num_sched_map, dict)
+                    else 0
+                )
+                computed_after_step = (
+                    prev_computed + sched_toks
+                    if sched_toks > 0
+                    else len(token_ids)
+                )
                 new_blk_tuple = (
                     c_new_block_ids[idx] if idx < len(c_new_block_ids) else None
                 )
@@ -7061,6 +7271,10 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     group_lists[0] if group_lists else [],
                     all_group_block_ids=tuple(group_lists),
                 )
+                if sched_toks > 0 and computed_after_step < len(token_ids):
+                    max_valid_blocks = computed_after_step // self._block_size
+                    if max_valid_blocks < len(specs):
+                        specs = specs[:max_valid_blocks]
                 new_store_specs = specs[prev_stored:]
                 if new_store_specs:
                     meta.requests.append(
@@ -7078,6 +7292,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                         token_ids,
                         group_lists,
                         len(specs),
+                        computed_after_step,
                     )
 
         mamba_g_indices = [

@@ -1861,6 +1861,138 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             torch.equal(ssm_rec_b.view(-1, 64)[:16], ssm_target.view(-1, 64)[:16])
         )
 
+    def test_configurable_multi_cohort_threshold(self) -> None:
+        """Verifies configurable multi_cohort_threshold (default=32 vs custom=4)."""
+        torch.manual_seed(2026)
+        b_size = 16
+        store_default = DeltaBlockStore(block_size=b_size)
+        store_custom = DeltaBlockStore(block_size=b_size, multi_cohort_threshold=4)
+        self.assertEqual(store_default.multi_cohort_threshold, 32)
+        self.assertEqual(store_custom.multi_cohort_threshold, 4)
+
+        layer = "model.layers.3.self_attn.attn"
+        for s in (store_default, store_custom):
+            s.register_layer_policy(
+                layer,
+                LayerCompressionPolicy(
+                    layer_idx=3,
+                    rope_theta=10000.0,
+                    tau_zero_bit=0.05,
+                    tau_int2=0.12,
+                    tau_int4=0.85,
+                ),
+            )
+
+        # Seed 4 distinct pos-0 cohort headers + 1 shared pos-16 haystack block
+        shared_tokens = tuple(range(500, 500 + b_size))
+        k_shared_base = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+        v_shared_base = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+
+        for c_idx in range(4):
+            pos0_tokens = tuple(range(100 + c_idx * 20, 100 + c_idx * 20 + b_size))
+            k_pos0 = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+            v_pos0 = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+            for s in (store_default, store_custom):
+                s.store_block(layer, f"h_pos0_{c_idx}", pos0_tokens, 0, k_pos0, v_pos0)
+
+        for s in (store_default, store_custom):
+            s.store_block(
+                layer, "h_shared_0", shared_tokens, b_size, k_shared_base, v_shared_base
+            )
+
+        # Store 2 sibling cases sharing `shared_tokens` at pos=16 with small context drift (~0.09)
+        k_sib = k_shared_base + 0.08 * torch.randn_like(k_shared_base)
+        v_sib = v_shared_base + 0.08 * torch.randn_like(v_shared_base)
+        specs = [
+            (
+                DeltaBlockTransferSpec(
+                    full_block_hash="h_shared_sib1",
+                    token_ids=shared_tokens,
+                    start_position=b_size,
+                    physical_block_id=10,
+                ),
+                k_sib,
+                v_sib,
+            ),
+            (
+                DeltaBlockTransferSpec(
+                    full_block_hash="h_shared_sib2",
+                    token_ids=shared_tokens,
+                    start_position=b_size,
+                    physical_block_id=11,
+                ),
+                k_sib,
+                v_sib,
+            ),
+        ]
+        recs_default = store_default.store_blocks_batch(layer, specs)
+        recs_custom = store_custom.store_blocks_batch(layer, specs)
+
+        # With default threshold=32 (4 < 32), sibling blocks use quantized delta (INT2/INT4);
+        # with custom threshold=4 (4 >= 4), is_multi_cohort promotes exact token matches to TIER0_ZERO_BIT!
+        self.assertEqual(recs_custom[0].tier, CompressionTier.TIER0_ZERO_BIT)
+        self.assertEqual(recs_custom[1].tier, CompressionTier.TIER0_ZERO_BIT)
+        self.assertIn(
+            recs_default[0].tier,
+            (CompressionTier.TIER1_INT2_DELTA, CompressionTier.TIER2_INT4_DELTA),
+        )
+        self.assertGreater(
+            store_custom.stats.compression_ratio,
+            store_default.stats.compression_ratio,
+        )
+
+        # Now add 28 more pos-0 blocks that differ by only 2 tokens from pos0_0
+        # (stored as TIER3_SPARSE_BF16_INT4_DELTA, like NIAH variant headers),
+        # bringing total distinct pos-0 blocks in store_default to 32 (the default multi_cohort_threshold):
+        base_pos0_tokens = list(range(100, 100 + b_size))
+        for v_idx in range(1, 29):
+            var_tokens = list(base_pos0_tokens)
+            var_tokens[2] += v_idx * 1000
+            var_tokens[5] += v_idx * 1000
+            k_var = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+            v_var = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+            store_default.store_block(
+                layer, f"h_pos0_var_{v_idx}", tuple(var_tokens), 0, k_var, v_var
+            )
+
+        self.assertEqual(len(store_default._pos0_blocks), 32)
+        recs_default_after_32 = store_default.store_blocks_batch(
+            layer,
+            [
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_shared_sib3",
+                        token_ids=shared_tokens,
+                        start_position=b_size,
+                        physical_block_id=12,
+                    ),
+                    k_sib,
+                    v_sib,
+                ),
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_shared_sib4",
+                        token_ids=shared_tokens,
+                        start_position=b_size,
+                        physical_block_id=13,
+                    ),
+                    k_sib,
+                    v_sib,
+                ),
+            ],
+        )
+        self.assertEqual(recs_default_after_32[0].tier, CompressionTier.TIER0_ZERO_BIT)
+        self.assertEqual(recs_default_after_32[1].tier, CompressionTier.TIER0_ZERO_BIT)
+        # Pre-threshold exact-token-match siblings are also retroactively promoted to TIER0_ZERO_BIT:
+        self.assertEqual(
+            store_default._records[(layer, "h_shared_sib1")].tier,
+            CompressionTier.TIER0_ZERO_BIT,
+        )
+        self.assertEqual(
+            store_default._records[(layer, "h_shared_sib2")].tier,
+            CompressionTier.TIER0_ZERO_BIT,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
