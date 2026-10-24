@@ -538,6 +538,15 @@ def _is_dsv41_fp8_indexer(t: torch.Tensor | None) -> bool:
     )
 
 
+def _is_dsv32_fp8_ds_mla(t: torch.Tensor | None) -> bool:
+    return (
+        isinstance(t, torch.Tensor)
+        and t.dtype == torch.uint8
+        and t.ndim >= 2
+        and t.shape[-1] == 656
+    )
+
+
 def _is_fp8_e4m3_mla(t: torch.Tensor | None) -> bool:
     return (
         isinstance(t, torch.Tensor)
@@ -554,6 +563,7 @@ def _is_dsv41_quant_kv(t: torch.Tensor | None) -> bool:
         _is_dsv41_nvfp4_mla(t)
         or _is_dsv41_mxfp8_swa(t)
         or _is_dsv41_fp8_indexer(t)
+        or _is_dsv32_fp8_ds_mla(t)
         or _is_fp8_e4m3_mla(t)
     )
 
@@ -561,7 +571,8 @@ def _is_dsv41_quant_kv(t: torch.Tensor | None) -> bool:
 def _dequant_dsv41_kv(raw: torch.Tensor) -> torch.Tensor:
     """Dequantize DeepSeek-V4.1 `nvfp4_ds_mla` (`[..., N, 288] uint8`),
     `swa_cache` (`[..., N, 528] uint8`), `indexer.k_cache` (`[..., N, 132] uint8`),
-    or `fp8_e4m3` MLA (`[..., N, 576] uint8`) into `bfloat16`.
+    DeepSeek-V3.2 `fp8_ds_mla` (`[..., N, 656] uint8`),
+    or `fp8_e4m3` MLA/GQA into `bfloat16`.
     Returns `raw` unchanged for standard floating-point KV tensors.
     """
     if _is_fp8_e4m3_mla(raw):
@@ -571,6 +582,28 @@ def _dequant_dsv41_kv(raw: torch.Tensor) -> torch.Tensor:
             else raw.view(torch.float8_e4m3fn)
         )
         return fp8_view.to(torch.bfloat16)
+    if _is_dsv32_fp8_ds_mla(raw):
+        prefix_shape = raw.shape[:-1]
+        q_fp8 = (
+            raw[..., :512]
+            .view(torch.float8_e4m3fn)
+            .reshape(*prefix_shape, 4, 128)
+            .to(torch.float32)
+        )
+        s_fp32 = (
+            raw[..., 512:528]
+            .contiguous()
+            .view(torch.float32)
+            .reshape(*prefix_shape, 4, 1)
+        )
+        nope_bf16 = (q_fp8 * s_fp32).reshape(*prefix_shape, 512).to(torch.bfloat16)
+        rope_bf16 = (
+            raw[..., 528:656]
+            .contiguous()
+            .view(torch.bfloat16)
+            .reshape(*prefix_shape, 64)
+        )
+        return torch.cat([nope_bf16, rope_bf16], dim=-1)
     if _is_dsv41_mxfp8_swa(raw):
         prefix_shape = raw.shape[:-1]
         q_fp8 = (
@@ -645,6 +678,25 @@ def _requant_dsv41_kv(
             if template_raw.dtype == torch.float8_e4m3fn
             else q_fp8.view(torch.uint8)
         )
+    if _is_dsv32_fp8_ds_mla(template_raw):
+        prefix_shape = template_raw.shape[:-1]
+        rope_bytes = (
+            vals_bf16[..., 512:576]
+            .to(torch.bfloat16)
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(*prefix_shape, 128)
+        )
+        if rope_only:
+            return torch.cat([template_raw[..., :528], rope_bytes], dim=-1)
+        x_nope = vals_bf16[..., :512].to(torch.float32).reshape(*prefix_shape, 4, 128)
+        amax = x_nope.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+        exponent = torch.ceil(torch.log2(amax / 448.0))
+        scale = torch.exp2(exponent)
+        q_fp8 = (x_nope / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        q_bytes = q_fp8.view(torch.uint8).reshape(*prefix_shape, 512)
+        s_bytes = scale.to(torch.float32).view(torch.uint8).reshape(*prefix_shape, 16)
+        return torch.cat([q_bytes, s_bytes, rope_bytes], dim=-1)
     if _is_dsv41_mxfp8_swa(template_raw):
         prefix_shape = vals_bf16.shape[:-2]
         x = vals_bf16.to(torch.float32).reshape(*prefix_shape, 16, 32)
@@ -1280,7 +1332,10 @@ def dequantize_residual_packed(packed_tensor: PackedQuantizedTensor) -> torch.Te
     else:
         raise ValueError(f"Unsupported bit-width: {packed_tensor.bits}")
 
-    return recon.reshape(packed_tensor.orig_shape).to(packed_tensor.orig_dtype)
+    out = recon.reshape(packed_tensor.orig_shape)
+    if packed_tensor.orig_dtype == torch.float8_e4m3fn:
+        return out.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return out.to(packed_tensor.orig_dtype)
 
 
 def quantize_residual_packed_batch(
@@ -1438,7 +1493,10 @@ def dequantize_residual_packed_batch(
     else:
         raise ValueError(f"Unsupported bit-width: {bits}")
 
-    return recon.reshape(n, *orig_shape).to(orig_dtype)
+    out = recon.reshape(n, *orig_shape)
+    if orig_dtype == torch.float8_e4m3fn:
+        return out.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return out.to(orig_dtype)
 
 
 @dataclass
@@ -2798,7 +2856,6 @@ class DeltaBlockStore:
             is_multi_cohort = (
                 self.multi_cohort_threshold > 0
                 and total_pos0_cohorts >= self.multi_cohort_threshold
-                and not self.enable_cross_turn_reuse
             )
             if is_multi_cohort and self._pre_multi_cohort_exact_matches:
                 self._promote_pre_multi_cohort_exact_matches()
@@ -2824,7 +2881,6 @@ class DeltaBlockStore:
             if (
                 not policy.is_mamba
                 and self.multi_cohort_threshold > 0
-                and not self.enable_cross_turn_reuse
             ):
                 self._pre_multi_cohort_exact_matches[
                     (layer_name, full_block_hash)
@@ -2868,7 +2924,7 @@ class DeltaBlockStore:
                 or _is_dsv41_mxfp8_swa(k_cpu)
                 or _is_dsv41_fp8_indexer(k_cpu)
             )
-            is_fp8_mla = _is_fp8_e4m3_mla(k_cpu)
+            is_fp8_mla = _is_fp8_e4m3_mla(k_cpu) or _is_dsv32_fp8_ds_mla(k_cpu)
             delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
             k_work = _dequant_dsv41_kv(k_cpu) if is_dsv41_q else k_cpu
             base_k_work = (
@@ -3074,9 +3130,14 @@ class DeltaBlockStore:
                         q_dk = quantize_residual_packed(
                             delta_k_rem.to(k_work.dtype), bits=delta_bits_4
                         )
+                        v_work_dtype = (
+                            torch.bfloat16
+                            if (v_cpu is not None and v_cpu.dtype == torch.float8_e4m3fn)
+                            else (v_cpu.dtype if v_cpu is not None else torch.bfloat16)
+                        )
                         q_dv = (
                             quantize_residual_packed(
-                                delta_v_rem.to(v_cpu.dtype), bits=4
+                                delta_v_rem.to(v_work_dtype), bits=4
                             )
                             if (delta_v_rem is not None and v_cpu is not None)
                             else None
@@ -3167,13 +3228,18 @@ class DeltaBlockStore:
                     else eta_max <= eff_tau_int2
                 )
             )
+            v_work_dtype = (
+                torch.bfloat16
+                if (v_cpu is not None and v_cpu.dtype == torch.float8_e4m3fn)
+                else (v_cpu.dtype if v_cpu is not None else torch.bfloat16)
+            )
             if tier1_eligible:
                 q_dk = quantize_residual_packed(delta_k.to(k_work.dtype), bits=2)
                 # For Mamba/GDN, conv_state (v_cpu) is only ~6.5% of the block bytes
                 # and holds the 3-token boundary window, so use 4-bit quantization on it.
                 v_bits = 4 if policy.is_mamba else 2
                 q_dv = (
-                    quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=v_bits)
+                    quantize_residual_packed(delta_v.to(v_work_dtype), bits=v_bits)
                     if (delta_v is not None and v_cpu is not None)
                     else None
                 )
@@ -3201,7 +3267,7 @@ class DeltaBlockStore:
                     delta_k.to(k_work.dtype), bits=delta_bits_4
                 )
                 q_dv = (
-                    quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                    quantize_residual_packed(delta_v.to(v_work_dtype), bits=4)
                     if (delta_v is not None and v_cpu is not None)
                     else None
                 )
@@ -3544,8 +3610,13 @@ class DeltaBlockStore:
                         if (policy.layer_idx > 0 and not is_dsv41_nvfp4)
                         else None
                     )
+                    v_work_dtype = (
+                        torch.bfloat16
+                        if (v_cpu is not None and v_cpu.dtype == torch.float8_e4m3fn)
+                        else (v_cpu.dtype if v_cpu is not None else torch.bfloat16)
+                    )
                     q_dv = (
-                        quantize_residual_packed(delta_v.to(v_cpu.dtype), bits=4)
+                        quantize_residual_packed(delta_v.to(v_work_dtype), bits=4)
                         if (
                             policy.layer_idx > 0
                             and delta_v is not None
@@ -4058,7 +4129,6 @@ class DeltaBlockStore:
         is_multi_cohort = (
             self.multi_cohort_threshold > 0
             and total_pos0_cohorts >= self.multi_cohort_threshold
-            and not self.enable_cross_turn_reuse
         )
         if is_multi_cohort and self._pre_multi_cohort_exact_matches:
             self._promote_pre_multi_cohort_exact_matches()
@@ -4067,7 +4137,6 @@ class DeltaBlockStore:
             exact_group
             and not policy.is_mamba
             and self.multi_cohort_threshold > 0
-            and not self.enable_cross_turn_reuse
             and not is_multi_cohort
         ):
             for (
@@ -4091,8 +4160,11 @@ class DeltaBlockStore:
             exact_group
             and not policy.is_mamba
             and (
-                _is_dsv41_quant_kv(k_cpus[exact_group[0][0]])
+                policy.layer_idx == 0
                 or is_multi_cohort
+                or _is_dsv41_nvfp4_mla(k_cpus[exact_group[0][0]])
+                or _is_dsv41_mxfp8_swa(k_cpus[exact_group[0][0]])
+                or _is_dsv41_fp8_indexer(k_cpus[exact_group[0][0]])
             )
         ):
             for (
@@ -4146,7 +4218,9 @@ class DeltaBlockStore:
                 or _is_dsv41_mxfp8_swa(k_stack_raw)
                 or _is_dsv41_fp8_indexer(k_stack_raw)
             )
-            is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw)
+            is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw) or _is_dsv32_fp8_ds_mla(
+                k_stack_raw
+            )
             delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
             k_stack = (
                 _dequant_dsv41_kv(k_stack_raw)
@@ -4410,9 +4484,14 @@ class DeltaBlockStore:
                             q_dk = quantize_residual_packed(
                                 dk_single.to(k_stack.dtype), bits=delta_bits_4
                             )
+                            v_work_dtype = (
+                                torch.bfloat16
+                                if (v_c is not None and v_c.dtype == torch.float8_e4m3fn)
+                                else (v_c.dtype if v_c is not None else torch.bfloat16)
+                            )
                             q_dv = (
                                 quantize_residual_packed(
-                                    dv_single.to(v_c.dtype), bits=4
+                                    dv_single.to(v_work_dtype), bits=4
                                 )
                                 if (dv_single is not None and v_c is not None)
                                 else None
@@ -4520,6 +4599,11 @@ class DeltaBlockStore:
                         ),
                     )
 
+            v_stack_work_dtype = (
+                torch.bfloat16
+                if (v_stack is not None and v_stack.dtype == torch.float8_e4m3fn)
+                else (v_stack.dtype if v_stack is not None else torch.bfloat16)
+            )
             if tier1_g_idxs:
                 q_dk_list = quantize_residual_packed_batch(
                     delta_k[tier1_g_idxs].to(k_stack.dtype), bits=2
@@ -4527,7 +4611,7 @@ class DeltaBlockStore:
                 v_bits = 4 if policy.is_mamba else 2
                 q_dv_list = (
                     quantize_residual_packed_batch(
-                        delta_v[tier1_g_idxs].to(v_stack.dtype), bits=v_bits
+                        delta_v[tier1_g_idxs].to(v_stack_work_dtype), bits=v_bits
                     )
                     if (delta_v is not None and v_stack is not None)
                     else [None] * len(tier1_g_idxs)
@@ -4567,7 +4651,7 @@ class DeltaBlockStore:
                 )
                 q_dv_list2 = (
                     quantize_residual_packed_batch(
-                        delta_v[tier2_g_idxs].to(v_stack.dtype), bits=4
+                        delta_v[tier2_g_idxs].to(v_stack_work_dtype), bits=4
                     )
                     if (delta_v is not None and v_stack is not None)
                     else [None] * len(tier2_g_idxs)
@@ -4603,8 +4687,9 @@ class DeltaBlockStore:
 
         # Pass 2B: Batched GPU evaluation for full-attention partial (and stitched partial) matches
         if attn_partial_group and (
-            _is_dsv41_quant_kv(k_cpus[attn_partial_group[0][0]])
-            or is_multi_cohort
+            _is_dsv41_nvfp4_mla(k_cpus[attn_partial_group[0][0]])
+            or _is_dsv41_mxfp8_swa(k_cpus[attn_partial_group[0][0]])
+            or _is_dsv41_fp8_indexer(k_cpus[attn_partial_group[0][0]])
         ):
             for (
                 item_idx,
@@ -4615,8 +4700,7 @@ class DeltaBlockStore:
                 d_idx,
             ) in attn_partial_group:
                 if (
-                    not is_multi_cohort
-                    and (delta_pos != 0 or partial_stitch_offset > 0)
+                    (delta_pos != 0 or partial_stitch_offset > 0)
                     and policy.layer_idx > 0
                 ):
                     continue
@@ -4684,7 +4768,9 @@ class DeltaBlockStore:
                 or _is_dsv41_mxfp8_swa(k_stack_raw)
                 or _is_dsv41_fp8_indexer(k_stack_raw)
             )
-            is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw)
+            is_fp8_mla = _is_fp8_e4m3_mla(k_stack_raw) or _is_dsv32_fp8_ds_mla(
+                k_stack_raw
+            )
             delta_bits_4 = 2 if is_dsv41_nvfp4 else 4
             k_stack = (
                 _dequant_dsv41_kv(k_stack_raw)
@@ -4849,13 +4935,26 @@ class DeltaBlockStore:
             ]
             if valid_p_idxs:
                 if policy.layer_idx > 0 and not is_dsv41_nvfp4:
+                    v_stack_work_dtype_p = (
+                        torch.bfloat16
+                        if (
+                            v_stack is not None
+                            and v_stack.dtype == torch.float8_e4m3fn
+                        )
+                        else (
+                            v_stack.dtype
+                            if v_stack is not None
+                            else torch.bfloat16
+                        )
+                    )
                     q_dk_p = quantize_residual_packed_batch(
                         delta_k[valid_p_idxs].to(k_stack.dtype),
                         bits=delta_bits_4,
                     )
                     q_dv_p = (
                         quantize_residual_packed_batch(
-                            delta_v[valid_p_idxs].to(v_stack.dtype), bits=4
+                            delta_v[valid_p_idxs].to(v_stack_work_dtype_p),
+                            bits=4,
                         )
                         if (delta_v is not None and v_stack is not None)
                         else [None] * len(valid_p_idxs)
@@ -5419,8 +5518,11 @@ class DeltaBlockStore:
                 k_out = _requant_dsv41_kv(k_out, raw_k_ref)
             if v_base is not None and rec.quant_delta_v is not None:
                 dv = dequantize_residual_packed(rec.quant_delta_v)
-                v_out = (v_base.to(torch.float32) + dv.to(torch.float32)).to(
-                    v_base.dtype
+                v_sum = v_base.to(torch.float32) + dv.to(torch.float32)
+                v_out = (
+                    v_sum.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                    if v_base.dtype == torch.float8_e4m3fn
+                    else v_sum.to(v_base.dtype)
                 )
             else:
                 v_out = v_base
@@ -5447,7 +5549,11 @@ class DeltaBlockStore:
                 if rec.quant_delta_v is not None:
                     dv = dequantize_residual_packed(rec.quant_delta_v)
                     v_out = v_out + dv.to(torch.float32)
-                v_out_typed: torch.Tensor | None = v_out.to(v_base.dtype)
+                v_out_typed: torch.Tensor | None = (
+                    v_out.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                    if v_base.dtype == torch.float8_e4m3fn
+                    else v_out.to(v_base.dtype)
+                )
             else:
                 v_out_typed = None
 
@@ -5925,9 +6031,14 @@ class DeltaBlockStore:
                 dv_batch = dequantize_residual_packed_batch(
                     [r.quant_delta_v for _, r, _, _ in dense_group]  # type: ignore[misc]
                 )
-                v_out_s = (
+                v_sum_s = (
                     base_v_s.to(torch.float32) + dv_batch.to(torch.float32)
-                ).to(base_v_s.dtype)
+                )
+                v_out_s = (
+                    v_sum_s.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                    if base_v_s.dtype == torch.float8_e4m3fn
+                    else v_sum_s.to(base_v_s.dtype)
+                )
                 for sub_i, (item_indices, _, _, _) in enumerate(dense_group):
                     k_sub = k_out_s[sub_i]
                     v_sub = v_out_s[sub_i]
@@ -5952,7 +6063,12 @@ class DeltaBlockStore:
             )
             is_dsv41_q = _is_dsv41_quant_kv(base_k_s_raw)
             dpos_s = [r.delta_pos for _, r, _, _ in tier3_items]
-            has_q_dk = tier3_items[0][1].quant_delta_k is not None
+            q_dk_sub_idxs = [
+                idx_s
+                for idx_s, (_, r, _, _) in enumerate(tier3_items)
+                if r.quant_delta_k is not None
+            ]
+            has_q_dk = len(q_dk_sub_idxs) > 0
             if (
                 is_dsv41_q
                 and not has_q_dk
@@ -5975,15 +6091,25 @@ class DeltaBlockStore:
                     rope_at_tail=policy.rope_at_tail,
                     rope_pos_scale=policy.rope_pos_scale,
                 )
-                if has_q_dk and all(
-                    r.quant_delta_k is not None for _, r, _, _ in tier3_items
-                ):
+                if len(q_dk_sub_idxs) == len(tier3_items):
                     dk_batch3 = dequantize_residual_packed_batch(
                         [r.quant_delta_k for _, r, _, _ in tier3_items]  # type: ignore[misc]
                     )
                     k_out_s = (
                         k_aligned_s.to(torch.float32)
                         + dk_batch3.to(torch.float32)
+                    ).to(k_aligned_s.dtype)
+                elif q_dk_sub_idxs:
+                    k_out_s = k_aligned_s.clone()
+                    dk_sub3 = dequantize_residual_packed_batch(
+                        [
+                            tier3_items[idx_s][1].quant_delta_k  # type: ignore[misc]
+                            for idx_s in q_dk_sub_idxs
+                        ]
+                    )
+                    k_out_s[q_dk_sub_idxs] = (
+                        k_aligned_s[q_dk_sub_idxs].to(torch.float32)
+                        + dk_sub3.to(torch.float32)
                     ).to(k_aligned_s.dtype)
                 else:
                     k_out_s = k_aligned_s.clone()
@@ -5999,16 +6125,41 @@ class DeltaBlockStore:
                 base_v_s = torch.stack(
                     [rv for _, _, _, rv in tier3_items], dim=0  # type: ignore[misc]
                 )
-                if has_q_dk and all(
-                    r.quant_delta_v is not None for _, r, _, _ in tier3_items
-                ):
+                q_dv_sub_idxs = [
+                    idx_s
+                    for idx_s, (_, r, _, _) in enumerate(tier3_items)
+                    if r.quant_delta_v is not None
+                ]
+                if len(q_dv_sub_idxs) == len(tier3_items):
                     dv_batch3 = dequantize_residual_packed_batch(
                         [r.quant_delta_v for _, r, _, _ in tier3_items]  # type: ignore[misc]
                     )
-                    v_out_s: torch.Tensor | None = (
+                    v_sum_s3 = (
                         base_v_s.to(torch.float32)
                         + dv_batch3.to(torch.float32)
-                    ).to(base_v_s.dtype)
+                    )
+                    v_out_s: torch.Tensor | None = (
+                        v_sum_s3.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                        if base_v_s.dtype == torch.float8_e4m3fn
+                        else v_sum_s3.to(base_v_s.dtype)
+                    )
+                elif q_dv_sub_idxs:
+                    v_out_s = base_v_s.clone()
+                    dv_sub3 = dequantize_residual_packed_batch(
+                        [
+                            tier3_items[idx_s][1].quant_delta_v  # type: ignore[misc]
+                            for idx_s in q_dv_sub_idxs
+                        ]
+                    )
+                    v_sum_sub3 = (
+                        base_v_s[q_dv_sub_idxs].to(torch.float32)
+                        + dv_sub3.to(torch.float32)
+                    )
+                    v_out_s[q_dv_sub_idxs] = (
+                        v_sum_sub3.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                        if base_v_s.dtype == torch.float8_e4m3fn
+                        else v_sum_sub3.to(base_v_s.dtype)
+                    )
                 else:
                     v_out_s = base_v_s.clone()
             else:
@@ -7431,13 +7582,35 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> bool:
         if isinstance(kv_layer, tuple):
             return False
+        if kv_layer.ndim == 5:
+            return False
         if isinstance(attn_metadata, MLACommonMetadata):
-            return True
-        if _is_dsv41_quant_kv(kv_layer):
             return True
         if kv_layer.ndim == 3 or (kv_layer.ndim == 4 and kv_layer.shape[1] == 1):
             return True
+        if kv_layer.ndim <= 3 and _is_dsv41_quant_kv(kv_layer):
+            return True
         return False
+
+    @staticmethod
+    def _is_5d_hnd_layout(
+        kv_layer: torch.Tensor,
+        block_size: int | None = None,
+    ) -> bool:
+        """Return True if a 5D KV cache tensor uses HND (`LBHNC` / `BLHNC`) layout
+        `[..., num_kv_heads, page_size, head_dim]` instead of NHD (`LBNHC` / `BLNHC`)
+        `[..., page_size, num_kv_heads, head_dim]`.
+        """
+        if kv_layer.ndim != 5:
+            return False
+        s2 = int(kv_layer.shape[2])
+        s3 = int(kv_layer.shape[3])
+        if block_size is not None and block_size > 0:
+            if s2 == block_size and s3 != block_size:
+                return False
+            if s3 == block_size and s2 != block_size:
+                return True
+        return s2 < 16 <= s3
 
     @staticmethod
     def _get_kernel_block_ratio(
@@ -7447,7 +7620,7 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> int:
         if isinstance(kv_layer, tuple) or block_size is None or block_size <= 0:
             return 1
-        if _is_dsv41_quant_kv(kv_layer):
+        if is_mla and _is_dsv41_quant_kv(kv_layer):
             return 1
         if is_mla:
             kbs = (
@@ -7455,7 +7628,15 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 if (kv_layer.ndim == 4 and kv_layer.shape[1] == 1)
                 else kv_layer.shape[1]
             )
-        elif kv_layer.ndim in (4, 5):
+        elif kv_layer.ndim == 5:
+            kbs = (
+                kv_layer.shape[3]
+                if DeltaCompressionConnector._is_5d_hnd_layout(
+                    kv_layer, block_size
+                )
+                else kv_layer.shape[2]
+            )
+        elif kv_layer.ndim == 4:
             kbs = kv_layer.shape[2]
         else:
             return 1
@@ -7559,10 +7740,17 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 sub = kv_layer[start_blk:end_blk]
             return sub.reshape(-1, *sub.shape[2:]).contiguous(), None
         if kv_layer.ndim == 5 and kv_layer.shape[0] == 2:
-            # Shape: [2, num_pages, page_size, num_kv_heads, head_dim]
+            # Shape: [2, num_pages, page_size, num_kv_heads, head_dim] (LBNHC)
+            # or [2, num_pages, num_kv_heads, page_size, head_dim] (LBHNC)
+            is_hnd = DeltaCompressionConnector._is_5d_hnd_layout(
+                kv_layer, block_size
+            )
             if ratio == 1:
                 k_blk = kv_layer[0, physical_block_id]
                 v_blk = kv_layer[1, physical_block_id]
+                if is_hnd:
+                    k_blk = k_blk.transpose(0, 1).contiguous()
+                    v_blk = v_blk.transpose(0, 1).contiguous()
                 if (
                     block_size is not None
                     and 0 < block_size < k_blk.shape[0]
@@ -7571,18 +7759,30 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     sub_start = start_position % k_blk.shape[0]
                     k_blk = k_blk[sub_start : sub_start + block_size]
                     v_blk = v_blk[sub_start : sub_start + block_size]
-                return k_blk, v_blk
-            k_sub = kv_layer[0, start_blk:end_blk]
-            v_sub = kv_layer[1, start_blk:end_blk]
-            return (
-                k_sub.reshape(-1, *k_sub.shape[2:]).contiguous(),
-                v_sub.reshape(-1, *v_sub.shape[2:]).contiguous(),
-            )
+            else:
+                k_sub = kv_layer[0, start_blk:end_blk]
+                v_sub = kv_layer[1, start_blk:end_blk]
+                if is_hnd:
+                    k_sub = k_sub.permute(0, 2, 1, 3)
+                    v_sub = v_sub.permute(0, 2, 1, 3)
+                k_blk = k_sub.reshape(-1, *k_sub.shape[2:]).contiguous()
+                v_blk = v_sub.reshape(-1, *v_sub.shape[2:]).contiguous()
+            if k_blk.dtype == torch.uint8:
+                k_blk = k_blk.view(torch.float8_e4m3fn)
+                v_blk = v_blk.view(torch.float8_e4m3fn)
+            return k_blk, v_blk
         if kv_layer.ndim == 5 and kv_layer.shape[1] == 2:
-            # Shape: [num_pages, 2, page_size, num_kv_heads, head_dim]
+            # Shape: [num_pages, 2, page_size, num_kv_heads, head_dim] (BLNHC)
+            # or [num_pages, 2, num_kv_heads, page_size, head_dim] (BLHNC)
+            is_hnd = DeltaCompressionConnector._is_5d_hnd_layout(
+                kv_layer, block_size
+            )
             if ratio == 1:
                 k_blk = kv_layer[physical_block_id, 0]
                 v_blk = kv_layer[physical_block_id, 1]
+                if is_hnd:
+                    k_blk = k_blk.transpose(0, 1).contiguous()
+                    v_blk = v_blk.transpose(0, 1).contiguous()
                 if (
                     block_size is not None
                     and 0 < block_size < k_blk.shape[0]
@@ -7591,13 +7791,18 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     sub_start = start_position % k_blk.shape[0]
                     k_blk = k_blk[sub_start : sub_start + block_size]
                     v_blk = v_blk[sub_start : sub_start + block_size]
-                return k_blk, v_blk
-            k_sub = kv_layer[start_blk:end_blk, 0]
-            v_sub = kv_layer[start_blk:end_blk, 1]
-            return (
-                k_sub.reshape(-1, *k_sub.shape[2:]).contiguous(),
-                v_sub.reshape(-1, *v_sub.shape[2:]).contiguous(),
-            )
+            else:
+                k_sub = kv_layer[start_blk:end_blk, 0]
+                v_sub = kv_layer[start_blk:end_blk, 1]
+                if is_hnd:
+                    k_sub = k_sub.permute(0, 2, 1, 3)
+                    v_sub = v_sub.permute(0, 2, 1, 3)
+                k_blk = k_sub.reshape(-1, *k_sub.shape[2:]).contiguous()
+                v_blk = v_sub.reshape(-1, *v_sub.shape[2:]).contiguous()
+            if k_blk.dtype == torch.uint8:
+                k_blk = k_blk.view(torch.float8_e4m3fn)
+                v_blk = v_blk.view(torch.float8_e4m3fn)
+            return k_blk, v_blk
         if kv_layer.ndim == 4:
             # Standardized vLLM V1 4D layout: [num_blocks, num_kv_heads, kernel_block_size, 2 * head_dim]
             if ratio == 1:
@@ -7615,7 +7820,12 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     ratio * sub.shape[2], sub.shape[1], sub.shape[3]
                 )
             k_blk, v_blk = blk.chunk(2, dim=-1)
-            return k_blk.contiguous(), v_blk.contiguous()
+            k_blk = k_blk.contiguous()
+            v_blk = v_blk.contiguous()
+            if k_blk.dtype == torch.uint8:
+                k_blk = k_blk.view(torch.float8_e4m3fn)
+                v_blk = v_blk.view(torch.float8_e4m3fn)
+            return k_blk, v_blk
         raise ValueError(f"Unsupported kv_layer shape: {tuple(kv_layer.shape)}")
 
     @staticmethod
@@ -7656,6 +7866,17 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
         start_blk = physical_block_id * ratio
         end_blk = start_blk + ratio
         target_device = kv_layer.device
+        if (
+            kv_layer.dtype == torch.uint8
+            and k_block.dtype == torch.float8_e4m3fn
+        ):
+            k_block = k_block.view(torch.uint8)
+        if (
+            v_block is not None
+            and kv_layer.dtype == torch.uint8
+            and v_block.dtype == torch.float8_e4m3fn
+        ):
+            v_block = v_block.view(torch.uint8)
         if is_mla or v_block is None:
             k_dev = k_block.to(device=target_device, non_blocking=True)
             if ratio == 1:
@@ -7685,12 +7906,32 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     )
             return
         if kv_layer.ndim == 5 and kv_layer.shape[0] == 2:
+            is_hnd = DeltaCompressionConnector._is_5d_hnd_layout(
+                kv_layer, effective_block_size
+            )
             k_dev = k_block.to(device=target_device, non_blocking=True)
             v_dev = v_block.to(device=target_device, non_blocking=True)
             if ratio == 1:
                 k_target = kv_layer[0, physical_block_id]
                 v_target = kv_layer[1, physical_block_id]
-                if (
+                if is_hnd:
+                    k_dev_t = k_dev.transpose(0, 1)
+                    v_dev_t = v_dev.transpose(0, 1)
+                    if (
+                        0 < effective_block_size < k_target.shape[1]
+                        and k_target.shape[1] % effective_block_size == 0
+                    ):
+                        sub_start = start_position % k_target.shape[1]
+                        k_target[
+                            :, sub_start : sub_start + effective_block_size, :
+                        ].copy_(k_dev_t)
+                        v_target[
+                            :, sub_start : sub_start + effective_block_size, :
+                        ].copy_(v_dev_t)
+                    else:
+                        k_target.copy_(k_dev_t)
+                        v_target.copy_(v_dev_t)
+                elif (
                     0 < effective_block_size < k_target.shape[0]
                     and k_target.shape[0] % effective_block_size == 0
                 ):
@@ -7700,6 +7941,14 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     k_target.copy_(k_dev)
                     v_target.copy_(v_dev)
+            elif is_hnd:
+                kbs = kv_layer.shape[3]
+                kv_layer[0, start_blk:end_blk].copy_(
+                    k_dev.reshape(ratio, kbs, *k_dev.shape[1:]).transpose(1, 2)
+                )
+                kv_layer[1, start_blk:end_blk].copy_(
+                    v_dev.reshape(ratio, kbs, *v_dev.shape[1:]).transpose(1, 2)
+                )
             else:
                 kbs = kv_layer.shape[2]
                 kv_layer[0, start_blk:end_blk].copy_(
@@ -7709,12 +7958,32 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     v_dev.reshape(ratio, kbs, *v_dev.shape[1:])
                 )
         elif kv_layer.ndim == 5 and kv_layer.shape[1] == 2:
+            is_hnd = DeltaCompressionConnector._is_5d_hnd_layout(
+                kv_layer, effective_block_size
+            )
             k_dev = k_block.to(device=target_device, non_blocking=True)
             v_dev = v_block.to(device=target_device, non_blocking=True)
             if ratio == 1:
                 k_target = kv_layer[physical_block_id, 0]
                 v_target = kv_layer[physical_block_id, 1]
-                if (
+                if is_hnd:
+                    k_dev_t = k_dev.transpose(0, 1)
+                    v_dev_t = v_dev.transpose(0, 1)
+                    if (
+                        0 < effective_block_size < k_target.shape[1]
+                        and k_target.shape[1] % effective_block_size == 0
+                    ):
+                        sub_start = start_position % k_target.shape[1]
+                        k_target[
+                            :, sub_start : sub_start + effective_block_size, :
+                        ].copy_(k_dev_t)
+                        v_target[
+                            :, sub_start : sub_start + effective_block_size, :
+                        ].copy_(v_dev_t)
+                    else:
+                        k_target.copy_(k_dev_t)
+                        v_target.copy_(v_dev_t)
+                elif (
                     0 < effective_block_size < k_target.shape[0]
                     and k_target.shape[0] % effective_block_size == 0
                 ):
@@ -7724,6 +7993,14 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     k_target.copy_(k_dev)
                     v_target.copy_(v_dev)
+            elif is_hnd:
+                kbs = kv_layer.shape[3]
+                kv_layer[start_blk:end_blk, 0].copy_(
+                    k_dev.reshape(ratio, kbs, *k_dev.shape[1:]).transpose(1, 2)
+                )
+                kv_layer[start_blk:end_blk, 1].copy_(
+                    v_dev.reshape(ratio, kbs, *v_dev.shape[1:]).transpose(1, 2)
+                )
             else:
                 kbs = kv_layer.shape[2]
                 kv_layer[start_blk:end_blk, 0].copy_(
@@ -7861,10 +8138,22 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                     ):
                         if kv_pair is None:
                             continue
+                        k_item, v_item = kv_pair
+                        if (
+                            kv_tensor.dtype == torch.uint8
+                            and k_item.dtype == torch.float8_e4m3fn
+                        ):
+                            k_item = k_item.view(torch.uint8)
+                        if (
+                            v_item is not None
+                            and kv_tensor.dtype == torch.uint8
+                            and v_item.dtype == torch.float8_e4m3fn
+                        ):
+                            v_item = v_item.view(torch.uint8)
                         b_phys.append(phys_blk_id)
-                        b_k.append(kv_pair[0])
-                        if kv_pair[1] is not None:
-                            b_v.append(kv_pair[1])
+                        b_k.append(k_item)
+                        if v_item is not None:
+                            b_v.append(v_item)
                         else:
                             has_all_v = False
                     if b_phys:
@@ -7896,7 +8185,13 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                                         kv_tensor[phys_t] = k_batch
                                 continue
                         elif kv_tensor.ndim == 5 and kv_tensor.shape[0] == 2:
-                            if eff_bs == int(kv_tensor.shape[2]):
+                            is_hnd = self._is_5d_hnd_layout(kv_tensor, eff_bs)
+                            page_dim = (
+                                int(kv_tensor.shape[3])
+                                if is_hnd
+                                else int(kv_tensor.shape[2])
+                            )
+                            if eff_bs == page_dim:
                                 for c_s in range(0, len(b_phys), 4096):
                                     c_e = c_s + 4096
                                     phys_t = torch.tensor(
@@ -7904,15 +8199,26 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                                         dtype=torch.long,
                                         device=kv_tensor.device,
                                     )
-                                    kv_tensor[0, phys_t] = torch.stack(
+                                    k_batch = torch.stack(
                                         b_k[c_s:c_e], dim=0
                                     ).to(device=kv_tensor.device, non_blocking=True)
-                                    kv_tensor[1, phys_t] = torch.stack(
+                                    v_batch = torch.stack(
                                         b_v[c_s:c_e], dim=0
                                     ).to(device=kv_tensor.device, non_blocking=True)
+                                    if is_hnd:
+                                        k_batch = k_batch.transpose(1, 2)
+                                        v_batch = v_batch.transpose(1, 2)
+                                    kv_tensor[0, phys_t] = k_batch
+                                    kv_tensor[1, phys_t] = v_batch
                                 continue
                         elif kv_tensor.ndim == 5 and kv_tensor.shape[1] == 2:
-                            if eff_bs == int(kv_tensor.shape[2]):
+                            is_hnd = self._is_5d_hnd_layout(kv_tensor, eff_bs)
+                            page_dim = (
+                                int(kv_tensor.shape[3])
+                                if is_hnd
+                                else int(kv_tensor.shape[2])
+                            )
+                            if eff_bs == page_dim:
                                 for c_s in range(0, len(b_phys), 4096):
                                     c_e = c_s + 4096
                                     phys_t = torch.tensor(
@@ -7920,12 +8226,17 @@ class DeltaCompressionConnector(KVConnectorBase_V1, SupportsHMA):
                                         dtype=torch.long,
                                         device=kv_tensor.device,
                                     )
-                                    kv_tensor[phys_t, 0] = torch.stack(
+                                    k_batch = torch.stack(
                                         b_k[c_s:c_e], dim=0
                                     ).to(device=kv_tensor.device, non_blocking=True)
-                                    kv_tensor[phys_t, 1] = torch.stack(
+                                    v_batch = torch.stack(
                                         b_v[c_s:c_e], dim=0
                                     ).to(device=kv_tensor.device, non_blocking=True)
+                                    if is_hnd:
+                                        k_batch = k_batch.transpose(1, 2)
+                                        v_batch = v_batch.transpose(1, 2)
+                                    kv_tensor[phys_t, 0] = k_batch
+                                    kv_tensor[phys_t, 1] = v_batch
                                 continue
                         elif kv_tensor.ndim == 4:
                             if eff_bs == int(kv_tensor.shape[2]):

@@ -1993,6 +1993,471 @@ class TestDeltaCompressionConnector(unittest.TestCase):
             CompressionTier.TIER0_ZERO_BIT,
         )
 
+    def test_gqa_fp8_kv_delta_and_reconstruction(self) -> None:
+        """Verifies GQA float8_e4m3fn K and V delta compression and reconstruction."""
+        torch.manual_seed(2026)
+        b_size = 16
+        store = DeltaBlockStore(block_size=b_size, multi_cohort_threshold=32)
+        layer = "model.layers.3.self_attn.attn"
+        store.register_layer_policy(
+            layer,
+            LayerCompressionPolicy(
+                layer_idx=3,
+                rope_theta=10000.0,
+                tau_zero_bit=0.01,
+                tau_int2=0.15,
+                tau_int4=0.85,
+            ),
+        )
+        base_tokens = tuple(range(200, 200 + b_size))
+        k_base_bf16 = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+        v_base_bf16 = torch.randn(b_size, 2, 64, dtype=torch.bfloat16)
+        k_base_fp8 = k_base_bf16.to(torch.float8_e4m3fn)
+        v_base_fp8 = v_base_bf16.to(torch.float8_e4m3fn)
+        store.store_block(layer, "h_fp8_base", base_tokens, 0, k_base_fp8, v_base_fp8)
+
+        # Shifted exact-token match (delta_pos=16) with small drift -> TIER1/TIER2 quantized delta
+        k_rot = apply_relative_rope_rotation(
+            k_base_fp8.to(torch.bfloat16),
+            delta_pos=b_size,
+            rope_theta=10000.0,
+            rotary_dim=64,
+        )
+        k_sib_fp8 = (k_rot + 0.05 * torch.randn_like(k_rot)).clamp(-448.0, 448.0).to(
+            torch.float8_e4m3fn
+        )
+        v_sib_fp8 = (
+            v_base_fp8.to(torch.bfloat16) + 0.05 * torch.randn_like(v_base_bf16)
+        ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+        # Partial token match (1 edited token at delta_pos=16) -> TIER3_SPARSE_BF16_INT4_DELTA
+        part_tokens = list(base_tokens)
+        part_tokens[4] = 9999
+        k_part_fp8 = k_sib_fp8.clone()
+        v_part_fp8 = v_sib_fp8.clone()
+
+        recs = store.store_blocks_batch(
+            layer,
+            [
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_fp8_sib",
+                        token_ids=base_tokens,
+                        start_position=b_size,
+                        physical_block_id=1,
+                    ),
+                    k_sib_fp8,
+                    v_sib_fp8,
+                ),
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_fp8_part",
+                        token_ids=tuple(part_tokens),
+                        start_position=b_size,
+                        physical_block_id=2,
+                    ),
+                    k_part_fp8,
+                    v_part_fp8,
+                ),
+            ],
+        )
+        self.assertIn(
+            recs[0].tier,
+            (CompressionTier.TIER1_INT2_DELTA, CompressionTier.TIER2_INT4_DELTA),
+        )
+        self.assertEqual(recs[1].tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+
+        recon_batch = store.reconstruct_blocks_batch(
+            layer,
+            [
+                DeltaBlockTransferSpec(
+                    full_block_hash="h_fp8_sib",
+                    token_ids=base_tokens,
+                    start_position=b_size,
+                    physical_block_id=1,
+                ),
+                DeltaBlockTransferSpec(
+                    full_block_hash="h_fp8_part",
+                    token_ids=tuple(part_tokens),
+                    start_position=b_size,
+                    physical_block_id=2,
+                ),
+            ],
+        )
+        for k_r, v_r in recon_batch:
+            self.assertEqual(k_r.dtype, torch.float8_e4m3fn)
+            self.assertIsNotNone(v_r)
+            assert v_r is not None
+            self.assertEqual(v_r.dtype, torch.float8_e4m3fn)
+            self.assertFalse(torch.isnan(k_r.to(torch.float32)).any().item())
+            self.assertFalse(torch.isnan(v_r.to(torch.float32)).any().item())
+
+    def test_5d_hnd_layout_and_mixed_tier3_quant_delta(self) -> None:
+        torch.manual_seed(77)
+        b_size = 64
+        num_heads = 2
+        head_dim = 64
+
+        # 1. Verify 5D LBHNC ([2, num_blocks, num_kv_heads=2, block_size=64, head_dim=64])
+        # and BLHNC ([num_blocks, 2, num_kv_heads=2, block_size=64, head_dim=64]) round-trip
+        kv_lbhnc = torch.randn(2, 4, num_heads, b_size, head_dim, dtype=torch.bfloat16)
+        k_ext, v_ext = DeltaCompressionConnector._extract_block_kv(
+            kv_lbhnc, 1, is_mla=False, block_size=b_size
+        )
+        self.assertEqual(tuple(k_ext.shape), (b_size, num_heads, head_dim))
+        assert v_ext is not None
+        self.assertEqual(tuple(v_ext.shape), (b_size, num_heads, head_dim))
+
+        kv_lbhnc_out = torch.zeros_like(kv_lbhnc)
+        DeltaCompressionConnector._inject_block_kv(
+            kv_lbhnc_out, 1, k_ext, v_ext, is_mla=False, block_size=b_size
+        )
+        self.assertTrue(torch.equal(kv_lbhnc[:, 1], kv_lbhnc_out[:, 1]))
+
+        # 2. Verify mixed TIER3_SPARSE_BF16_INT4_DELTA records (with and without quant_delta_k)
+        # in the same reconstruct_blocks_batch call
+        b_small = 16
+        store = DeltaBlockStore(
+            block_size=b_small,
+            enable_cross_turn_reuse=True,
+        )
+        layer = "model.layers.3.self_attn.attn"
+        store.register_layer_policy(
+            layer,
+            LayerCompressionPolicy(
+                layer_idx=3,
+                rotary_dim=0,
+                tau_zero_bit=0.01,
+                tau_int2=0.12,
+                tau_int4=0.85,
+                max_sparse_exceptions=4,
+            ),
+        )
+        base_tokens = tuple(range(500, 500 + b_small))
+        k_base = torch.randn(b_small, num_heads, head_dim, dtype=torch.bfloat16)
+        v_base = torch.randn(b_small, num_heads, head_dim, dtype=torch.bfloat16)
+        store.store_block(layer, "h_t3_base", base_tokens, 0, k_base, v_base)
+
+        # Record A: partial token match (quant_delta_k is None)
+        tok_a = list(base_tokens)
+        tok_a[2] = 99999
+        k_a = k_base.clone()
+        k_a[2] += 5.0
+        v_a = v_base.clone()
+        v_a[2] -= 5.0
+
+        # Record B: exact token match at b_size=16 with outlier row (quant_delta_k is not None)
+        k_b = k_base + 0.02 * torch.randn_like(k_base)
+        k_b[5] += 20.0
+        v_b = v_base + 0.02 * torch.randn_like(v_base)
+        v_b[5] -= 20.0
+
+        recs = store.store_blocks_batch(
+            layer,
+            [
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_t3_part_a",
+                        token_ids=tuple(tok_a),
+                        start_position=0,
+                        physical_block_id=1,
+                    ),
+                    k_a,
+                    v_a,
+                ),
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_t3_exact_b",
+                        token_ids=base_tokens,
+                        start_position=b_small,
+                        physical_block_id=2,
+                    ),
+                    k_b,
+                    v_b,
+                ),
+            ],
+        )
+        self.assertEqual(recs[0].tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+        self.assertEqual(recs[1].tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA)
+        self.assertIsNotNone(recs[1].quant_delta_k)
+        # Simulate pos==0 multi-cohort sparse record (quant_delta_k=None) mixed with
+        # full-residual TIER3_SPARSE_BF16_INT4_DELTA record (quant_delta_k!=None)
+        recs[0].quant_delta_k = None
+        recs[0].quant_delta_v = None
+
+        recon_mixed = store.reconstruct_blocks_batch(
+            layer,
+            [
+                DeltaBlockTransferSpec(
+                    full_block_hash="h_t3_part_a",
+                    token_ids=tuple(tok_a),
+                    start_position=0,
+                    physical_block_id=1,
+                ),
+                DeltaBlockTransferSpec(
+                    full_block_hash="h_t3_exact_b",
+                    token_ids=base_tokens,
+                    start_position=b_small,
+                    physical_block_id=2,
+                ),
+            ],
+        )
+        self.assertTrue(torch.allclose(recon_mixed[0][0], k_a, atol=1e-2))
+        self.assertTrue(torch.allclose(recon_mixed[1][0], k_b, atol=0.1))
+
+    def test_gqa_uint8_fp8_kv_extract_store_reconstruct_inject(self):
+        """Verify 4D and 5D GQA `torch.uint8`-backed `float8_e4m3fn` KV caches
+        (`--kv-cache-dtype fp8`) view as `float8_e4m3fn` on extraction and view back
+        as `uint8` on injection without raw `uint8` (`0..255`) numeric corruption.
+        """
+        torch.manual_seed(2026)
+        block_size = 16
+        num_kv_heads = 2
+        head_dim = 64
+
+        for layout in ("5d_lbnhc", "5d_blhnc", "4d"):
+            if layout == "5d_lbnhc":
+                kv_layer = (
+                    torch.randn(
+                        2, 4, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16
+                    )
+                    .to(torch.float8_e4m3fn)
+                    .view(torch.uint8)
+                )
+            elif layout == "5d_blhnc":
+                kv_layer = (
+                    torch.randn(
+                        4, 2, num_kv_heads, block_size, head_dim, dtype=torch.bfloat16
+                    )
+                    .to(torch.float8_e4m3fn)
+                    .view(torch.uint8)
+                )
+            else:
+                kv_layer = (
+                    torch.randn(
+                        4, num_kv_heads, block_size, 2 * head_dim, dtype=torch.bfloat16
+                    )
+                    .to(torch.float8_e4m3fn)
+                    .view(torch.uint8)
+                )
+
+            self.assertFalse(
+                DeltaCompressionConnector._is_mla_kv_tensor(kv_layer)
+            )
+            k_ext, v_ext = DeltaCompressionConnector._extract_block_kv(
+                kv_layer,
+                physical_block_id=1,
+                is_mla=False,
+                block_size=block_size,
+            )
+            self.assertEqual(k_ext.dtype, torch.float8_e4m3fn)
+            self.assertIsNotNone(v_ext)
+            assert v_ext is not None
+            self.assertEqual(v_ext.dtype, torch.float8_e4m3fn)
+            self.assertEqual(
+                tuple(k_ext.shape), (block_size, num_kv_heads, head_dim)
+            )
+
+            store = DeltaBlockStore(
+                block_size=block_size,
+                enable_cross_turn_reuse=True,
+            )
+            layer_name = f"model.layers.0.self_attn.{layout}"
+            store.register_layer_policy(
+                layer_name,
+                LayerCompressionPolicy(
+                    layer_idx=0,
+                    rotary_dim=32,
+                    rope_theta=10000.0,
+                    is_neox_style=True,
+                ),
+            )
+            tokens = tuple(range(100, 100 + block_size))
+            store.store_blocks_batch(
+                layer_name,
+                [
+                    (
+                        DeltaBlockTransferSpec(
+                            full_block_hash="h_base",
+                            token_ids=tokens,
+                            start_position=0,
+                            physical_block_id=1,
+                        ),
+                        k_ext,
+                        v_ext,
+                    )
+                ],
+            )
+            k_shifted = apply_relative_rope_rotation(
+                k_ext.to(torch.bfloat16),
+                delta_pos=block_size,
+                rope_theta=10000.0,
+                rotary_dim=32,
+                is_neox_style=True,
+            ).to(torch.float8_e4m3fn)
+            recs = store.store_blocks_batch(
+                layer_name,
+                [
+                    (
+                        DeltaBlockTransferSpec(
+                            full_block_hash="h_shift",
+                            token_ids=tokens,
+                            start_position=block_size,
+                            physical_block_id=2,
+                        ),
+                        k_shifted,
+                        v_ext,
+                    )
+                ],
+            )
+            self.assertEqual(recs[0].tier, CompressionTier.TIER0_ZERO_BIT)
+            recon = store.reconstruct_blocks_batch(
+                layer_name,
+                [
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_shift",
+                        token_ids=tokens,
+                        start_position=block_size,
+                        physical_block_id=2,
+                    )
+                ],
+            )
+            assert recon[0] is not None
+            k_rec, v_rec = recon[0]
+            self.assertEqual(k_rec.dtype, torch.float8_e4m3fn)
+            assert v_rec is not None
+            self.assertEqual(v_rec.dtype, torch.float8_e4m3fn)
+
+            DeltaCompressionConnector._inject_block_kv(
+                kv_layer,
+                physical_block_id=3,
+                k_block=k_rec,
+                v_block=v_rec,
+                is_mla=False,
+                block_size=block_size,
+            )
+            k_re_ext, v_re_ext = DeltaCompressionConnector._extract_block_kv(
+                kv_layer,
+                physical_block_id=3,
+                is_mla=False,
+                block_size=block_size,
+            )
+            self.assertTrue(
+                torch.allclose(
+                    k_re_ext.to(torch.float32),
+                    k_shifted.to(torch.float32),
+                    atol=1e-2,
+                )
+            )
+            assert v_re_ext is not None
+            self.assertTrue(
+                torch.equal(
+                    v_re_ext.view(torch.uint8), v_ext.view(torch.uint8)
+                )
+            )
+
+    def test_dsv32_fp8_ds_mla_656b_dequant_rope_requant(self):
+        """Verify 656-byte DeepSeek-V3.2 / GLM-5.3 `fp8_ds_mla` KV cache format
+        (`512`B `float8_e4m3fn` NoPE + `16`B `4 x float32` scales + `128`B `64 x bfloat16` RoPE)
+        round-trips through `DeltaBlockStore` with exact NoPE preservation under `TIER0_ZERO_BIT`
+        and accurate dynamic scale re-quantization under `TIER1`/`TIER2`.
+        """
+        torch.manual_seed(2027)
+        block_size = 16
+        nope_fp32 = torch.randn(block_size, 4, 128, dtype=torch.float32) * 3.5
+        amax = nope_fp32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+        q_fp8 = (nope_fp32 / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        rope_bf16 = torch.randn(block_size, 64, dtype=torch.bfloat16)
+        raw_base = torch.cat(
+            [
+                q_fp8.view(torch.uint8).reshape(block_size, 512),
+                scale.to(torch.float32).view(torch.uint8).reshape(block_size, 16),
+                rope_bf16.view(torch.uint8).reshape(block_size, 128),
+            ],
+            dim=-1,
+        )
+        self.assertEqual(tuple(raw_base.shape), (block_size, 656))
+
+        rope_rot = apply_relative_rope_rotation(
+            rope_bf16,
+            delta_pos=block_size,
+            rope_theta=10000.0,
+            rotary_dim=64,
+            is_neox_style=False,
+        )
+        raw_shifted = torch.cat(
+            [
+                raw_base[:, :528],
+                rope_rot.contiguous().view(torch.uint8).reshape(block_size, 128),
+            ],
+            dim=-1,
+        )
+
+        store = DeltaBlockStore(
+            block_size=block_size,
+            enable_cross_turn_reuse=True,
+        )
+        layer_name = "model.layers.1.self_attn.mla_attn"
+        store.register_layer_policy(
+            layer_name,
+            LayerCompressionPolicy(
+                layer_idx=1,
+                rotary_dim=64,
+                rope_theta=10000.0,
+                is_neox_style=False,
+                rope_at_tail=True,
+            ),
+        )
+        tokens = tuple(range(200, 200 + block_size))
+        store.store_blocks_batch(
+            layer_name,
+            [
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_ds_base",
+                        token_ids=tokens,
+                        start_position=0,
+                        physical_block_id=1,
+                    ),
+                    raw_base,
+                    None,
+                )
+            ],
+        )
+        recs = store.store_blocks_batch(
+            layer_name,
+            [
+                (
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_ds_shift",
+                        token_ids=tokens,
+                        start_position=block_size,
+                        physical_block_id=2,
+                    ),
+                    raw_shifted,
+                    None,
+                )
+            ],
+        )
+        self.assertEqual(recs[0].tier, CompressionTier.TIER0_ZERO_BIT)
+        recon = store.reconstruct_blocks_batch(
+            layer_name,
+            [
+                DeltaBlockTransferSpec(
+                    full_block_hash="h_ds_shift",
+                    token_ids=tokens,
+                    start_position=block_size,
+                    physical_block_id=2,
+                )
+            ],
+        )
+        assert recon[0] is not None
+        k_rec, _ = recon[0]
+        self.assertTrue(torch.equal(k_rec[:, :528], raw_base[:, :528]))
+        rec_rope = k_rec[:, 528:656].contiguous().view(torch.bfloat16)
+        self.assertTrue(torch.allclose(rec_rope, rope_rot, atol=1e-2))
+
 
 if __name__ == "__main__":
     unittest.main()
