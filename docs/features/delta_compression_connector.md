@@ -1,6 +1,6 @@
 # `DeltaCompressionConnector` User Guide (`vLLM V1`)
 
-[`DeltaCompressionConnector`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py) is a drop-in **vLLM V1 `KVConnectorBase_V1`** plugin (registered in [`factory.py`](../../vllm/distributed/kv_transfer/kv_connector/factory.py#L140-L145)) that extends vLLM's exact-prefix caching (`BlockPool`) with **position-shifted cross-turn KV cache reuse** and **1-hop anchored residual delta compression** directly in **GPU HBM (`store_device="cuda"`)** or **CPU DRAM (`store_device="cpu"`)**.
+[`DeltaCompressionConnector`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py) is a drop-in **vLLM V1 `KVConnectorBase_V1`** plugin (registered in [`factory.py`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/factory.py#L140-L145)) that extends vLLM's exact-prefix caching (`BlockPool`) with **position-shifted cross-turn KV cache reuse** and **1-hop anchored residual delta compression** directly in **GPU HBM (`store_device="cuda"`)** or **CPU DRAM (`store_device="cpu"`)**.
 
 ---
 
@@ -94,9 +94,9 @@ flowchart LR
     G --> H["Match Anchor Block\nRotate Key by R(Δp)\nQuantize Residual\n(Tier 0 / INT2 / INT4 / Sparse)"]
 ```
 
-### 3.1 Five Compression Tiers ([`CompressionTier`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L46-L61))
+### 3.1 Five Compression Tiers ([`CompressionTier`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L46-L61))
 
-When a newly computed block $(K_{\text{new}}, V_{\text{new}})$ at token position $p_{\text{new}}$ is saved to [`DeltaBlockStore`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L2261-L5100), each layer independently selects the highest-compression tier that satisfies its relative root-mean-square error ($\text{rRMSE}$) threshold against an anchor block $(K_{\text{ref}}, V_{\text{ref}})$ at position $p_{\text{ref}}$ after applying Relative RoPE Key Rotation $\hat{K}_{\text{ref}} = \mathcal{R}(p_{\text{new}} - p_{\text{ref}}) K_{\text{ref}}$:
+When a newly computed block $(K_{\text{new}}, V_{\text{new}})$ at token position $p_{\text{new}}$ is saved to [`DeltaBlockStore`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L2261-L5100), each layer independently selects the highest-compression tier that satisfies its relative root-mean-square error ($\text{rRMSE}$) threshold against an anchor block $(K_{\text{ref}}, V_{\text{ref}})$ at position $p_{\text{ref}}$ after applying Relative RoPE Key Rotation $\hat{K}_{\text{ref}} = \mathcal{R}(p_{\text{new}} - p_{\text{ref}}) K_{\text{ref}}$:
 
 | Tier | Enum Name | Bit-Width | Selection Criterion | Typical Layers / Content | Compression vs. Raw KV |
 | :--- | :--- | :---: | :--- | :--- | :---: |
@@ -114,26 +114,26 @@ All parameters are passed inside the `"kv_connector_extra_config"` dictionary of
 
 | Parameter | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
-| **`store_device`** | `str` | `"cpu"` | Storage device for [`DeltaBlockStore`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L5333): `"cuda"` packs compressed blocks into 256 KB contiguous GPU HBM byte slabs on each worker's local CUDA device; `"cpu"` stores them in host DRAM. |
+| **`store_device`** | `str` | `"cpu"` | Storage device for [`DeltaBlockStore`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L5333): `"cuda"` packs compressed blocks into 256 KB contiguous GPU HBM byte slabs on each worker's local CUDA device; `"cpu"` stores them in host DRAM. |
 | **`exclusive_connector_cache`** | `bool` | `false` | When `true`, `DeltaCompressionConnector` acts as the sole long-term KV cache and immediately reclaims inactive cached blocks from vLLM's uncompressed `BlockPool` so `BlockPool` only needs scratch blocks for currently running sequences. |
-| **`max_hbm_mb`** | `float` | `0` *(unlimited)* | Maximum compressed storage budget **per TP worker rank in MiB** ($1024^2$ bytes). Across `TP = N` GPUs, the total cluster KV HBM budget is `N * max_hbm_mb` MiB. When exceeded, [`evict_lru_to_budget`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L4490-L4586) evicts unreferenced delta leaf blocks before anchor blocks. |
+| **`max_hbm_mb`** | `float` | `0` *(unlimited)* | Maximum compressed storage budget **per TP worker rank in MiB** ($1024^2$ bytes). Across `TP = N` GPUs, the total cluster KV HBM budget is `N * max_hbm_mb` MiB. When exceeded, [`evict_lru_to_budget`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L4490-L4586) evicts unreferenced delta leaf blocks before anchor blocks. |
 | **`max_store_bytes`** | `int` | `0` *(unlimited)* | Exact byte equivalent of `max_hbm_mb` per worker rank (overrides `max_hbm_mb` if both are set). |
 | **`tau_zero_bit`** | `float` | `0.06` | Maximum relative RMSE ($\|\Delta\|_F / \|X_{\text{ref}}\|_F$) to promote a block to **`TIER0_ZERO_BIT`** (`0` bytes of residual payload, storing only `ref_base_hash` and `delta_pos`). |
 | **`tau_int2`** | `float` | `0.12` | Maximum relative RMSE to compress a block with **`TIER1_INT2_DELTA`** (`2` bits/element crest-adaptive quantizer). |
 | **`tau_int4`** | `float` | `0.85` | Maximum relative RMSE to compress a block with **`TIER2_INT4_DELTA`** (`4` bits/element zero-preserving quantizer). |
 | **`max_sparse_exceptions`** | `int` | `4` | Maximum number of intra-block token edits ($k \le \text{max\_sparse\_exceptions}$) matched via Pigeonhole sub-chunk indexing for **`TIER3_SPARSE_BF16_INT4_DELTA`**. |
 | **`sliding_window_dedup_threshold`** | `int` | `64` | Minimum token divergence distance $d_{\text{div}}$ after which `LOCAL_SLIDING` attention layers use `TIER0_ZERO_BIT` (`0` bits). |
-| **`multi_cohort_threshold`** | `int` | `32` | Number of distinct position-0 blocks (`len(self._pos0_blocks)`, including both `UNCOMPRESSED_BASE` and `TIER3` delta `Block 0`s) after which multi-cohort mode (`is_multi_cohort`) activates and retroactively promotes pre-threshold exact-token-match blocks to `TIER0_ZERO_BIT` via [`_promote_pre_multi_cohort_exact_matches`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L3612-L3683). Keeps the default `32` optimal out-of-the-box for both multi-turn coding agents (`SWE-bench`, `R2E-Gym`, `DeepSWE`) and shared-document / NIAH workloads (`76.3x–83.9x` compression). Set to `0` to disable multi-cohort zero-bit promotion. |
+| **`multi_cohort_threshold`** | `int` | `32` | Number of distinct position-0 blocks (`len(self._pos0_blocks)`, including both `UNCOMPRESSED_BASE` and `TIER3` delta `Block 0`s) after which multi-cohort mode (`is_multi_cohort`) activates and retroactively promotes pre-threshold exact-token-match blocks to `TIER0_ZERO_BIT` via [`_promote_pre_multi_cohort_exact_matches`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L3612-L3683). Keeps the default `32` optimal out-of-the-box for both multi-turn coding agents (`SWE-bench`, `R2E-Gym`, `DeepSWE`) and shared-document / NIAH workloads (`76.3x–83.9x` compression). Set to `0` to disable multi-cohort zero-bit promotion. |
 | **`rope_theta`** | `float` | `10000.0` | Fallback RoPE base frequency $\theta$ if not specified in the model's `hf_config` (automatically overridden by `hf_config.rope_theta` / `rope_parameters` when present). |
 | **`force_uncompressed`** | `bool` | `false` | Diagnostic baseline flag: when `true`, disables delta compression and stores all blocks in `DeltaBlockStore` as `UNCOMPRESSED_BASE`. |
 | **`enable_server_block_align`** | `bool` | `false` | Enables server-side block-aligned padding of `[File: ...]` viewer windows using `pad_token` / `pad_token_id` / `pad_token_map`. |
-| **`pad_token`** | `str` | `"\n"` | Default padding string used by [`resolve_pad_token_id`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L115-L159) when aligning file viewer buckets to block boundaries. |
+| **`pad_token`** | `str` | `"\n"` | Default padding string used by [`resolve_pad_token_id`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L115-L159) when aligning file viewer buckets to block boundaries. |
 | **`pad_token_id`** | `int \| null` | `null` | Explicit token ID override for block-alignment padding. |
 | **`pad_token_map`** | `dict[str, str] \| null` | `null` | Optional mapping of content substrings/regexes to custom padding tokens (e.g. `{"re:^\\s*\\{": " ", "[File:": "\n"}`). |
 
 ### 4.1 How Compression Ratio Is Determined (Automatic Adaptive Selection vs. User Profiles)
 
-Users **do not** specify a fixed compression ratio (`2x`, `10x`, `80x`). Instead, [`DeltaBlockStore`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L2856-L3060) **automatically determines the compression tier (`Base`, `Tier 0`, `Tier 1`, `Tier 2`, or `Tier 3`) for every individual block and layer** at runtime:
+Users **do not** specify a fixed compression ratio (`2x`, `10x`, `80x`). Instead, [`DeltaBlockStore`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L2856-L3060) **automatically determines the compression tier (`Base`, `Tier 0`, `Tier 1`, `Tier 2`, or `Tier 3`) for every individual block and layer** at runtime:
 1. **Worst-Case Sub-Window Relative L2 Error Check ($\eta_{\max}$)**:
    For each block and layer, `DeltaBlockStore` computes both the whole-block relative L2 residual norm and the worst-case **16-token sub-window relative L2 norm** ($\eta_{\max} = \max(\eta_{\text{block}}, \max_w \eta_{\text{window } w})$) after applying Relative RoPE Key Rotation $\mathcal{R}(\Delta p)$.
 2. **Automatic Per-Layer Tier Selection**:
@@ -171,14 +171,14 @@ In `store_device="cuda"` with `"exclusive_connector_cache": true`:
 
 ## 6. Supported Model Architectures & Automatic Layer Policy Detection
 
-[`DeltaCompressionConnector._auto_configure_layers`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L5443-L5730) inspects `vllm_config.model_config.hf_text_config` and `kv_cache_config.kv_cache_groups` at startup and automatically configures per-layer RoPE, quantization, and attention policies with zero manual tuning:
+[`DeltaCompressionConnector._auto_configure_layers`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L5443-L5730) inspects `vllm_config.model_config.hf_text_config` and `kv_cache_config.kv_cache_groups` at startup and automatically configures per-layer RoPE, quantization, and attention policies with zero manual tuning:
 
 1. **Standard MHA / GQA (`Llama`, `Qwen2.5/3`, `gpt-oss-120b`, `Muse-Spark-Open-816B`)**:
    - Automatically detects `rope_theta`, `rotary_dim` / `partial_rotary_factor`, and NeoX vs. GPT-J interleaved RoPE style.
    - Supports both `[2, num_blocks, block_size, num_kv_heads, head_dim]` and `[num_blocks, 2, ...]` paged KV layouts.
 2. **Multi-Head Latent Attention (`MLA`) & Sparse Indexer Layers (`DeepSeek-V3/V4.1-Flash`, `GLM-5.3`, `Kimi-K2.6`)**:
    - **Tail-RoPE Canonicalization (`rope_at_tail=True`)**: Rotates only the trailing `64`-dim RoPE key slice (`qk_rope_head_dim=64`) while preserving the leading `512`-dim compressed NoPE latent vector ($c_t^{KV}$).
-   - **Custom Quantized MLA Formats**: Natively dequantizes, rotates, delta-quantizes, and requantizes `DeepSeek-V4.1-Flash` custom `832`-byte/token FP8+scale MLA pages ([`_dequant_dsv41_kv`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L4676-L4734) / [`_requant_dsv41_kv`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L4737-L4810)), `GLM-5.3` `float8_e4m3fn` (`576 B/tok`) MLA pages, and `132 B/tok` NSA/DSA sparse indexer pages.
+   - **Custom Quantized MLA Formats**: Natively dequantizes, rotates, delta-quantizes, and requantizes `DeepSeek-V4.1-Flash` custom `832`-byte/token FP8+scale MLA pages ([`_dequant_dsv41_kv`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L4676-L4734) / [`_requant_dsv41_kv`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L4737-L4810)), `GLM-5.3` `float8_e4m3fn` (`576 B/tok`) MLA pages, and `132 B/tok` NSA/DSA sparse indexer pages.
    - **YaRN Scaling (`Kimi-K2.6`)**: Automatically extracts `factor`, `beta_fast`, `beta_slow`, and `original_max_position_embeddings` for exact YaRN frequency-warped relative RoPE rotation.
 3. **Sliding-Window + Global Hybrid Attention (`Gemma 3`, `Gemma 4`, `gpt-oss-20b/120b`)**:
    - Separate per-layer `local_rope_theta` vs. `global_rope_theta` and proportional RoPE (`rope_type="proportional"`).
@@ -204,7 +204,7 @@ In `store_device="cuda"` with `"exclusive_connector_cache": true`:
 
 ## 7. Server-Side Prompt & File-Viewer Block Alignment (Optional)
 
-When building a custom SWE-agent scaffold, aligning numbered `[File: ...]` viewer windows to block boundaries ensures that scrolling (`scroll_down` / `goto`) or editing a 10-line region never shifts downstream token block boundaries. You can call [`encode_file_viewer_bucketed_server`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L183-L295) directly in your agent client or server middleware:
+When building a custom SWE-agent scaffold, aligning numbered `[File: ...]` viewer windows to block boundaries ensures that scrolling (`scroll_down` / `goto`) or editing a 10-line region never shifts downstream token block boundaries. You can call [`encode_file_viewer_bucketed_server`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L183-L295) directly in your agent client or server middleware:
 
 ```python
 from transformers import AutoTokenizer
@@ -226,7 +226,7 @@ aligned_token_ids = encode_file_viewer_bucketed_server(
 
 ## 8. Monitoring & Prometheus Telemetry (`GET /metrics`)
 
-When `vllm serve` is started with `--kv-cache-metrics --kv-cache-metrics-sample 1.0`, [`DeltaConnectorPromMetrics`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L5203-L5293) exposes real-time Prometheus gauges on `http://<host>:<port>/metrics` (aggregated across all `TP` worker ranks):
+When `vllm serve` is started with `--kv-cache-metrics --kv-cache-metrics-sample 1.0`, [`DeltaConnectorPromMetrics`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py#L5203-L5293) exposes real-time Prometheus gauges on `http://<host>:<port>/metrics` (aggregated across all `TP` worker ranks):
 
 | Prometheus Metric Name | Type | Description |
 | :--- | :---: | :--- |
@@ -246,7 +246,7 @@ $$\text{GPU HBM Memory Saved (\%)} = \left(1 - \frac{\texttt{vllm:delta\_connect
 
 ## 9. Reproducing Standalone Black-Box `vllm serve` Benchmarks
 
-You can benchmark any running `vllm serve` endpoint (`BlockPool` vs. `DeltaCompressionConnector`) over standard HTTP (`POST /v1/completions` and `GET /metrics`) using [`benchmark_swe_agent_http_client.py`](../../benchmarks/benchmark_swe_agent_http_client.py):
+You can benchmark any running `vllm serve` endpoint (`BlockPool` vs. `DeltaCompressionConnector`) over standard HTTP (`POST /v1/completions` and `GET /metrics`) using [`benchmark_swe_agent_http_client.py`](file:///usr/local/google/home/xzhaos/vllm/benchmarks/benchmark_swe_agent_http_client.py):
 
 ### 9.1 `R2E-Gym/R2EGym-SFT-Trajectories` (`N = 1,000` Trajectories, `7,651` Turns)
 
@@ -299,11 +299,33 @@ python3 benchmarks/benchmark_swe_agent_http_client.py \
   --comparison-output comparison_deepswe113_ds_v41.json
 ```
 
+### 9.3 3-Turn `GSM8K` + `CoQA` Multi-Turn HTTP Benchmark (`N = 500` Conversations $\times$ `3` Turns = `1,500` HTTP Requests)
+
+```bash
+python3 benchmarks/benchmark_3turn_gsm8k_coqa_http.py \
+  --base-url http://127.0.0.1:8000 \
+  --mode delta \
+  --model deepseek-ai/DeepSeek-V4.1-Flash \
+  --num-gsm8k 250 \
+  --num-coqa 250 \
+  --target-context-tokens 16384 \
+  --block-size 128 \
+  --block-bytes 1602560 \
+  --capacity-blocks 16000 \
+  --max-concurrency 32 \
+  --max-new-tokens 128 \
+  --output-json results_3turn_dsv41_delta.json \
+  --compare-with results_3turn_dsv41_blockpool.json \
+  --comparison-output comparison_3turn_dsv41.json
+```
+
 ---
 
 ## 10. Related Reports & Source Files
 
-- **Connector Implementation**: [`vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py`](../../vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py)
-- **Connector Registration**: [`vllm/distributed/kv_transfer/kv_connector/factory.py`](../../vllm/distributed/kv_transfer/kv_connector/factory.py#L140-L145)
-- **Standalone HTTP Benchmark Client**: [`benchmarks/benchmark_swe_agent_http_client.py`](../../benchmarks/benchmark_swe_agent_http_client.py)
+- **Connector Implementation**: [`vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py)
+- **Connector Registration**: [`vllm/distributed/kv_transfer/kv_connector/factory.py`](file:///usr/local/google/home/xzhaos/vllm/vllm/distributed/kv_transfer/kv_connector/v1/delta_compression_connector.py)
+- **Standalone HTTP Benchmark Clients**:
+  - [`benchmarks/benchmark_swe_agent_http_client.py`](file:///usr/local/google/home/xzhaos/vllm/benchmarks/benchmark_swe_agent_http_client.py)
+  - [`benchmarks/benchmark_3turn_gsm8k_coqa_http.py`](file:///usr/local/google/home/xzhaos/vllm/benchmarks/benchmark_3turn_gsm8k_coqa_http.py)
 - **Full GPU HBM Benchmark Report**: [`swe_agent_gpu_hbm_benchmark_report.md`](file:///usr/local/google/home/xzhaos/.gemini/jetski/brain/fed6ac32-e76b-4f73-ace3-cde7b0cd157a/swe_agent_gpu_hbm_benchmark_report.md)

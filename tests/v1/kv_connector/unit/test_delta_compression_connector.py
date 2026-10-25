@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.delta_compression_connector im
     DeltaBlockTransferSpec,
     DeltaCompressionConnector,
     LayerCompressionPolicy,
+    _requant_dsv41_kv,
     align_structural_prompt_server,
     align_tokens_to_block,
     apply_relative_rope_rotation,
@@ -2457,6 +2458,243 @@ class TestDeltaCompressionConnector(unittest.TestCase):
         self.assertTrue(torch.equal(k_rec[:, :528], raw_base[:, :528]))
         rec_rope = k_rec[:, 528:656].contiguous().view(torch.bfloat16)
         self.assertTrue(torch.allclose(rec_rope, rope_rot, atol=1e-2))
+
+    def test_dsv41_planar_indexer_and_compress_ratio_shifted_stitched_hybrid_tiers(
+        self,
+    ):
+        """Verify DeepSeek-V4.1-Flash planar indexer.k_cache ([128, 132]),
+        compress_ratio=2 MLA ([64, 288]), compress_ratio=1 MLA ([128, 288]),
+        and swa_cache ([128, 528]) support single-block shifted Block 0
+        (TIER3_SPARSE_BF16_INT4_DELTA with quant_delta_k=None) and 2-block
+        stitched Blocks 1..K (TIER0_ZERO_BIT).
+        """
+        torch.manual_seed(2028)
+        block_size = 128
+        shift_k = 6
+        tok_b0 = tuple(range(1000, 1000 + block_size))
+        tok_b1 = tuple(range(2000, 2000 + block_size))
+        prefix_toks = tuple(range(9000, 9000 + shift_k))
+        tok_t2_b0 = prefix_toks + tok_b0[: block_size - shift_k]
+        tok_t2_b1 = (
+            tok_b0[block_size - shift_k :] + tok_b1[: block_size - shift_k]
+        )
+
+        store = DeltaBlockStore(
+            block_size=block_size,
+            enable_cross_turn_reuse=True,
+        )
+        store.register_layer_policy(
+            "layer.0.swa",
+            LayerCompressionPolicy(
+                layer_idx=0,
+                rotary_dim=64,
+                rope_theta=10000.0,
+                is_neox_style=False,
+                rope_at_tail=True,
+                is_sliding_window=True,
+            ),
+        )
+        store.register_layer_policy(
+            "layer.2.mla_cr2",
+            LayerCompressionPolicy(
+                layer_idx=2,
+                rotary_dim=64,
+                rope_theta=160000.0,
+                is_neox_style=False,
+                rope_at_tail=True,
+            ),
+        )
+        store.register_layer_policy(
+            "layer.3.mla_cr1",
+            LayerCompressionPolicy(
+                layer_idx=3,
+                rotary_dim=64,
+                rope_theta=160000.0,
+                is_neox_style=False,
+                rope_at_tail=True,
+            ),
+        )
+        store.register_layer_policy(
+            "layer.3.indexer",
+            LayerCompressionPolicy(
+                layer_idx=3,
+                rotary_dim=0,
+            ),
+        )
+
+        def make_swa(n: int) -> torch.Tensor:
+            bf = torch.randn(n, 1, 512, dtype=torch.bfloat16)
+            return _requant_dsv41_kv(bf, torch.zeros(n, 528, dtype=torch.uint8))
+
+        def make_mla(n: int) -> torch.Tensor:
+            bf = torch.randn(n, 1, 512, dtype=torch.bfloat16)
+            return _requant_dsv41_kv(bf, torch.zeros(n, 288, dtype=torch.uint8))
+
+        def make_indexer(n: int) -> torch.Tensor:
+            w = (
+                torch.randn(n, 128, dtype=torch.bfloat16)
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+            )
+            s = torch.randint(120, 132, (n, 4), dtype=torch.uint8)
+            return torch.cat([w.reshape(-1), s.reshape(-1)], dim=0).reshape(n, 132)
+
+        shapes = {
+            "layer.0.swa": (make_swa(128), make_swa(128), make_swa(128), make_swa(128)),
+            "layer.2.mla_cr2": (make_mla(64), make_mla(64), make_mla(64), make_mla(64)),
+            "layer.3.mla_cr1": (
+                make_mla(128),
+                make_mla(128),
+                make_mla(128),
+                make_mla(128),
+            ),
+            "layer.3.indexer": (
+                make_indexer(128),
+                make_indexer(128),
+                make_indexer(128),
+                make_indexer(128),
+            ),
+        }
+
+        for lname, (kb0, kb1, kt2_0, kt2_1) in shapes.items():
+            recs_t1 = store.store_blocks_batch(
+                lname,
+                [
+                    (
+                        DeltaBlockTransferSpec(
+                            full_block_hash="h_t1_b0",
+                            token_ids=tok_b0,
+                            start_position=0,
+                            physical_block_id=1,
+                        ),
+                        kb0,
+                        None,
+                    ),
+                    (
+                        DeltaBlockTransferSpec(
+                            full_block_hash="h_t1_b1",
+                            token_ids=tok_b1,
+                            start_position=block_size,
+                            physical_block_id=2,
+                        ),
+                        kb1,
+                        None,
+                    ),
+                ],
+            )
+            self.assertEqual(recs_t1[0].tier, CompressionTier.UNCOMPRESSED_BASE)
+            self.assertEqual(recs_t1[1].tier, CompressionTier.UNCOMPRESSED_BASE)
+
+            recs_t2 = store.store_blocks_batch(
+                lname,
+                [
+                    (
+                        DeltaBlockTransferSpec(
+                            full_block_hash="h_t2_b0",
+                            token_ids=tok_t2_b0,
+                            start_position=0,
+                            physical_block_id=3,
+                        ),
+                        kt2_0,
+                        None,
+                    ),
+                    (
+                        DeltaBlockTransferSpec(
+                            full_block_hash="h_t2_b1",
+                            token_ids=tok_t2_b1,
+                            start_position=block_size,
+                            physical_block_id=4,
+                        ),
+                        kt2_1,
+                        None,
+                    ),
+                ],
+            )
+            self.assertEqual(
+                recs_t2[0].tier, CompressionTier.TIER3_SPARSE_BF16_INT4_DELTA
+            )
+            self.assertIsNone(recs_t2[0].quant_delta_k)
+            self.assertEqual(recs_t2[0].stitch_offset, -shift_k)
+            self.assertEqual(recs_t2[1].tier, CompressionTier.TIER0_ZERO_BIT)
+            self.assertEqual(recs_t2[1].stitch_offset, block_size - shift_k)
+
+            recons = store.reconstruct_blocks_batch(
+                lname,
+                [
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_t2_b0",
+                        token_ids=tok_t2_b0,
+                        start_position=0,
+                        physical_block_id=3,
+                    ),
+                    DeltaBlockTransferSpec(
+                        full_block_hash="h_t2_b1",
+                        token_ids=tok_t2_b1,
+                        start_position=block_size,
+                        physical_block_id=4,
+                    ),
+                ],
+            )
+            k_rec0, _ = recons[0]
+            k_rec1, _ = recons[1]
+            self.assertEqual(tuple(k_rec0.shape), tuple(kt2_0.shape))
+            self.assertEqual(tuple(k_rec1.shape), tuple(kt2_1.shape))
+            sparse_end = shift_k + 3
+            if lname == "layer.3.indexer":
+                # Planar indexer Block 0: first 128*128 bytes are FP8 weights, last 128*4 bytes are UE8M0 scales
+                w_rec0 = k_rec0.reshape(-1)[: 128 * 128].reshape(128, 128)
+                s_rec0 = k_rec0.reshape(-1)[128 * 128 :].reshape(128, 4)
+                w_t2_0 = kt2_0.reshape(-1)[: 128 * 128].reshape(128, 128)
+                s_t2_0 = kt2_0.reshape(-1)[128 * 128 :].reshape(128, 4)
+                w_b0 = kb0.reshape(-1)[: 128 * 128].reshape(128, 128)
+                s_b0 = kb0.reshape(-1)[128 * 128 :].reshape(128, 4)
+                w_b1 = kb1.reshape(-1)[: 128 * 128].reshape(128, 128)
+                s_b1 = kb1.reshape(-1)[128 * 128 :].reshape(128, 4)
+                self.assertTrue(
+                    torch.equal(w_rec0[:sparse_end], w_t2_0[:sparse_end])
+                )
+                self.assertTrue(
+                    torch.equal(s_rec0[:sparse_end], s_t2_0[:sparse_end])
+                )
+                self.assertTrue(
+                    torch.equal(
+                        w_rec0[sparse_end:], w_b0[3 : 128 - shift_k]
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        s_rec0[sparse_end:], s_b0[3 : 128 - shift_k]
+                    )
+                )
+                # Planar indexer Block 1 stitched weights & scales must match kb0[s:] + kb1[:s]
+                s_off = block_size - shift_k
+                w_rec1 = k_rec1.reshape(-1)[: 128 * 128].reshape(128, 128)
+                s_rec1 = k_rec1.reshape(-1)[128 * 128 :].reshape(128, 4)
+                self.assertTrue(
+                    torch.equal(
+                        w_rec1,
+                        torch.cat([w_b0[s_off:], w_b1[:s_off]], dim=0),
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        s_rec1,
+                        torch.cat([s_b0[s_off:], s_b1[:s_off]], dim=0),
+                    )
+                )
+            elif lname == "layer.0.swa":
+                # NoPE FP8 bytes (0..448) and NoPE UE8M0 scale bytes (512..526) on shifted/stitched
+                # tokens must be 100% bit-exact with base!
+                self.assertTrue(
+                    torch.equal(
+                        k_rec0[sparse_end:, :448], kb0[3 : 128 - shift_k, :448]
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        k_rec0[sparse_end:, 512:526], kb0[3 : 128 - shift_k, 512:526]
+                    )
+                )
 
 
 if __name__ == "__main__":

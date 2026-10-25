@@ -151,15 +151,18 @@ async def send_completion(
     prompt_token_ids: list[int],
     max_tokens: int,
     temperature: float = 0.0,
+    stop: list[str] | None = None,
 ) -> dict[str, Any]:
     """Send a single `POST /v1/completions` request to standalone `vllm serve`."""
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "prompt": prompt_token_ids,
         "max_tokens": max_tokens,
         "min_tokens": min(16, max_tokens) if max_tokens > 1 else 1,
         "temperature": temperature,
     }
+    if stop:
+        payload["stop"] = stop
     async with sem:
         t0 = time.perf_counter()
         data: dict[str, Any] = {}

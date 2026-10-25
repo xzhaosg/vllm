@@ -79,6 +79,67 @@ You have access to the following XML tools:
 4. `<function=finish>` when all target hunks are applied and verified."""
 
 
+_DOCKER_IMAGE_CACHE: dict[str, bool] = {}
+
+
+def _has_local_docker_image(docker_image: str) -> bool:
+    """Return True if `docker_image` is present in the local Docker daemon."""
+    if not docker_image:
+        return False
+    if docker_image in _DOCKER_IMAGE_CACHE:
+        return _DOCKER_IMAGE_CACHE[docker_image]
+    proc = subprocess.run(
+        ["sudo", "docker", "image", "inspect", docker_image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    ok = proc.returncode == 0
+    _DOCKER_IMAGE_CACHE[docker_image] = ok
+    return ok
+
+
+def _ensure_local_docker_image(docker_image: str) -> bool:
+    """Ensure `docker_image` is present in the local Docker daemon, pulling it from ECR if needed."""
+    if _has_local_docker_image(docker_image):
+        return True
+    if not docker_image:
+        return False
+    for attempt in range(3):
+        proc = subprocess.run(
+            ["sudo", "docker", "pull", "-q", docker_image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode == 0:
+            _DOCKER_IMAGE_CACHE[docker_image] = True
+            return True
+        time.sleep(1.5 * (attempt + 1))
+    return False
+
+
+def _read_test_totals_from_config(tests_dir: str) -> tuple[int, int]:
+    """Read deduplicated `(f2p_total, p2p_total)` from `tests/config.json` (matching `grader.py`)."""
+    cfg_path = os.path.join(tests_dir, "config.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as cf:
+            cfg = json.load(cf)
+
+        def _count_ids(k_primary: str, k_fallback: str) -> int:
+            raw_list = cfg.get(k_primary) or cfg.get(k_fallback) or []
+            seen: set[str] = set()
+            for item in raw_list:
+                s = str(item).strip()
+                if s and s not in seen:
+                    seen.add(s)
+            return len(seen)
+
+        return _count_ids("f2p_node_ids", "f2p"), _count_ids("p2p_node_ids", "p2p")
+    except Exception:
+        return 0, 0
+
+
 def run_docker_verifier_sync(
     task_id: str,
     docker_image: str,
@@ -86,9 +147,40 @@ def run_docker_verifier_sync(
     model_patch: str,
     timeout_s: int = 300,
 ) -> dict[str, Any]:
-    """Run the official `datacurve-ai/deep-swe` verifier container on `model_patch`."""
+    """Run the official `datacurve-ai/deep-swe` verifier container (`bash /tests/test.sh`) on `model_patch`."""
     t0 = time.perf_counter()
+    f2p_tot_cfg, p2p_tot_cfg = _read_test_totals_from_config(tests_dir)
+    if not model_patch.strip():
+        tot_all = f2p_tot_cfg + p2p_tot_cfg
+        return {
+            "reward": 0,
+            "f2p_total": f2p_tot_cfg,
+            "f2p_passed": 0,
+            "p2p_total": p2p_tot_cfg,
+            "p2p_passed": p2p_tot_cfg,
+            "f2p": 0.0,
+            "p2p": 1.0 if p2p_tot_cfg >= 0 else 0.0,
+            "partial": (p2p_tot_cfg / tot_all) if tot_all > 0 else 0.0,
+            "verifier_exit_code": 0,
+            "verifier_wall_time_s": round(time.perf_counter() - t0, 3),
+            "verifier_log_tail": "[verifier] no model.patch submitted — pristine base state (reward 0 by construction)",
+        }
+    if not _ensure_local_docker_image(docker_image):
+        return {
+            "reward": 0,
+            "f2p_total": f2p_tot_cfg,
+            "f2p_passed": 0,
+            "p2p_total": p2p_tot_cfg,
+            "p2p_passed": 0,
+            "f2p": 0.0,
+            "p2p": 0.0,
+            "partial": 0.0,
+            "verifier_exit_code": -1,
+            "verifier_wall_time_s": round(time.perf_counter() - t0, 3),
+            "error": f"Failed to pull docker image {docker_image}",
+        }
     tmp_dir = tempfile.mkdtemp(prefix=f"deepswe_verify_{task_id}_")
+    cname = f"deepswe_ver_{os.path.basename(tmp_dir)}"
     try:
         artifacts_dir = os.path.join(tmp_dir, "artifacts")
         verifier_dir = os.path.join(tmp_dir, "verifier")
@@ -104,8 +196,23 @@ def run_docker_verifier_sync(
             "docker",
             "run",
             "--rm",
+            "--name",
+            cname,
             "--network",
             "none",
+            "--cpus=8",
+            "-e",
+            "LOKY_MAX_CPU_COUNT=4",
+            "-e",
+            "OMP_NUM_THREADS=2",
+            "-e",
+            "OPENBLAS_NUM_THREADS=2",
+            "-e",
+            "MKL_NUM_THREADS=2",
+            "-e",
+            "RAYON_NUM_THREADS=4",
+            "-e",
+            "GOMAXPROCS=4",
             "-v",
             f"{os.path.abspath(tests_dir)}:/tests:ro",
             "-v",
@@ -116,14 +223,43 @@ def run_docker_verifier_sync(
             "bash",
             "/tests/test.sh",
         ]
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+            exit_code = int(proc.returncode)
+            stdout_txt = proc.stdout or ""
+            err_msg = ""
+        except subprocess.TimeoutExpired as te:
+            subprocess.run(
+                ["sudo", "docker", "rm", "-f", cname],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            exit_code = -9
+            stdout_txt = (
+                te.stdout.decode("utf-8", errors="replace")
+                if isinstance(te.stdout, bytes)
+                else (te.stdout or "")
+            )
+            err_msg = f"Verifier container timed out after {timeout_s}s"
+        except Exception as exc:
+            subprocess.run(
+                ["sudo", "docker", "rm", "-f", cname],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            exit_code = -2
+            stdout_txt = ""
+            err_msg = f"Verifier container error: {exc}"
+
         verifier_time_s = time.perf_counter() - t0
         reward_path = os.path.join(verifier_dir, "reward.json")
         if os.path.exists(reward_path):
@@ -132,19 +268,19 @@ def run_docker_verifier_sync(
         else:
             reward_data = {
                 "reward": 0,
-                "f2p_total": 0,
+                "f2p_total": f2p_tot_cfg,
                 "f2p_passed": 0,
-                "p2p_total": 0,
+                "p2p_total": p2p_tot_cfg,
                 "p2p_passed": 0,
                 "f2p": 0.0,
                 "p2p": 0.0,
                 "partial": 0.0,
-                "error": f"reward.json missing (exit={proc.returncode})",
+                "error": err_msg or f"reward.json missing (exit={exit_code})",
             }
-        reward_data["verifier_exit_code"] = int(proc.returncode)
+        reward_data["verifier_exit_code"] = exit_code
         reward_data["verifier_wall_time_s"] = round(verifier_time_s, 3)
         reward_data["verifier_log_tail"] = "\n".join(
-            (proc.stdout or "").splitlines()[-15:]
+            stdout_txt.splitlines()[-15:]
         )
         return reward_data
     finally:
@@ -153,7 +289,18 @@ def run_docker_verifier_sync(
 
 def serve_verifier_daemon(port: int, tasks_dir: str) -> None:
     """Run a lightweight host HTTP daemon on `127.0.0.1:<port>` that executes official Docker verifiers."""
+    import threading
+
+    cache_file = "/tmp/deepswe_verifier_cache.json"
     cache: dict[str, dict[str, Any]] = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, encoding="utf-8") as cf:
+                cache = json.load(cf)
+        except Exception:
+            cache = {}
+    key_locks: dict[str, threading.Lock] = {}
+    meta_lock = threading.Lock()
 
     class VerifierHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
@@ -170,20 +317,34 @@ def serve_verifier_daemon(port: int, tasks_dir: str) -> None:
             patch_sha = hashlib.sha256(model_patch.encode("utf-8")).hexdigest()
             cache_key = f"{task_id}:{patch_sha}"
 
-            if use_cache and cache_key in cache:
-                res = dict(cache[cache_key])
-                res["cached_verifier"] = True
-            else:
-                tests_dir = os.path.join(tasks_dir, task_id, "tests")
-                res = run_docker_verifier_sync(
-                    task_id=task_id,
-                    docker_image=docker_image,
-                    tests_dir=tests_dir,
-                    model_patch=model_patch,
-                )
-                res["patch_sha256"] = patch_sha
-                res["cached_verifier"] = False
-                cache[cache_key] = dict(res)
+            with meta_lock:
+                if cache_key not in key_locks:
+                    key_locks[cache_key] = threading.Lock()
+                k_lock = key_locks[cache_key]
+
+            with k_lock:
+                if use_cache and cache_key in cache:
+                    res = dict(cache[cache_key])
+                    res["cached_verifier"] = True
+                else:
+                    tests_dir = os.path.join(tasks_dir, task_id, "tests")
+                    res = run_docker_verifier_sync(
+                        task_id=task_id,
+                        docker_image=docker_image,
+                        tests_dir=tests_dir,
+                        model_patch=model_patch,
+                    )
+                    res["patch_sha256"] = patch_sha
+                    res["cached_verifier"] = False
+                    with meta_lock:
+                        cache[cache_key] = dict(res)
+                        try:
+                            tmp_cf = f"{cache_file}.tmp"
+                            with open(tmp_cf, "w", encoding="utf-8") as wf:
+                                json.dump(cache, wf)
+                            os.replace(tmp_cf, cache_file)
+                        except Exception:
+                            pass
 
             out_bytes = json.dumps(res).encode("utf-8")
             self.send_response(200)
@@ -202,61 +363,6 @@ def serve_verifier_daemon(port: int, tasks_dir: str) -> None:
         flush=True,
     )
     server.serve_forever()
-
-
-def _parse_patch_file_hunks(patch_text: str) -> list[dict[str, Any]]:
-    """Parse a unified git patch into ordered per-file hunks with line numbers and old/new blocks."""
-    file_chunks = re.split(r"(?=^diff --git )", patch_text, flags=re.MULTILINE)
-    file_chunks = [c for c in file_chunks if c.strip().startswith("diff --git ")]
-    parsed_hunks: list[dict[str, Any]] = []
-
-    for f_chunk in file_chunks:
-        m_b = re.search(r"^\+\+\+\s+b/(\S+)", f_chunk, flags=re.MULTILINE)
-        m_a = re.search(r"^---\s+a/(\S+)", f_chunk, flags=re.MULTILINE)
-        rel_path = (
-            m_b.group(1)
-            if m_b and m_b.group(1) != "/dev/null"
-            else (m_a.group(1) if m_a else "src/main")
-        ).lstrip("/")
-        fpath = f"/app/{rel_path}"
-
-        hunks = re.split(r"(?=^@@ )", f_chunk, flags=re.MULTILINE)
-        hunk_list = [h for h in hunks if h.startswith("@@ ")]
-        if not hunk_list:
-            continue
-
-        for h_idx, h_txt in enumerate(hunk_list):
-            h_lines = h_txt.splitlines()
-            header = h_lines[0] if h_lines else "@@ -1,10 +1,10 @@"
-            m_ln = re.match(
-                r"@@\s*-(\d+)(?:,(\d+))?\s*\+(\d+)(?:,(\d+))?\s*@@(.*)", header
-            )
-            start_ln = int(m_ln.group(1)) if m_ln else 1
-            old_lines: list[str] = []
-            new_lines: list[str] = []
-            for raw_l in h_lines[1:]:
-                if raw_l.startswith("\\"):
-                    continue
-                if raw_l.startswith("-"):
-                    old_lines.append(raw_l[1:])
-                elif raw_l.startswith("+"):
-                    new_lines.append(raw_l[1:])
-                elif raw_l.startswith(" "):
-                    old_lines.append(raw_l[1:])
-                    new_lines.append(raw_l[1:])
-            parsed_hunks.append(
-                {
-                    "rel_path": rel_path,
-                    "fpath": fpath,
-                    "file_diff": f_chunk,
-                    "hunk_idx_in_file": h_idx,
-                    "start_ln": start_ln,
-                    "old_str": "\n".join(old_lines[:16]),
-                    "new_str": "\n".join(new_lines[:16]),
-                    "hunk_text": h_txt,
-                }
-            )
-    return parsed_hunks
 
 
 def _find_existing_neighbor_file(app_dir: str, rel_path: str) -> str:
@@ -309,15 +415,56 @@ def _find_existing_neighbor_file(app_dir: str, rel_path: str) -> str:
     return rel_path
 
 
+def _extract_instruction_symbols_and_paths(instruction: str) -> tuple[list[str], list[str]]:
+    """Extract backticked symbols, identifiers, and dotted/slashed paths strictly from `instruction.md`."""
+    backticked = [
+        m.group(1).strip()
+        for m in re.finditer(r"`([^`\n]{2,80})`", instruction)
+    ]
+    path_hints: list[str] = []
+    symbols: list[str] = []
+    stop_words = {
+        "true", "false", "null", "none", "self", "this", "return", "const",
+        "let", "var", "func", "function", "class", "struct", "interface",
+        "type", "import", "from", "export", "default", "async", "await",
+        "string", "number", "boolean", "object", "array", "list", "dict",
+        "int", "float", "bool", "str", "bytes", "error", "value", "result",
+    }
+    for bt in backticked:
+        if "/" in bt or bt.endswith((".py", ".go", ".ts", ".tsx", ".js", ".rs")):
+            path_hints.append(bt.strip("/"))
+        elif re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)+$", bt):
+            path_hints.append(bt.replace(".", "/"))
+        for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{2,}", bt):
+            sym = m.group(0)
+            if sym.lower() not in stop_words and sym not in symbols:
+                symbols.append(sym)
+
+    for m in re.finditer(
+        r"\b(?:[A-Z][a-z0-9]+){2,}\b|\b[a-z]+(?:_[a-z0-9]+)+\b|\b[a-z]+(?:[A-Z][a-z0-9]+)+\b",
+        instruction,
+    ):
+        sym = m.group(0)
+        if sym.lower() not in stop_words and sym not in symbols:
+            symbols.append(sym)
+    return symbols[:32], path_hints[:16]
+
+
 def _discover_autonomous_repo_files(
-    app_dir: str, instruction: str, fallback_rel_path: str
-) -> tuple[list[str], str]:
-    """Discover and rank existing `/app` source files from `git ls-files` and `instruction.md` (zero `solution.patch`)."""
+    app_dir: str,
+    instruction: str,
+    num_steps: int = 8,
+) -> tuple[list[str], str, list[dict[str, Any]], list[str]]:
+    """Discover and rank `/app` source files and code windows strictly from `git ls-files` and `instruction.md`."""
     source_exts = (".py", ".go", ".ts", ".tsx", ".js", ".jsx", ".rs")
+    inst_symbols, path_hints = _extract_instruction_symbols_and_paths(instruction)
     inst_tokens = {
         m.group(0).lower()
         for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{2,}", instruction)
     }
+    sym_set_exact = set(inst_symbols)
+    sym_set_lower = {s.lower() for s in inst_symbols}
+
     try:
         ls_out = subprocess.check_output(
             ["git", "-C", app_dir, "ls-files"],
@@ -327,14 +474,23 @@ def _discover_autonomous_repo_files(
     except Exception:
         ls_out = []
 
-    scored: list[tuple[int, str]] = []
+    scored: list[tuple[int, str, list[int]]] = []
     for cand in ls_out:
         if not cand.endswith(source_exts):
             continue
         low_cand = cand.lower()
         if any(
             skip in low_cand
-            for skip in ("node_modules/", "vendor/", "dist/", "__snapshots__/")
+            for skip in (
+                "node_modules/",
+                "vendor/",
+                "dist/",
+                "build/",
+                "__snapshots__/",
+                "examples/",
+                "benchmarks/",
+                "docs/",
+            )
         ):
             continue
         cand_abs = os.path.join(app_dir, cand)
@@ -344,83 +500,250 @@ def _discover_autonomous_repo_files(
             sz = os.path.getsize(cand_abs)
         except OSError:
             continue
-        if sz < 200:
+        if sz < 100 or sz > 600_000:
             continue
+
         path_toks = {
             m.group(0).lower()
             for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{2,}", cand)
         }
-        score = len(path_toks & inst_tokens) * 25
-        if "test" in low_cand or "spec" in low_cand:
-            score -= 30
+        score = len(path_toks & inst_tokens) * 20
+        score += len(path_toks & sym_set_lower) * 45
+        for ph in path_hints:
+            ph_low = ph.lower()
+            if ph_low in low_cand or os.path.dirname(ph_low) and os.path.dirname(ph_low) in low_cand:
+                score += 80
+
+        is_test_file = (
+            "/test" in f"/{low_cand}"
+            or low_cand.endswith(("_test.go", "_test.py", ".test.ts", ".spec.ts", ".test.js", ".spec.js"))
+            or os.path.basename(low_cand).startswith("test_")
+        )
+        if is_test_file:
+            score -= 60
+
+        best_lines: list[int] = [1]
         try:
-            head_txt = open(
+            full_txt = open(
                 cand_abs, encoding="utf-8", errors="replace"
-            ).read(4096)
-            head_toks = {
-                m.group(0).lower()
-                for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{3,}", head_txt)
+            ).read(131072)
+            file_toks = {
+                m.group(0)
+                for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{2,}", full_txt)
             }
-            score += min(40, len(head_toks & inst_tokens) * 2)
+            exact_hits = len(file_toks & sym_set_exact)
+            lower_hits = len({t.lower() for t in file_toks} & inst_tokens)
+            score += exact_hits * 30 + min(60, lower_hits * 2)
+
+            lines = full_txt.splitlines()
+            if lines and sym_set_exact:
+                win_scores: list[tuple[int, int]] = []
+                stride = 25
+                win_sz = 50
+                for s_ln in range(1, max(2, len(lines) - 10), stride):
+                    chunk_txt = "\n".join(lines[s_ln - 1 : s_ln - 1 + win_sz])
+                    c_toks = {
+                        m.group(0)
+                        for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{2,}", chunk_txt)
+                    }
+                    w_hits = len(c_toks & sym_set_exact) * 10 + len(
+                        {t.lower() for t in c_toks} & sym_set_lower
+                    ) * 3
+                    if w_hits > 0:
+                        win_scores.append((w_hits, s_ln))
+                win_scores.sort(key=lambda x: (-x[0], x[1]))
+                chosen_lns: list[int] = []
+                for _, ln_cand in win_scores:
+                    if all(abs(ln_cand - prev_ln) >= 35 for prev_ln in chosen_lns):
+                        chosen_lns.append(ln_cand)
+                        if len(chosen_lns) >= 4:
+                            break
+                if chosen_lns:
+                    best_lines = chosen_lns
         except OSError:
             pass
-        scored.append((score, cand))
+        scored.append((score, cand, best_lines))
 
     scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
-    ranked = [c for _, c in scored[:12]]
+    ranked = [c for _, c, _ in scored[:12]]
     if not ranked:
-        ranked = [_find_existing_neighbor_file(app_dir, fallback_rel_path)]
+        ranked = [ls_out[0]] if ls_out else ["README.md"]
+
+    step_schedule: list[dict[str, Any]] = []
+    for _, cand_rel, cand_lns in scored[:6]:
+        for s_ln in cand_lns[:2]:
+            step_schedule.append(
+                {
+                    "step_num": len(step_schedule) + 1,
+                    "rel_path": cand_rel,
+                    "fpath": f"/app/{cand_rel}",
+                    "start_ln": s_ln,
+                    "inst_symbols": inst_symbols[:16] or [os.path.basename(cand_rel)],
+                }
+            )
+            if len(step_schedule) >= max(1, num_steps):
+                break
+        if len(step_schedule) >= max(1, num_steps):
+            break
+    while len(step_schedule) < max(1, num_steps):
+        base_entry = step_schedule[len(step_schedule) % max(1, len(step_schedule))] if step_schedule else {
+            "rel_path": ranked[0],
+            "fpath": f"/app/{ranked[0]}",
+            "start_ln": 1,
+            "inst_symbols": inst_symbols[:16] or [os.path.basename(ranked[0])],
+        }
+        step_schedule.append(
+            {
+                **base_entry,
+                "step_num": len(step_schedule) + 1,
+            }
+        )
+
     summary_lines = [f"- `/app/{c}`" for c in ranked[:12]]
-    return ranked, "\n".join(summary_lines)
+    return ranked, "\n".join(summary_lines), step_schedule, inst_symbols
+
+
+def _strip_viewer_line_numbers(text: str) -> str:
+    """Strip accidental viewer line prefixes (`  42: `) if the model copied them from the file viewer."""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    numbered_count = sum(
+        1 for ln in lines if re.match(r"^\s*\d+:\s?", ln) or not ln.strip()
+    )
+    if numbered_count == len(lines) and any(re.match(r"^\s*\d+:\s?", ln) for ln in lines):
+        return "\n".join(re.sub(r"^\s*\d+:\s?", "", ln, count=1) for ln in lines)
+    return text
+
+
+def _apply_str_replace_to_content(
+    cur_content: str, old_s: str, new_s: str
+) -> str | None:
+    """Apply `str_replace` with fallback for viewer line numbers or minor whitespace differences."""
+    for cand_old, cand_new in [
+        (old_s, new_s),
+        (_strip_viewer_line_numbers(old_s), _strip_viewer_line_numbers(new_s)),
+    ]:
+        if not cand_old or cand_old == cand_new:
+            continue
+        if cand_old in cur_content:
+            return cur_content.replace(cand_old, cand_new, 1)
+
+        cur_lines = cur_content.splitlines()
+        old_lines = [ln.rstrip() for ln in cand_old.splitlines()]
+        while old_lines and not old_lines[0].strip():
+            old_lines.pop(0)
+        while old_lines and not old_lines[-1].strip():
+            old_lines.pop()
+        if not old_lines:
+            continue
+
+        m = len(old_lines)
+        for i in range(len(cur_lines) - m + 1):
+            if all(
+                cur_lines[i + j].rstrip() == old_lines[j]
+                or cur_lines[i + j].strip() == old_lines[j].strip()
+                for j in range(m)
+            ):
+                new_lines = cand_new.splitlines()
+                updated_lines = cur_lines[:i] + new_lines + cur_lines[i + m :]
+                trailing_nl = "\n" if cur_content.endswith("\n") else ""
+                return "\n".join(updated_lines) + trailing_nl
+    return None
 
 
 def _execute_autonomous_tool_call(r: dict[str, Any], gen_text: str) -> bool:
-    """Parse and execute a live `<function=file_editor>` tool call against `r['live_app_dir']`."""
-    m_path = re.search(r"^\s*([^\n<]+?)</parameter>", gen_text)
-    if not m_path:
-        m_path = re.search(
-            r"<parameter=path>\s*([^\n<]+?)</parameter>", gen_text
+    """Parse and execute one or more live `<function=file_editor>` tool calls against `r['live_app_dir']`."""
+    # Prepend the assistant prefill if `gen_text` starts mid-tool-call
+    full_xml = (
+        "<function=file_editor>\n<parameter=command>str_replace</parameter>\n<parameter=path>"
+        + gen_text
+        if not gen_text.lstrip().startswith("<function=")
+        else gen_text
+    )
+    blocks = re.split(r"<function=file_editor>", full_xml)
+    applied_any = False
+
+    for blk in blocks[1:]:
+        m_cmd = re.search(
+            r"<parameter=command>\s*([^\n<]+?)\s*</parameter>", blk
         )
-    rel_path = ""
-    if m_path:
-        raw_p = m_path.group(1).strip().strip('"').strip("'")
-        if raw_p.startswith("/app/"):
-            rel_path = raw_p[len("/app/") :]
-        elif not raw_p.startswith("__"):
-            rel_path = raw_p.lstrip("/")
-    if not rel_path:
-        rel_path = r.get("autonomous_primary_rel_path") or r["step_schedule"][0]["rel_path"]
+        cmd_name = m_cmd.group(1).strip().lower() if m_cmd else "str_replace"
 
-    m_old = re.search(
-        r"<parameter=old_str>(.*?)</parameter>", gen_text, flags=re.DOTALL
-    )
-    m_new = re.search(
-        r"<parameter=new_str>(.*?)</parameter>", gen_text, flags=re.DOTALL
-    )
-    if not (m_old and m_new):
-        return False
+        m_path = re.search(
+            r"<parameter=path>\s*([^\n<]+?)\s*</parameter>", blk
+        )
+        rel_path = ""
+        if m_path:
+            raw_p = m_path.group(1).strip().strip('"').strip("'")
+            if raw_p.startswith("/app/"):
+                rel_path = raw_p[len("/app/") :]
+            elif not raw_p.startswith("__"):
+                rel_path = raw_p.lstrip("/")
+        if not rel_path:
+            rel_path = r.get("autonomous_primary_rel_path") or r["step_schedule"][0]["rel_path"]
 
-    old_s = m_old.group(1).strip("\n")
-    new_s = m_new.group(1).strip("\n")
-    if not old_s or not new_s or old_s == new_s:
-        return False
+        m_old = re.search(
+            r"<parameter=old_str>(.*?)</parameter>", blk, flags=re.DOTALL
+        )
+        m_new = re.search(
+            r"<parameter=(?:new_str|file_text)>(.*?)(?:</parameter>|$)",
+            blk,
+            flags=re.DOTALL,
+        )
+        old_s = m_old.group(1).strip("\n") if m_old else ""
+        new_s = m_new.group(1).strip("\n") if m_new else ""
 
-    abs_target = os.path.join(r["live_app_dir"], rel_path)
-    if not os.path.isfile(abs_target):
-        return False
-    try:
-        cur_content = open(
-            abs_target, encoding="utf-8", errors="replace"
-        ).read()
-        if old_s in cur_content:
-            updated = cur_content.replace(old_s, new_s, 1)
-            with open(abs_target, "w", encoding="utf-8") as wf:
-                wf.write(updated)
-            r["applied_hunks"] += 1
-            return True
-    except OSError:
-        pass
-    return False
+        abs_target = os.path.join(r["live_app_dir"], rel_path)
+        if cmd_name == "create" or (not os.path.exists(abs_target) and new_s and not old_s):
+            try:
+                os.makedirs(os.path.dirname(abs_target), exist_ok=True)
+                clean_new = _strip_viewer_line_numbers(new_s)
+                with open(abs_target, "w", encoding="utf-8") as wf:
+                    wf.write(clean_new + "\n")
+                r["applied_hunks"] += 1
+                applied_any = True
+            except OSError:
+                pass
+            continue
+
+        if not os.path.isfile(abs_target) or not new_s:
+            continue
+
+        try:
+            cur_content = open(
+                abs_target, encoding="utf-8", errors="replace"
+            ).read()
+            if cmd_name == "insert":
+                m_ln = re.search(
+                    r"<parameter=insert_line>\s*(\d+)\s*</parameter>", blk
+                )
+                ins_ln = int(m_ln.group(1)) if m_ln else 0
+                cur_lines = cur_content.splitlines()
+                ins_idx = max(0, min(len(cur_lines), ins_ln))
+                clean_new = _strip_viewer_line_numbers(new_s)
+                updated_lines = (
+                    cur_lines[:ins_idx]
+                    + clean_new.splitlines()
+                    + cur_lines[ins_idx:]
+                )
+                with open(abs_target, "w", encoding="utf-8") as wf:
+                    wf.write("\n".join(updated_lines) + "\n")
+                r["applied_hunks"] += 1
+                applied_any = True
+            else:
+                updated = _apply_str_replace_to_content(
+                    cur_content, old_s, new_s
+                )
+                if updated is not None and updated != cur_content:
+                    with open(abs_target, "w", encoding="utf-8") as wf:
+                        wf.write(updated)
+                    r["applied_hunks"] += 1
+                    applied_any = True
+        except OSError:
+            pass
+
+    return applied_any
 
 
 def _read_live_file_window(
@@ -444,13 +767,7 @@ def _read_live_file_window(
     total_l = len(all_lines)
     s_idx = max(0, min(center_start_ln - 1, max(0, total_l - num_lines)))
     e_idx = min(total_l, s_idx + num_lines)
-    numbered = [
-        f"{ln_no:4d}: {all_lines[ln_no - 1]}"
-        for ln_no in range(s_idx + 1, e_idx + 1)
-    ]
-    body = "\n".join(numbered)
-    while len(body) < 700 and numbered:
-        body = body + "\n" + "\n".join(numbered[:15])
+    body = "\n".join(all_lines[s_idx:e_idx])
     if effective_rel != rel_path:
         return (
             f"[File: {fpath} (new target file; viewing sibling /app/{effective_rel}, "
@@ -483,6 +800,112 @@ def _live_git_status_summary(app_dir: str) -> str:
         return "live /app workspace active"
 
 
+def _extract_base_repo_from_docker_image(
+    docker_image: str, app_dir: str
+) -> bool:
+    """Extract `/app` directly from the official `datacurve-ai/deep-swe` container image."""
+    if not _ensure_local_docker_image(docker_image):
+        return False
+    cid = ""
+    try:
+        cid = subprocess.check_output(
+            ["sudo", "docker", "create", docker_image],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if not cid:
+            return False
+        if os.path.exists(app_dir):
+            shutil.rmtree(app_dir)
+        os.makedirs(os.path.dirname(app_dir), exist_ok=True)
+        subprocess.run(
+            ["sudo", "docker", "cp", f"{cid}:/app", app_dir],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", app_dir],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return os.path.isdir(os.path.join(app_dir, ".git"))
+    except Exception:
+        return False
+    finally:
+        if cid:
+            subprocess.run(
+                ["sudo", "docker", "rm", "-f", cid],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+
+def select_stage2_task_ids(
+    tasks_dir: str, num_tasks: int, explicit_task_ids: str
+) -> list[str]:
+    """Select `num_tasks` official `datacurve-ai/deep-swe` tasks (starting with `STAGE2_DEFAULT_TASKS` and interleaving remaining tasks by language)."""
+    parsed_explicit = [
+        t.strip() for t in explicit_task_ids.split(",") if t.strip()
+    ]
+    if num_tasks <= 0:
+        return parsed_explicit or list(STAGE2_DEFAULT_TASKS)
+    if (
+        num_tasks <= len(STAGE2_DEFAULT_TASKS)
+        and parsed_explicit == STAGE2_DEFAULT_TASKS
+    ):
+        return list(STAGE2_DEFAULT_TASKS[:num_tasks])
+
+    selected: list[str] = [
+        t
+        for t in STAGE2_DEFAULT_TASKS
+        if os.path.isdir(os.path.join(tasks_dir, t))
+    ]
+    selected_set = set(selected)
+
+    by_lang: dict[str, list[str]] = {}
+    lang_order = ["javascript", "typescript", "python", "go", "rust"]
+    for name in sorted(os.listdir(tasks_dir)):
+        if name in selected_set:
+            continue
+        td = os.path.join(tasks_dir, name)
+        if not os.path.isdir(td):
+            continue
+        toml_p = os.path.join(td, "task.toml")
+        inst_p = os.path.join(td, "instruction.md")
+        cfg_p = os.path.join(td, "tests", "config.json")
+        if not all(os.path.exists(p) for p in (toml_p, inst_p, cfg_p)):
+            continue
+        try:
+            with open(toml_p, "rb") as tf:
+                t_data = tomllib.load(tf)
+            lg = str(
+                t_data.get("metadata", {}).get("language") or "python"
+            ).lower()
+        except Exception:
+            continue
+        by_lang.setdefault(lg, []).append(name)
+
+    all_langs = lang_order + [lg for lg in sorted(by_lang) if lg not in lang_order]
+    lang_cursors = {lg: 0 for lg in all_langs}
+    while len(selected) < num_tasks:
+        added_in_round = False
+        for lg in all_langs:
+            bucket = by_lang.get(lg, [])
+            cur = lang_cursors[lg]
+            if cur < len(bucket):
+                selected.append(bucket[cur])
+                lang_cursors[lg] = cur + 1
+                added_in_round = True
+                if len(selected) >= num_tasks:
+                    break
+        if not added_in_round:
+            break
+    return selected[:num_tasks]
+
+
 def load_stage2_live_tasks(
     tasks_dir: str,
     repos_dir: str,
@@ -490,12 +913,11 @@ def load_stage2_live_tasks(
     rollouts_per_task: int,
     num_steps: int,
 ) -> list[dict[str, Any]]:
-    """Load metadata, instructions, reference patches, and base `/app` paths for Stage 2 tasks."""
-    from validate_swe_agent_trajectories_hbm import _extract_patch_symbols
+    """Load metadata, instructions, and base `/app` paths for Stage 2 tasks (zero `solution.patch` access)."""
+    num_tasks = len(task_ids)
+    num_cohorts = min(10, max(1, num_tasks))
+    os.makedirs(repos_dir, exist_ok=True)
 
-    # First load per-task data once, then interleave rollouts across tasks
-    # (`g_idx` outer loop, `t_idx` inner loop) so `rollouts[0..num_tasks-1]`
-    # are the task anchors (`g_idx == 0`) across all 10 repositories/languages.
     task_templates: list[dict[str, Any]] = []
     for t_idx, tid in enumerate(task_ids):
         td = os.path.join(tasks_dir, tid)
@@ -525,61 +947,117 @@ def load_stage2_live_tasks(
             os.path.join(td, "instruction.md"), encoding="utf-8", errors="replace"
         ) as f:
             instruction = f.read().strip()
-        with open(
-            os.path.join(td, "solution", "solution.patch"),
-            encoding="utf-8",
-            errors="replace",
-        ) as f:
-            solution_patch = f.read()
 
-        hunks = _parse_patch_file_hunks(solution_patch)
-        if not hunks:
-            raise RuntimeError(f"No hunks parsed for task {tid}")
-
-        step_schedule: list[dict[str, Any]] = []
-        for s_i in range(num_steps):
-            h = hunks[s_i % len(hunks)]
-            syms = _extract_patch_symbols(h["hunk_text"], h["fpath"])
-            if not syms:
-                syms = _extract_patch_symbols(solution_patch, h["fpath"])
-            step_schedule.append(
-                {
-                    "step_num": s_i + 1,
-                    "rel_path": h["rel_path"],
-                    "fpath": h["fpath"],
-                    "start_ln": h["start_ln"],
-                    "old_str": h["old_str"],
-                    "new_str": h["new_str"],
-                    "hunk_text": h["hunk_text"],
-                    "gt_symbols": syms[:16] if syms else [os.path.basename(h["fpath"])],
-                }
-            )
-
-        hunk0_syms = _extract_patch_symbols(
-            hunks[0]["hunk_text"], hunks[0]["fpath"]
-        )
-        patch_syms = _extract_patch_symbols(
-            solution_patch, hunks[0]["fpath"]
-        )
-        all_task_syms: list[str] = []
-        for sym in hunk0_syms + patch_syms:
-            if sym and not sym.isdigit() and sym not in all_task_syms:
-                all_task_syms.append(sym)
-                if len(all_task_syms) >= 24:
-                    break
         base_app_dir = os.path.join(repos_dir, tid, "app")
-        if not os.path.isdir(base_app_dir):
-            raise FileNotFoundError(
-                f"Extracted `/app` repository not found at `{base_app_dir}`."
-            )
-        autonomous_files, repo_files_summary = _discover_autonomous_repo_files(
-            base_app_dir, instruction, hunks[0]["rel_path"]
+        need_real_repo = not os.path.isdir(os.path.join(base_app_dir, ".git"))
+        if not need_real_repo:
+            try:
+                commit_subj = subprocess.check_output(
+                    ["git", "-C", base_app_dir, "log", "-1", "--pretty=%s"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).strip()
+                if commit_subj == "base":
+                    need_real_repo = True
+            except Exception:
+                need_real_repo = True
+        if need_real_repo:
+            fetched_real = False
+            if repo_url and base_commit and base_commit != "HEAD":
+                tmp_fetch = f"{base_app_dir}_fetching"
+                try:
+                    if os.path.exists(tmp_fetch):
+                        shutil.rmtree(tmp_fetch)
+                    os.makedirs(tmp_fetch, exist_ok=True)
+                    subprocess.run(
+                        ["git", "-C", tmp_fetch, "init", "-q"], check=True
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            tmp_fetch,
+                            "remote",
+                            "add",
+                            "origin",
+                            repo_url,
+                        ],
+                        check=True,
+                    )
+                    r_fetch = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            tmp_fetch,
+                            "fetch",
+                            "--depth",
+                            "1",
+                            "--filter=blob:none",
+                            "origin",
+                            base_commit,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                    )
+                    if r_fetch.returncode == 0:
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                tmp_fetch,
+                                "checkout",
+                                "-q",
+                                "FETCH_HEAD",
+                            ],
+                            check=True,
+                        )
+                    else:
+                        shutil.rmtree(tmp_fetch)
+                        subprocess.run(
+                            [
+                                "git",
+                                "clone",
+                                "--filter=blob:none",
+                                "--no-checkout",
+                                repo_url,
+                                tmp_fetch,
+                            ],
+                            check=True,
+                            timeout=180,
+                        )
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                tmp_fetch,
+                                "checkout",
+                                "-q",
+                                base_commit,
+                            ],
+                            check=True,
+                        )
+                    if os.path.exists(base_app_dir):
+                        shutil.rmtree(base_app_dir)
+                    os.rename(tmp_fetch, base_app_dir)
+                    fetched_real = True
+                except Exception:
+                    if os.path.exists(tmp_fetch):
+                        shutil.rmtree(tmp_fetch, ignore_errors=True)
+            if not fetched_real:
+                _extract_base_repo_from_docker_image(docker_image, base_app_dir)
+
+        (
+            autonomous_files,
+            repo_files_summary,
+            step_schedule,
+            inst_symbols,
+        ) = _discover_autonomous_repo_files(
+            base_app_dir, instruction, num_steps=num_steps
         )
+        all_task_syms: list[str] = list(inst_symbols)
         for extra_sym in [
             tid,
-            *[os.path.basename(h["fpath"]) for h in hunks],
-            *[h["rel_path"] for h in hunks],
-            *[sym for s in step_schedule for sym in s["gt_symbols"]],
             *[os.path.basename(af) for af in autonomous_files[:3]],
             *[os.path.splitext(os.path.basename(af))[0] for af in autonomous_files[:3]],
         ]:
@@ -590,6 +1068,7 @@ def load_stage2_live_tasks(
             {
                 "task_id": tid,
                 "task_index": t_idx,
+                "cohort_idx": t_idx % num_cohorts,
                 "language": lang,
                 "repository_url": repo_url,
                 "title": title,
@@ -597,8 +1076,7 @@ def load_stage2_live_tasks(
                 "base_commit": base_commit,
                 "docker_image": docker_image,
                 "instruction": instruction,
-                "solution_patch": solution_patch,
-                "primary_fpath": hunks[0]["fpath"],
+                "primary_fpath": f"/app/{autonomous_files[0]}",
                 "autonomous_primary_rel_path": autonomous_files[0],
                 "autonomous_files": autonomous_files,
                 "repo_files_summary": repo_files_summary,
@@ -612,12 +1090,19 @@ def load_stage2_live_tasks(
     for g_idx in range(rollouts_per_task):
         for tmpl in task_templates:
             tid = tmpl["task_id"]
+            t_idx = tmpl["task_index"]
             rollout_id = f"{tid}__r{g_idx}"
+            cohort_branch_idx = (
+                (t_idx // num_cohorts) * rollouts_per_task + g_idx
+                if num_tasks > num_cohorts
+                else g_idx
+            )
             rollouts.append(
                 {
                     "rollout_index": len(rollouts),
                     "rollout_id": rollout_id,
                     "group_rollout_idx": g_idx,
+                    "cohort_branch_idx": cohort_branch_idx,
                     **tmpl,
                 }
             )
@@ -635,6 +1120,7 @@ async def verify_patch_via_http_or_docker(
     """Verify `model.patch` against the official `datacurve-ai/deep-swe` container."""
     import aiohttp
 
+    tests_dir = os.path.join(tasks_dir, task_id, "tests")
     if verifier_url:
         payload = {
             "task_id": task_id,
@@ -642,15 +1128,35 @@ async def verify_patch_via_http_or_docker(
             "model_patch": model_patch,
             "use_cache": True,
         }
-        async with session.post(
-            verifier_url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=600),
-        ) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+        last_err = ""
+        for _attempt in range(2):
+            try:
+                async with session.post(
+                    verifier_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=600),
+                ) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except Exception as exc:
+                last_err = str(exc)
+                await asyncio.sleep(1.0)
+        f2p_tot, p2p_tot = _read_test_totals_from_config(tests_dir)
+        return {
+            "reward": 0,
+            "f2p_total": f2p_tot,
+            "f2p_passed": 0,
+            "p2p_total": p2p_tot,
+            "p2p_passed": 0,
+            "f2p": 0.0,
+            "p2p": 0.0,
+            "partial": 0.0,
+            "verifier_exit_code": -3,
+            "verifier_wall_time_s": 0.0,
+            "patch_sha256": hashlib.sha256(model_patch.encode("utf-8")).hexdigest(),
+            "error": f"Verifier HTTP error: {last_err}",
+        }
 
-    tests_dir = os.path.join(tasks_dir, task_id, "tests")
     return await asyncio.to_thread(
         run_docker_verifier_sync,
         task_id,
@@ -794,9 +1300,11 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 out[a_edit + 1] = t1
         return out
 
-    task_ids = [
-        t.strip() for t in args.task_ids.split(",") if t.strip()
-    ] or STAGE2_DEFAULT_TASKS
+    task_ids = select_stage2_task_ids(
+        tasks_dir=args.deepswe_tasks_dir,
+        num_tasks=args.num_tasks,
+        explicit_task_ids=args.task_ids,
+    )
     rollouts = load_stage2_live_tasks(
         tasks_dir=args.deepswe_tasks_dir,
         repos_dir=args.repos_dir,
@@ -806,6 +1314,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     )
     num_rollouts = len(rollouts)
     num_tasks = len(task_ids)
+    num_cohorts = min(10, max(1, num_tasks))
     blk_mult = max(1, 128 // block_size) if args.long_context else 1
     h_blks = 5 * blk_mult if args.long_context else 1
     issue_blks = 15 * blk_mult if args.long_context else 1
@@ -838,7 +1347,19 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     def _init_rollout_workspace(r: dict[str, Any]) -> None:
         r_dir = os.path.join(work_root, r["rollout_id"], "app")
-        if not os.path.isdir(os.path.join(r_dir, ".git")):
+        need_copy = not os.path.isdir(os.path.join(r_dir, ".git"))
+        if not need_copy:
+            try:
+                subj = subprocess.check_output(
+                    ["git", "-C", r_dir, "log", "-1", "--pretty=%s"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).strip()
+                if subj == "base":
+                    need_copy = True
+            except Exception:
+                need_copy = True
+        if need_copy:
             os.makedirs(os.path.dirname(r_dir), exist_ok=True)
             if os.path.exists(r_dir):
                 shutil.rmtree(r_dir)
@@ -872,41 +1393,69 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         flush=True,
     )
 
-    # Pre-build per-task anchor blocks from each task's live `/app` initial checkout
+    # Pre-build per-cohort anchor blocks from each cohort's live `/app` initial checkout
     task_anchors: dict[int, dict[str, list[int]]] = {}
     for r in rollouts:
-        t_idx = r["task_index"]
-        if t_idx in task_anchors:
+        c_idx = r["cohort_idx"]
+        if c_idx in task_anchors:
             continue
+        cohort_tasks = [
+            rt
+            for rt in rollouts
+            if rt["cohort_idx"] == c_idx and rt["group_rollout_idx"] == 0
+        ]
         s0 = r["step_schedule"][0]
-        c_sid_h = 100000000 + t_idx
-        c_sid_b = 200000000 + t_idx
-        c_sid_p = 300000000 + t_idx
+        c_sid_h = 100000000 + c_idx
+        c_sid_b = 200000000 + c_idx
+        c_sid_p = 300000000 + c_idx
 
-        open_rel = (
-            r["autonomous_primary_rel_path"]
-            if args.autonomous_agent
-            else s0["rel_path"]
-        )
+        open_rel = r["autonomous_primary_rel_path"]
         open_fpath = f"/app/{open_rel}"
-        open_start_ln = 1 if args.autonomous_agent else s0["start_ln"]
+        open_start_ln = s0["start_ln"]
 
-        static_txt = (
-            f"ID: {c_sid_h} | SWE-Agent Live Trajectory: {r['task_id']} | Open File: {open_fpath}\n"
-            f"{SWE_SYSTEM_TOOL_SPEC}\n"
-            f"Repository: {r['repository_url']} (commit {r['base_commit'][:12]}) | Language: {r['language']}\n"
-            f"Task: {r['title']} — {r['description']}\n\n"
-        )
+        if len(cohort_tasks) > 1:
+            cohort_summary = ", ".join(
+                f"{ct['task_id']} ({ct['primary_fpath']})"
+                for ct in cohort_tasks
+            )
+            static_txt = (
+                f"ID: {c_sid_h} | SWE-Agent Multi-Task Workspace Cohort {c_idx}\n"
+                f"{SWE_SYSTEM_TOOL_SPEC}\n"
+                f"Cohort Tasks & Discovered Candidate Files: {cohort_summary}\n\n"
+            )
+        else:
+            static_txt = (
+                f"ID: {c_sid_h} | SWE-Agent Live Trajectory: {r['task_id']} | Open File: {open_fpath}\n"
+                f"{SWE_SYSTEM_TOOL_SPEC}\n"
+                f"Repository: {r['repository_url']} (commit {r['base_commit'][:12]}) | Language: {r['language']}\n"
+                f"Task: {r['title']} — {r['description']}\n\n"
+            )
         h_static_anc = _tag_task_anchor_blocks(
             _repeat_and_align(
                 tokenizer.encode(static_txt, add_special_tokens=False), h_blks
             ),
             h_blks,
             role_id=0,
-            task_idx=t_idx,
+            task_idx=c_idx,
         )
 
-        if args.autonomous_agent:
+        if len(cohort_tasks) > 1:
+            cohort_issue_parts = []
+            for ct in cohort_tasks:
+                cand_list = ", ".join(
+                    f"`/app/{af}`" for af in ct["autonomous_files"][:3]
+                )
+                cohort_issue_parts.append(
+                    f"### Task `{ct['task_id']}` — Candidate Files: {cand_list}\n"
+                    f"Title: {ct['title']} — {ct['description']}\n"
+                    f"Specification:\n{ct['instruction'][:420]}"
+                )
+            issue_txt = (
+                f"ID: {c_sid_h} | Active SWE-Agent Multi-Task Issue & Repository Context (Cohort {c_idx}): {c_sid_b}\n\n"
+                + "\n\n".join(cohort_issue_parts)
+                + "\n\n"
+            )
+        else:
             issue_txt = (
                 f"ID: {c_sid_h} | Active SWE-Agent Issue & Repository Context: {c_sid_b}\n\n"
                 f"### Specification ({r['task_id']})\n"
@@ -914,86 +1463,65 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 f"### Live `/app` Repository Files\n"
                 f"{r['repo_files_summary']}\n\n"
             )
-            issue_raw_ids = tokenizer.encode(
-                issue_txt, add_special_tokens=False
-            )
-        else:
-            issue_header_txt = (
-                f"ID: {c_sid_h} | Active SWE-Agent Issue & Patch Context: {c_sid_b}\n\n"
-                f"### Specification ({r['task_id']})\n"
-                f"{r['instruction'][:2400]}\n\n"
-                + (
-                    f"### Live `/app` Repository Files\n{r['repo_files_summary'][:1200]}\n\n"
-                    if args.long_context
-                    else ""
-                )
-            )
-            issue_patch_txt = (
-                f"### Target Patch Context (`{r['primary_fpath']}`)\n"
-                f"{r['solution_patch'][:3000]}\n\n"
-            )
-            issue_hdr_ids = tokenizer.encode(
-                issue_header_txt, add_special_tokens=False
-            )
-            issue_patch_ids = tokenizer.encode(
-                issue_patch_txt, add_special_tokens=False
-            )
-            max_issue_hdr = max(
-                64, issue_blks * block_size - len(issue_patch_ids) - 8
-            )
-            issue_raw_ids = issue_hdr_ids[:max_issue_hdr] + issue_patch_ids
+        issue_raw_ids = tokenizer.encode(issue_txt, add_special_tokens=False)
         issue_base_anc = _tag_task_anchor_blocks(
             _repeat_and_align(issue_raw_ids, issue_blks),
             issue_blks,
             role_id=2,
-            task_idx=t_idx,
+            task_idx=c_idx,
         )
 
         if args.long_context:
             multi_views: list[str] = []
             seen_rels: set[str] = set()
-            for sc in r["step_schedule"]:
-                rel_p = sc["rel_path"]
-                if rel_p not in seen_rels:
-                    seen_rels.add(rel_p)
+            # Pass 1: Primary discovered `/app` file window (`step_schedule[0]`) for every cohort task
+            for ct in cohort_tasks:
+                sc0 = ct["step_schedule"][0]
+                rel_p = sc0["rel_path"]
+                key_p = f"{ct['task_id']}:{rel_p}:{sc0['start_ln']}:primary"
+                if key_p not in seen_rels:
+                    seen_rels.add(key_p)
                     multi_views.append(
-                        _read_live_file_window(
-                            r["live_app_dir"],
+                        f"### Task `{ct['task_id']}` — Primary `/app` Window (`{sc0['fpath']}`)\n"
+                        + _read_live_file_window(
+                            ct["live_app_dir"],
                             rel_p,
-                            max(1, sc["start_ln"] - 40),
-                            num_lines=160,
+                            max(1, sc0["start_ln"] - 8),
+                            num_lines=160 if len(cohort_tasks) == 1 else 32,
                         )
                     )
+            # Pass 2: Extended windows across discovered candidate files & line windows of each cohort task
+            for ct in cohort_tasks:
+                for sc in ct["step_schedule"]:
+                    rel_p = sc["rel_path"]
+                    key_p = f"{ct['task_id']}:{rel_p}:{sc['start_ln']}"
+                    if key_p not in seen_rels:
+                        seen_rels.add(key_p)
+                        multi_views.append(
+                            _read_live_file_window(
+                                ct["live_app_dir"],
+                                rel_p,
+                                max(1, sc["start_ln"] - 20),
+                                num_lines=160 if len(cohort_tasks) == 1 else 60,
+                            )
+                        )
             for rel_p in r.get("autonomous_files", [])[:6]:
-                if rel_p not in seen_rels:
-                    seen_rels.add(rel_p)
+                key_p = f"{r['task_id']}:{rel_p}:1"
+                if key_p not in seen_rels:
+                    seen_rels.add(key_p)
                     multi_views.append(
                         _read_live_file_window(
-                            r["live_app_dir"], rel_p, 1, num_lines=160
+                            r["live_app_dir"], rel_p, 1, num_lines=120
                         )
                     )
             live_view_txt = "\n\n".join(multi_views)
             views_ids = tokenizer.encode(
                 live_view_txt, add_special_tokens=False
             )
-            patch_footer_txt = (
-                f"\n\n### Target Patch Context (`{r['primary_fpath']}`)\n"
-                f"{s0['hunk_text'][:1600]}\n\n"
-            )
-            patch_footer_ids = tokenizer.encode(
-                patch_footer_txt, add_special_tokens=False
-            )
             obs_target_toks = obs_blks * block_size
-            mid_budget = max(
-                block_size, obs_target_toks - 2 * len(patch_footer_ids)
-            )
-            while len(views_ids) < mid_budget:
+            while len(views_ids) < obs_target_toks:
                 views_ids = views_ids + views_ids
-            obs_raw_ids = (
-                patch_footer_ids
-                + views_ids[:mid_budget]
-                + patch_footer_ids
-            )[:obs_target_toks]
+            obs_raw_ids = views_ids[:obs_target_toks]
         else:
             live_view_txt = _read_live_file_window(
                 r["live_app_dir"], open_rel, open_start_ln, num_lines=32
@@ -1010,25 +1538,33 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             obs_raw_ids,
             obs_blks,
             role_id=3,
-            task_idx=t_idx,
+            task_idx=c_idx,
         )
 
-        p1_txt = (
-            f"ID: {c_sid_p} | Rolling Live Trajectory Log: {r['task_id']} | Active File: {open_fpath}\n"
-            f"Step: 1 | Live Git Status: {_live_git_status_summary(r['live_app_dir'])}\n\n"
-            f"Trajectory History ({r['task_id']}):\n"
-            f"{live_view_txt[:8000] if args.long_context else live_view_txt[:1200]}\n\n"
-        )
+        if len(cohort_tasks) > 1:
+            p1_txt = (
+                f"ID: {c_sid_p} | Rolling Live Trajectory Log (Cohort {c_idx})\n"
+                f"Step: 1 | Multi-Workspace Live Git Status: {_live_git_status_summary(r['live_app_dir'])}\n\n"
+                f"Workspace File Windows (Cohort {c_idx}):\n"
+                f"{live_view_txt[:11500] if args.long_context else live_view_txt[:1200]}\n\n"
+            )
+        else:
+            p1_txt = (
+                f"ID: {c_sid_p} | Rolling Live Trajectory Log: {r['task_id']} | Active File: {open_fpath}\n"
+                f"Step: 1 | Live Git Status: {_live_git_status_summary(r['live_app_dir'])}\n\n"
+                f"Trajectory History ({r['task_id']}):\n"
+                f"{live_view_txt[:8000] if args.long_context else live_view_txt[:1200]}\n\n"
+            )
         p_turn_1_anc = _tag_task_anchor_blocks(
             _repeat_and_align(
                 tokenizer.encode(p1_txt, add_special_tokens=False), p_blks
             ),
             p_blks,
             role_id=4,
-            task_idx=t_idx,
+            task_idx=c_idx,
         )
 
-        task_anchors[t_idx] = {
+        task_anchors[c_idx] = {
             "h_static": h_static_anc,
             "issue_base": issue_base_anc,
             "obs_turn_0": obs_base_anc,
@@ -1038,23 +1574,23 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     def _build_live_step_prompt(
         r: dict[str, Any], step_idx: int, is_final_submit: bool = False
     ) -> list[int]:
-        t_idx = r["task_index"]
-        anc = task_anchors[t_idx]
+        c_idx = r["cohort_idx"]
+        anc = task_anchors[c_idx]
         r_idx = r["rollout_index"]
-        g_idx = r["group_rollout_idx"]
+        c_branch = r["cohort_branch_idx"]
         sched = r["step_schedule"]
-        cur_s = sched[min(step_idx, len(sched) - 1)]
+        cur_s = (
+            sched[0]
+            if is_final_submit
+            else sched[min(step_idx, len(sched) - 1)]
+        )
 
         # Inspect the live `/app` file and git status at the current step
-        step_rel = (
-            r["autonomous_files"][step_idx % len(r["autonomous_files"])]
-            if args.autonomous_agent
-            else cur_s["rel_path"]
-        )
+        step_rel = cur_s["rel_path"]
         _ = _read_live_file_window(
             r["live_app_dir"],
             step_rel,
-            1 if args.autonomous_agent else cur_s["start_ln"],
+            cur_s["start_ln"],
             num_lines=24,
         )
         live_git_stat = _live_git_status_summary(r["live_app_dir"])
@@ -1063,7 +1599,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         # Block 0: Rollout static header (`h_blks` blocks)
         h_static = (
             list(anc["h_static"])
-            if g_idx == 0
+            if c_branch == 0
             else _apply_rollout_step_tag(
                 anc["h_static"], h_blks, r_idx, 0, role_salt=0
             )
@@ -1073,63 +1609,76 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         # Bucketed Live File Viewer Window (`obs_blks` blocks)
         obs_turn_rw = list(anc["obs_turn_0"])
 
-        # Partial Tail Block (< block_size tokens): Live Tool-Call Generation Trigger
-        if args.autonomous_agent:
-            auto_fpath = f"/app/{r['autonomous_primary_rel_path']}"
-            prompt_question = (
-                f"Task `{r['task_id']}`: Inspect or edit `{auto_fpath}` in `/app` to implement the specification:"
-            )
-        else:
-            max_syms = 1 if block_size <= 64 else 3
-            sym_hint = (
-                ", ".join(r["gt_symbols"][:max_syms])
-                if r["gt_symbols"]
-                else os.path.basename(r["primary_fpath"])
-            )
-            prompt_question = (
-                f"Apply DeepSWE patch to `{r['primary_fpath']}` ({sym_hint}):"
-            )
         assistant_prefill = (
             "<function=file_editor>\n"
             "<parameter=command>str_replace</parameter>\n"
             "<parameter=path>"
         )
-        if is_harmony:
-            suffix_text = (
-                f"{prompt_question}"
-                f"<|end|><|start|>assistant<|channel|>final<|message|>{assistant_prefill}"
-            )
-        elif is_qwen_thinking:
-            suffix_text = (
-                f"{prompt_question}"
-                f"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{assistant_prefill}"
-            )
-        elif is_deepseek_v41:
-            suffix_text = (
-                f"<｜User｜>{prompt_question}<｜Assistant｜></think>{assistant_prefill}"
-            )
-        elif is_glm:
-            suffix_text = (
-                f"<|user|>{prompt_question}<|assistant|><think></think>{assistant_prefill}"
-            )
-        elif is_kimi:
-            suffix_text = (
-                f"<|im_user|>user<|im_middle|>{prompt_question}<|im_end|>"
-                f"<|im_assistant|>assistant<|im_middle|><think></think>{assistant_prefill}"
-            )
-        elif is_muse_spark:
-            suffix_text = (
-                f"<|start|>user<|message|>{prompt_question}<|eot|>"
-                f"<|start|>assistant to=user<|message|>{assistant_prefill}"
-            )
-        else:
-            suffix_text = (
-                f"\n\nUser: {prompt_question}\nAssistant: {assistant_prefill}"
-            )
 
-        suffix_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
+        def _format_suffix_text(q_str: str) -> str:
+            if is_harmony:
+                return (
+                    f"{q_str}"
+                    f"<|end|><|start|>assistant<|channel|>final<|message|>{assistant_prefill}"
+                )
+            if is_qwen_thinking:
+                return (
+                    f"{q_str}"
+                    f"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{assistant_prefill}"
+                )
+            if is_deepseek_v41:
+                return f"<｜User｜>{q_str}<｜Assistant｜></think>{assistant_prefill}"
+            if is_glm:
+                return f"<|user|>{q_str}<|assistant|><think></think>{assistant_prefill}"
+            if is_kimi:
+                return (
+                    f"<|im_user|>user<|im_middle|>{q_str}<|im_end|>"
+                    f"<|im_assistant|>assistant<|im_middle|><think></think>{assistant_prefill}"
+                )
+            if is_muse_spark:
+                return (
+                    f"<|start|>user<|message|>{q_str}<|eot|>"
+                    f"<|start|>assistant to=user<|message|>{assistant_prefill}"
+                )
+            return f"\n\nUser: {q_str}\nAssistant: {assistant_prefill}"
+
+        # Partial Tail Block (< block_size tokens): Autonomous Tool-Call Generation Trigger (zero solution.patch)
+        target_fpath = cur_s["fpath"]
+        short_fpath = (
+            target_fpath
+            if len(target_fpath) <= 36
+            else "/app/.../" + os.path.basename(target_fpath)
+        )
+        cand_questions = [
+            f"Task `{r['task_id']}`: Edit `{target_fpath}` in `/app` to implement `{r['title'][:48]}`:",
+            f"Task `{r['task_id']}`: Edit `{short_fpath}` in `/app` to implement the specification:",
+            f"Task `{r['task_id']}`: Edit `{os.path.basename(target_fpath)}` in `/app`:",
+            f"Edit `{short_fpath}`:",
+        ]
+        suffix_ids: list[int] = []
+        for cq in cand_questions:
+            c_ids = tokenizer.encode(
+                _format_suffix_text(cq), add_special_tokens=False
+            )
+            suffix_ids = c_ids
+            if len(c_ids) <= block_size - 2:
+                break
+
         if len(suffix_ids) >= block_size:
-            suffix_ids = suffix_ids[-(block_size - 4) :]
+            empty_wrap_ids = tokenizer.encode(
+                _format_suffix_text(""), add_special_tokens=False
+            )
+            budget_q = max(2, block_size - 2 - len(empty_wrap_ids))
+            q_ids = tokenizer.encode(
+                f"{os.path.basename(target_fpath)}",
+                add_special_tokens=False,
+            )[:budget_q]
+            q_trunc = tokenizer.decode(q_ids, skip_special_tokens=True)
+            suffix_ids = tokenizer.encode(
+                _format_suffix_text(q_trunc), add_special_tokens=False
+            )
+            if len(suffix_ids) >= block_size:
+                suffix_ids = empty_wrap_ids[-(block_size - 2) :]
         if len(suffix_ids) < 4:
             suffix_ids = [newline_id] * (4 - len(suffix_ids)) + suffix_ids
         if len(suffix_ids) % block_size == 0:
@@ -1141,7 +1690,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         eff_t_idx = args.num_steps - 1 if is_final_submit else step_idx
         p_turn = (
             list(anc["p_turn_1"])
-            if (g_idx == 0 and eff_t_idx == 1)
+            if (c_branch == 0 and eff_t_idx == 1)
             else _apply_rollout_step_tag(
                 anc["p_turn_1"], p_blks, r_idx, eff_t_idx, role_salt=4
             )
@@ -1186,6 +1735,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             indexed_prompts: list[tuple[int, list[int]]],
             max_toks: int,
             batch_sz: int,
+            stop_seqs: list[str] | None = None,
         ) -> list[dict[str, Any]]:
             out_results: list[dict[str, Any]] = []
             for start_i in range(0, len(indexed_prompts), batch_sz):
@@ -1199,6 +1749,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         prompt_token_ids=p_ids,
                         max_tokens=max_toks,
                         temperature=0.0,
+                        stop=stop_seqs,
                     )
                     for _, p_ids in chunk
                 ]
@@ -1207,39 +1758,44 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         t_rollout_start = time.perf_counter()
         completed_turns = 0
+        rollout_llm_server_time_s = 0.0
+        rollout_tool_call_time_s = 0.0
 
         # Step 1: Live Multi-Turn SWEAgent Rollout Waves (`step 1 .. num_steps`)
         for step_idx in range(args.num_steps):
+            t_wave_total0 = time.perf_counter()
+            t_tool_obs0 = time.perf_counter()
             active_indexed_prompts: list[tuple[int, list[int]]] = [
                 (r["rollout_index"], _build_live_step_prompt(r, step_idx, False))
                 for r in rollouts
             ]
-            # Group rollouts 0 of each task first in Steps 0..1 so task anchors populate before sibling rollouts
+            # Group cohort anchors (`cohort_branch_idx == 0`) first in Steps 0..1 so cohort anchors populate before sibling trajectories
             if step_idx <= 1:
                 anchors_first = [
                     item
                     for item in active_indexed_prompts
-                    if rollouts[item[0]]["group_rollout_idx"] == 0
+                    if rollouts[item[0]]["cohort_branch_idx"] == 0
                 ]
                 siblings_after = [
                     item
                     for item in active_indexed_prompts
-                    if rollouts[item[0]]["group_rollout_idx"] != 0
+                    if rollouts[item[0]]["cohort_branch_idx"] != 0
                 ]
                 active_indexed_prompts = anchors_first + siblings_after
+            wave_tool_obs_dur_s = time.perf_counter() - t_tool_obs0
 
             cur_batch_sz = (
                 wave_batch_sz
                 if step_idx >= max(0, args.num_steps - 3)
                 else args.concurrency
             )
-            t_wave0 = time.perf_counter()
-            if step_idx <= 1 and len(active_indexed_prompts) > num_tasks:
+            t_llm0 = time.perf_counter()
+            if step_idx <= 1 and len(active_indexed_prompts) > num_cohorts:
                 res_anc = await _run_indexed_batches(
-                    active_indexed_prompts[:num_tasks], 1, cur_batch_sz
+                    active_indexed_prompts[:num_cohorts], 1, cur_batch_sz
                 )
                 res_sib = await _run_indexed_batches(
-                    active_indexed_prompts[num_tasks:], 1, cur_batch_sz
+                    active_indexed_prompts[num_cohorts:], 1, cur_batch_sz
                 )
                 wave_ingest_results = list(res_anc) + list(res_sib)
             else:
@@ -1265,8 +1821,10 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
             else:
                 wave_verify_results = []
+            wave_llm_dur_s = time.perf_counter() - t_llm0
 
-            # Apply live tool action to each rollout's `/app` repository as the step executes
+            # Apply live autonomous tool action to each rollout's `/app` repository as the step executes
+            t_tool_exec0 = time.perf_counter()
             for (r_idx, _), step_res in zip(
                 active_indexed_prompts, wave_ingest_results
             ):
@@ -1275,36 +1833,8 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 sched_s = r["step_schedule"][
                     min(step_idx, len(r["step_schedule"]) - 1)
                 ]
-                if args.autonomous_agent:
-                    _execute_autonomous_tool_call(r, gen_txt)
-                    step_rel = r["autonomous_files"][
-                        step_idx % len(r["autonomous_files"])
-                    ]
-                else:
-                    step_rel = sched_s["rel_path"]
-                    abs_target = os.path.join(
-                        r["live_app_dir"], sched_s["rel_path"]
-                    )
-                    if (
-                        os.path.exists(abs_target)
-                        and sched_s["old_str"]
-                        and sched_s["new_str"]
-                    ):
-                        try:
-                            cur_content = open(
-                                abs_target, encoding="utf-8", errors="replace"
-                            ).read()
-                            if sched_s["old_str"] in cur_content:
-                                updated = cur_content.replace(
-                                    sched_s["old_str"], sched_s["new_str"], 1
-                                )
-                                with open(
-                                    abs_target, "w", encoding="utf-8"
-                                ) as wf:
-                                    wf.write(updated)
-                                r["applied_hunks"] += 1
-                        except OSError:
-                            pass
+                _execute_autonomous_tool_call(r, gen_txt)
+                step_rel = sched_s["rel_path"]
                 r["tool_history"].append(
                     {
                         "step": step_idx + 1,
@@ -1312,6 +1842,10 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         "gen_preview": gen_txt[:60],
                     }
                 )
+            wave_tool_exec_dur_s = time.perf_counter() - t_tool_exec0
+            wave_tool_dur_s = wave_tool_obs_dur_s + wave_tool_exec_dur_s
+            rollout_llm_server_time_s += wave_llm_dur_s
+            rollout_tool_call_time_s += wave_tool_dur_s
 
             active_mru_indices = [
                 idx
@@ -1326,7 +1860,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 i for i in mru_order if i not in active_set
             ]
             wave_results = wave_ingest_results + wave_verify_results
-            wave_dur_s = time.perf_counter() - t_wave0
+            wave_dur_s = time.perf_counter() - t_wave_total0
             completed_turns += len(wave_ingest_results)
             reqs_per_turn = 1 if args.long_context else 2
 
@@ -1364,6 +1898,8 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "active_rollouts_in_wave": len(wave_ingest_results),
                 "completed_turns_cumulative": completed_turns,
                 "wave_wall_time_s": round(wave_dur_s, 4),
+                "wave_llm_server_wall_time_s": round(wave_llm_dur_s, 4),
+                "wave_tool_call_wall_time_s": round(wave_tool_dur_s, 4),
                 "elapsed_wall_time_s": round(
                     time.perf_counter() - t_rollout_start, 4
                 ),
@@ -1388,7 +1924,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             print(
                 f"  [Live Agent Wave {step_idx + 1:02d}/{args.num_steps:02d}] "
                 f"rollouts={len(wave_ingest_results):3d} | "
-                f"wave_time={wave_dur_s:6.2f}s | "
+                f"wave_time={wave_dur_s:6.2f}s (llm={wave_llm_dur_s:6.2f}s, tool={wave_tool_dur_s:5.2f}s) | "
                 f"wave_hit={wave_record['wave_hit_rate_pct']:6.2f}% | "
                 f"cum_hit={wave_record['cumulative_hit_rate_pct']:6.2f}% | "
                 f"evicted_blks={wave_record['evicted_blocks_cumulative']:5d} "
@@ -1418,10 +1954,12 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             num_requests_completed=completed_turns * reqs_per_turn,
         )
 
-        # Step 2: Final Patch Submission & Cache Residency Evaluation Wave (`max_tokens=64`)
+        # Step 2: Final Patch Submission & Cache Residency Evaluation Wave
+        final_max_tokens = max(args.max_new_tokens, 512)
+        final_stop_seqs = ["</function>", "<function=finish>", "<|eot|>", "<|im_end|>"]
         print(
             f"[Stage2-Live-Agent] Running Final Patch Submission & Residency Wave "
-            f"(`max_tokens={args.max_new_tokens}`) across all {num_rollouts} live rollouts in MRU order...",
+            f"(`max_tokens={final_max_tokens}`) across all {num_rollouts} live rollouts in MRU order...",
             flush=True,
         )
         t_eval_start = time.perf_counter()
@@ -1447,6 +1985,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         mru_window_indices = mru_order[:max_resident_window]
         lru_tail_indices = mru_order[max_resident_window:]
 
+        t_eval_tool_obs0 = time.perf_counter()
         mru_window_prompts = [
             (
                 idx,
@@ -1456,26 +1995,40 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             )
             for idx in mru_window_indices
         ]
+        lru_tail_prompts = [
+            (
+                idx,
+                _build_live_step_prompt(
+                    rollouts[idx], args.num_steps - 1, is_final_submit=True
+                ),
+            )
+            for idx in lru_tail_indices
+        ]
+        eval_tool_obs_dur_s = time.perf_counter() - t_eval_tool_obs0
+
+        t_eval_llm0 = time.perf_counter()
         mru_window_results = await _run_indexed_batches(
-            mru_window_prompts, args.max_new_tokens, resident_batch_sz
+            mru_window_prompts,
+            final_max_tokens,
+            resident_batch_sz,
+            stop_seqs=final_stop_seqs,
         )
+        t_eval_llm_mru = time.perf_counter() - t_eval_llm0
         after_window_snap = await scrape_vllm_metrics(session, args.base_url)
 
-        if lru_tail_indices:
-            lru_tail_prompts = [
-                (
-                    idx,
-                    _build_live_step_prompt(
-                        rollouts[idx], args.num_steps - 1, is_final_submit=True
-                    ),
-                )
-                for idx in lru_tail_indices
-            ]
+        t_eval_llm1 = time.perf_counter()
+        if lru_tail_prompts:
             lru_tail_results = await _run_indexed_batches(
-                lru_tail_prompts, args.max_new_tokens, args.concurrency
+                lru_tail_prompts,
+                final_max_tokens,
+                args.concurrency,
+                stop_seqs=final_stop_seqs,
             )
         else:
             lru_tail_results = []
+        eval_llm_server_time_s = t_eval_llm_mru + (
+            time.perf_counter() - t_eval_llm1
+        )
 
         eval_results: list[dict[str, Any]] = [{}] * num_rollouts
         for idx, res in zip(
@@ -1484,7 +2037,6 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         ):
             eval_results[idx] = res
         eval_wall_time_s = time.perf_counter() - t_eval_start
-        total_llm_wall_time_s = rollout_wall_time_s + eval_wall_time_s
 
         after_eval_snap = await scrape_vllm_metrics(session, args.base_url)
         window_only_metrics = extract_effective_hit_metrics(
@@ -1522,14 +2074,15 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             + num_rollouts,
         )
 
-        # Step 3: Commit finalized patch to each rollout's live `/app` repo, extract `git diff`,
-        # and run the official `datacurve-ai/deep-swe` Docker container verifier (`bash /tests/test.sh`)
+        # Step 3: Apply the model's generated `<function=file_editor>` tool calls to each rollout's
+        # live `/app` repo, extract `git diff --binary HEAD`, and grade with the official
+        # `datacurve-ai/deep-swe` Docker container verifier (`bash /tests/test.sh`)
         print(
-            f"[Stage2-Live-Agent] Finalizing live `/app` git patches (`git diff --binary HEAD`) "
+            f"[Stage2-Live-Agent] Executing live model `<function=file_editor>` edits, extracting `git diff --binary HEAD`, "
             f"and grading all {num_rollouts} rollouts with official `datacurve-ai/deep-swe` verifier containers...",
             flush=True,
         )
-        t_verify_start = time.perf_counter()
+        t_final_tool_exec0 = time.perf_counter()
         per_rollout_outputs: list[dict[str, Any]] = []
         symbol_hits = 0
         passed_rollouts = 0
@@ -1542,6 +2095,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         task_pass_counts: dict[str, int] = {tid: 0 for tid in task_ids}
         lang_stats: dict[str, dict[str, Any]] = {}
 
+        rollout_patches: list[tuple[str, str, bool]] = []
         for r, res in zip(rollouts, eval_results):
             gen_text = res["text"]
             gen_lower = gen_text.lower()
@@ -1550,39 +2104,8 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             )
             if matched_final:
                 symbol_hits += 1
-            if args.autonomous_agent:
-                _execute_autonomous_tool_call(r, gen_text)
-            elif matched_final:
-                # Apply the complete verified patch cleanly to the rollout's live `/app` repo
-                subprocess.run(
-                    ["git", "-C", r["live_app_dir"], "reset", "--hard", "HEAD"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                subprocess.run(
-                    ["git", "-C", r["live_app_dir"], "clean", "-fd"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                patch_proc = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        r["live_app_dir"],
-                        "apply",
-                        "--whitespace=nowarn",
-                        "-",
-                    ],
-                    input=r["solution_patch"],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                )
-                if patch_proc.returncode == 0:
-                    r["applied_hunks"] = len(r["step_schedule"])
+
+            _execute_autonomous_tool_call(r, gen_text)
 
             # Stage intent-to-add (`git add -N .`) so newly created files are included in `git diff HEAD`
             subprocess.run(
@@ -1591,7 +2114,7 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-            # Extract real `model.patch` from the rollout's live `/app` git checkout
+            # Extract real `model.patch` strictly from the rollout's live `/app` git checkout
             diff_proc = subprocess.run(
                 [
                     "git",
@@ -1610,15 +2133,49 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             patch_sha256 = hashlib.sha256(
                 live_model_patch.encode("utf-8")
             ).hexdigest()
-
-            verifier_res = await verify_patch_via_http_or_docker(
-                session=session,
-                verifier_url=args.verifier_url,
-                tasks_dir=args.deepswe_tasks_dir,
-                task_id=r["task_id"],
-                docker_image=r["docker_image"],
-                model_patch=live_model_patch,
+            rollout_patches.append(
+                (live_model_patch, patch_sha256, matched_final)
             )
+        eval_tool_call_time_s = eval_tool_obs_dur_s + (
+            time.perf_counter() - t_final_tool_exec0
+        )
+        total_llm_server_wall_time_s = (
+            rollout_llm_server_time_s + eval_llm_server_time_s
+        )
+        total_tool_call_wall_time_s = (
+            rollout_tool_call_time_s + eval_tool_call_time_s
+        )
+        total_llm_wall_time_s = (
+            total_llm_server_wall_time_s + total_tool_call_wall_time_s
+        )
+
+        t_verify_start = time.perf_counter()
+        verify_sem = asyncio.Semaphore(8)
+
+        async def _verify_one(
+            r_item: dict[str, Any], patch_txt: str
+        ) -> dict[str, Any]:
+            async with verify_sem:
+                return await verify_patch_via_http_or_docker(
+                    session=session,
+                    verifier_url=args.verifier_url,
+                    tasks_dir=args.deepswe_tasks_dir,
+                    task_id=r_item["task_id"],
+                    docker_image=r_item["docker_image"],
+                    model_patch=patch_txt,
+                )
+
+        verifier_results = await asyncio.gather(
+            *[
+                _verify_one(r, patch_txt)
+                for r, (patch_txt, _, _) in zip(rollouts, rollout_patches)
+            ]
+        )
+
+        for r, res, (live_model_patch, patch_sha256, matched_final), verifier_res in zip(
+            rollouts, eval_results, rollout_patches, verifier_results
+        ):
+            gen_text = res["text"]
             reward_val = int(verifier_res.get("reward", 0))
             f2p_p = int(verifier_res.get("f2p_passed", 0))
             f2p_t = int(verifier_res.get("f2p_total", 0))
@@ -1730,12 +2287,8 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     payload = {
-        "stage": (
-            "Stage 2 (Option 2): Unguided Autonomous SWEAgent Rollout + Official Container Verifier"
-            if args.autonomous_agent
-            else "Stage 2: Live SWEAgent Sandbox Rollout + Official Container Verifier"
-        ),
-        "autonomous_agent": bool(args.autonomous_agent),
+        "stage": "Stage 2: Unguided Autonomous SWEAgent Rollout + Official Container Verifier",
+        "autonomous_agent": True,
         "mode": args.mode,
         "model": args.served_model_name,
         "tokenizer": args.tokenizer,
@@ -1758,11 +2311,22 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             overall_metrics["hbm_memory_saving_pct"], 2
         ),
         "rollout_wall_time_s": round(rollout_wall_time_s, 3),
+        "rollout_llm_server_wall_time_s": round(rollout_llm_server_time_s, 3),
+        "rollout_tool_call_wall_time_s": round(rollout_tool_call_time_s, 3),
         "eval_wall_time_s": round(eval_wall_time_s, 3),
+        "eval_llm_server_wall_time_s": round(eval_llm_server_time_s, 3),
+        "eval_tool_call_wall_time_s": round(eval_tool_call_time_s, 3),
+        "total_llm_server_wall_time_s": round(total_llm_server_wall_time_s, 3),
+        "total_tool_call_wall_time_s": round(total_tool_call_wall_time_s, 3),
         "total_llm_wall_time_s": round(total_llm_wall_time_s, 3),
         "verifier_wall_time_s": round(verifier_wall_time_s, 3),
         "throughput_turns_per_s": round(
             (completed_turns + num_rollouts) / max(1e-6, total_llm_wall_time_s),
+            2,
+        ),
+        "llm_server_throughput_turns_per_s": round(
+            (completed_turns + num_rollouts)
+            / max(1e-6, total_llm_server_wall_time_s),
             2,
         ),
         "rollout_prefix_hit_rate_pct": round(rollout_metrics["hit_rate_pct"], 2),
@@ -1800,8 +2364,11 @@ async def run_stage2_live_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     print(
         f"\n[Stage2 Live Agent + Official Verifier Summary: mode={args.mode} | model={args.served_model_name}]\n"
         f"  Live Rollouts / Turns:          {num_rollouts} rollouts ({num_tasks} tasks x G={args.rollouts_per_task}) / {completed_turns} turns (+{num_rollouts} submit)\n"
-        f"  LLM Rollout Wall-Clock Time:    {payload['total_llm_wall_time_s']:.2f} s "
-        f"(Steps 1..{args.num_steps}: {payload['rollout_wall_time_s']:.2f} s, Final Submit: {payload['eval_wall_time_s']:.2f} s)\n"
+        f"  Pure LLM Server Wall Time:      {payload['total_llm_server_wall_time_s']:.2f} s "
+        f"(Steps 1..{args.num_steps}: {payload['rollout_llm_server_wall_time_s']:.2f} s, Final Submit: {payload['eval_llm_server_wall_time_s']:.2f} s)\n"
+        f"  Tool-Call / Sandbox I/O Time:   {payload['total_tool_call_wall_time_s']:.2f} s "
+        f"(Steps 1..{args.num_steps}: {payload['rollout_tool_call_wall_time_s']:.2f} s, Final Submit: {payload['eval_tool_call_wall_time_s']:.2f} s)\n"
+        f"  Total Agent Loop Wall Time:     {payload['total_llm_wall_time_s']:.2f} s | Container Verifier Time: {payload['verifier_wall_time_s']:.2f} s\n"
         f"  Overall Prefix Cache Hit Rate:  {payload['overall_prefix_hit_rate_pct']:.2f}%\n"
         f"  Final Submit Prefix Hit Rate:   {payload['final_submit_prefix_hit_rate_pct']:.2f}% "
         f"(~{resident_rollouts_est}/{num_rollouts} resident rollouts)\n"
@@ -1864,9 +2431,17 @@ def compare_stage2_blockpool_and_delta(
     bp_llm_time = bp_data["total_llm_wall_time_s"]
     dt_llm_time = delta_data["total_llm_wall_time_s"]
     llm_speedup = bp_llm_time / max(1e-6, dt_llm_time)
+    bp_llm_srv_time = bp_data.get("total_llm_server_wall_time_s", bp_llm_time)
+    dt_llm_srv_time = delta_data.get("total_llm_server_wall_time_s", dt_llm_time)
+    llm_srv_speedup = bp_llm_srv_time / max(1e-6, dt_llm_srv_time)
+    bp_tool_time = bp_data.get("total_tool_call_wall_time_s", 0.0)
+    dt_tool_time = delta_data.get("total_tool_call_wall_time_s", 0.0)
     bp_eval_time = bp_data["eval_wall_time_s"]
     dt_eval_time = delta_data["eval_wall_time_s"]
     eval_speedup = bp_eval_time / max(1e-6, dt_eval_time)
+    bp_eval_srv_time = bp_data.get("eval_llm_server_wall_time_s", bp_eval_time)
+    dt_eval_srv_time = delta_data.get("eval_llm_server_wall_time_s", dt_eval_time)
+    eval_srv_speedup = bp_eval_srv_time / max(1e-6, dt_eval_srv_time)
 
     comparison = {
         "stage": delta_data["stage"],
@@ -1928,9 +2503,17 @@ def compare_stage2_blockpool_and_delta(
             "eval_wall_time_blockpool_s": bp_eval_time,
             "eval_wall_time_delta_s": dt_eval_time,
             "eval_wall_time_speedup": round(eval_speedup, 2),
+            "eval_llm_server_wall_time_blockpool_s": bp_eval_srv_time,
+            "eval_llm_server_wall_time_delta_s": dt_eval_srv_time,
+            "eval_llm_server_wall_time_speedup": round(eval_srv_speedup, 2),
             "llm_wall_time_blockpool_s": bp_llm_time,
             "llm_wall_time_delta_s": dt_llm_time,
             "llm_wall_time_speedup": round(llm_speedup, 2),
+            "llm_server_wall_time_blockpool_s": bp_llm_srv_time,
+            "llm_server_wall_time_delta_s": dt_llm_srv_time,
+            "llm_server_wall_time_speedup": round(llm_srv_speedup, 2),
+            "tool_call_wall_time_blockpool_s": bp_tool_time,
+            "tool_call_wall_time_delta_s": dt_tool_time,
             "gt_patch_symbol_accuracy_blockpool_pct": bp_data.get(
                 "gt_patch_symbol_accuracy_pct", 0.0
             ),
@@ -1988,7 +2571,9 @@ def compare_stage2_blockpool_and_delta(
         f"  Cache Evictions:               {cs['evicted_blocks_blockpool']:6d} blks ({cs['evicted_gib_blockpool']:.2f} GiB) -> {cs['evicted_blocks_delta']:6d} blks ({cs['evicted_gib_delta']:.2f} GiB)\n"
         f"  KV HBM Budget Utilization:     {cs['used_kv_hbm_gib_blockpool']:.2f}/{cs['hbm_budget_gib']:.2f} GiB ({cs['effective_kv_hbm_utilization_blockpool_pct']:.1f}%) -> {cs['used_kv_hbm_gib_delta']:.2f}/{cs['hbm_budget_gib']:.2f} GiB ({cs['effective_kv_hbm_utilization_delta_pct']:.1f}%, storing {cs['uncompressed_equivalent_gib_delta']:.2f} GiB raw, {cs['hbm_memory_saving_delta_pct']:.1f}% saved)\n"
         f"  Effective KV Compression:      1.00x (BlockPool) -> {cs['compression_factor_delta']:.2f}x (Delta)\n"
-        f"  LLM Rollout Wall-Clock Time:   {cs['llm_wall_time_blockpool_s']:.2f} s (BlockPool) -> {cs['llm_wall_time_delta_s']:.2f} s (Delta) [{cs['llm_wall_time_speedup']:.2f}x speedup; Final Submit: {cs['eval_wall_time_blockpool_s']:.2f}s -> {cs['eval_wall_time_delta_s']:.2f}s ({cs['eval_wall_time_speedup']:.2f}x)]\n"
+        f"  Pure LLM Server Wall Time:     {cs['llm_server_wall_time_blockpool_s']:.2f} s (BlockPool) -> {cs['llm_server_wall_time_delta_s']:.2f} s (Delta) [{cs['llm_server_wall_time_speedup']:.2f}x speedup; Final Submit LLM: {cs['eval_llm_server_wall_time_blockpool_s']:.2f}s -> {cs['eval_llm_server_wall_time_delta_s']:.2f}s ({cs['eval_llm_server_wall_time_speedup']:.2f}x)]\n"
+        f"  Tool-Call / Sandbox I/O Time:  {cs['tool_call_wall_time_blockpool_s']:.2f} s (BlockPool) vs {cs['tool_call_wall_time_delta_s']:.2f} s (Delta)\n"
+        f"  Total Agent Loop Wall Time:    {cs['llm_wall_time_blockpool_s']:.2f} s (BlockPool) -> {cs['llm_wall_time_delta_s']:.2f} s (Delta) [{cs['llm_wall_time_speedup']:.2f}x speedup]\n"
         f"  Target Symbol Localization:    {cs['gt_patch_symbol_accuracy_blockpool_pct']:.2f}% (BlockPool) vs {cs['gt_patch_symbol_accuracy_delta_pct']:.2f}% (Delta)\n"
         f"  Official Verifier Pass@1:      {cs['verifier_pass_at_1_blockpool_pct']:.2f}% (BlockPool) vs {cs['verifier_pass_at_1_delta_pct']:.2f}% (Delta)\n"
         f"  Official Verifier Pass@{comparison['rollouts_per_task']}:      {cs['verifier_pass_at_k_blockpool_pct']:.2f}% (BlockPool) vs {cs['verifier_pass_at_k_delta_pct']:.2f}% (Delta)\n"
@@ -2060,6 +2645,12 @@ def parse_args() -> argparse.Namespace:
         "--task-ids",
         type=str,
         default=",".join(STAGE2_DEFAULT_TASKS),
+    )
+    parser.add_argument(
+        "--num-tasks",
+        type=int,
+        default=0,
+        help="If > 0, select this many official `datacurve-ai/deep-swe` tasks from `--deepswe-tasks-dir` (e.g. 100 tasks x 1 rollout).",
     )
     parser.add_argument("--rollouts-per-task", type=int, default=12)
     parser.add_argument("--num-steps", type=int, default=8)
