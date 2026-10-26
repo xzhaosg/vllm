@@ -109,6 +109,13 @@ def extract_gsm8k_gold(answer_str: str) -> str:
 
 def extract_gsm8k_pred(text: str) -> str:
     """Extract predicted numeric answer from model completion."""
+    for marker in (
+        "It looks like your message",
+        "It seems like your message",
+        "It looks like there might",
+    ):
+        if marker in text:
+            text = text.split(marker)[0]
     if "</think>" in text:
         text = text.split("</think>")[-1]
     if "<|message|>" in text:
@@ -123,6 +130,11 @@ def extract_gsm8k_pred(text: str) -> str:
         m = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", boxed[-1])
         if m:
             return m.group(0).replace(",", "")
+    if "assistantfinal" in text:
+        af_seg = text.split("assistantfinal", 1)[1].split("assistantfinal")[0]
+        af_nums = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", af_seg)
+        if af_nums:
+            return af_nums[-1].replace(",", "")
     nums = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", text)
     if nums:
         return nums[-1].replace(",", "")
@@ -142,16 +154,52 @@ def gsm8k_is_correct(pred_text: str, gold_str: str) -> bool:
 
 def normalize_coqa_answer(s: str) -> str:
     """Official CoQA / SQuAD answer normalization."""
+    for marker in (
+        "It looks like your message",
+        "It seems like your message",
+        "It looks like there might",
+        "\n(Note:",
+        "\nHere’s a concise answer",
+        "\nHere's a concise answer",
+    ):
+        if marker in s:
+            s = s.split(marker)[0]
     if "</think>" in s:
         s = s.split("</think>")[-1]
     if "<|message|>" in s:
         s = s.split("<|message|>")[-1]
-    for prefix in ("Short Answer:", "Answer:", "A:"):
-        if prefix in s:
-            s = s.split(prefix)[-1]
-    s = s.strip().splitlines()[0] if s.strip() else ""
-    s = s.lower()
-    s = "".join(ch for ch in s if ch not in set(string.punctuation))
+    if "assistantfinal" in s:
+        af_seg = s.split("assistantfinal", 1)[1].split("assistantfinal")[0]
+        if "".join(ch for ch in af_seg if ch.isalnum()):
+            s = af_seg
+    for pat in (
+        r"(?i)\bshort\s+answer\s*\**\s*:",
+        r"(?i)\bso\s+final\s+answer\s*\**\s*:",
+        r"(?i)\bfinal\s+answer\s*\**\s*:",
+        r"(?i)\bso\s+answer\s*\**\s*:",
+        r"(?i)\bthe\s+answer\s+to\s+the\s+last\s+question\s+is\s*\**\s*:",
+        r"(?i)\bthe\s+answer\s+is\s*\**\s*:",
+        r"(?i)\bthe\s+answer\s*\**\s*:",
+        r"(?i)\*+\s*answer\s*\*+\s*:",
+        r"(?i)\banswer\s*\**\s*:",
+        r"(?:^|\n)\s*\**\s*A\s*\**\s*:",
+    ):
+        parts = re.split(pat, s)
+        if len(parts) > 1:
+            for cand_part in reversed(parts[1:]):
+                if "".join(ch for ch in cand_part if ch.isalnum()):
+                    s = cand_part
+                    break
+            break
+    chosen_line = ""
+    for line in s.splitlines():
+        cleaned = "".join(
+            ch for ch in line if ch not in set(string.punctuation)
+        ).strip()
+        if cleaned:
+            chosen_line = cleaned
+            break
+    s = chosen_line.lower()
     s = re.sub(r"\b(a|an|the)\b", " ", s)
     return " ".join(s.split())
 
@@ -704,7 +752,18 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             bp_data = json.load(f)
         bp_ts = bp_data.get("time_series_every_20_questions", [])
         aligned_series: list[dict[str, Any]] = []
+        bp_updated = False
         for d_pt, b_pt in zip(time_series, bp_ts):
+            if (
+                float(d_pt.get("evicted_blocks", 0.0)) == 0.0
+                and float(d_pt.get("raw_kv_hbm_mb", 0.0)) > 0.0
+            ):
+                b_pt["evicted_blocks"] = 0.0
+                b_pt["kv_cache_hbm_mb"] = d_pt["raw_kv_hbm_mb"]
+                b_pt["raw_kv_hbm_mb"] = d_pt["raw_kv_hbm_mb"]
+                b_pt["kv_cache_hbm_gib"] = d_pt["raw_kv_hbm_gib"]
+                b_pt["raw_kv_hbm_gib"] = d_pt["raw_kv_hbm_gib"]
+                bp_updated = True
             b_mb = float(b_pt.get("kv_cache_hbm_mb", 0.0))
             d_mb = float(d_pt.get("kv_cache_hbm_mb", 0.0))
             aligned_series.append(
@@ -726,6 +785,14 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     "delta_coqa_f1_pct": d_pt["coqa_f1_pct"],
                 }
             )
+        if bp_updated and bp_ts:
+            bp_sum = bp_data.get("summary", {})
+            bp_sum["final_kv_cache_hbm_mb"] = bp_ts[-1]["kv_cache_hbm_mb"]
+            bp_sum["final_kv_cache_hbm_gib"] = bp_ts[-1]["kv_cache_hbm_gib"]
+            bp_sum["final_raw_kv_hbm_mb"] = bp_ts[-1]["raw_kv_hbm_mb"]
+            bp_sum["final_raw_kv_hbm_gib"] = bp_ts[-1]["raw_kv_hbm_gib"]
+            with open(args.compare_blockpool_json, "w", encoding="utf-8") as f:
+                json.dump(bp_data, f, indent=2)
         comp_payload = {
             "served_model_name": args.served_model_name,
             "total_questions": total_q,

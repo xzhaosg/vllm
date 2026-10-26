@@ -2345,8 +2345,13 @@ class DeltaBlockStore:
                 prev_token_block_hash,
                 max_exceptions,
                 policy.is_mamba,
+                policy.layer_idx == 0,
             )
-            if full_block_hash and not exclude_hashes
+            if (
+                full_block_hash
+                and not exclude_hashes
+                and not self.enable_cross_turn_reuse
+            )
             else None
         )
         if (
@@ -2738,6 +2743,7 @@ class DeltaBlockStore:
             )
             else 1
         )
+        policy = self.get_layer_policy(layer_name)
         pos_cache_key = (
             (
                 state_step,
@@ -2745,6 +2751,7 @@ class DeltaBlockStore:
                 start_position,
                 eff_max_shift,
                 max_extra_edits,
+                policy.layer_idx == 0,
             )
             if full_block_hash and not exclude_hashes
             else None
@@ -3017,12 +3024,14 @@ class DeltaBlockStore:
             )
             else 1
         )
+        policy = self.get_layer_policy(layer_name)
         pos_cache_key = (
             (
                 state_step,
                 full_block_hash,
                 start_position,
                 max_edits,
+                policy.layer_idx == 0,
             )
             if full_block_hash and not exclude_hashes
             else None
@@ -3408,7 +3417,12 @@ class DeltaBlockStore:
         # 1. Check for an UNCOMPRESSED_BASE block with the exact same token_block_hash,
         # or (Approach 1) a 0-edit cross-block stitched match across two consecutive base blocks:
         can_shift_or_stitch = (
-            not self.force_uncompressed and not policy.is_mamba
+            not self.force_uncompressed
+            and not policy.is_mamba
+            and (
+                not self.enable_cross_turn_reuse
+                or _is_dsv41_native_quant_kv(k_cpu)
+            )
         )
         base_rec = (
             None
@@ -3423,7 +3437,7 @@ class DeltaBlockStore:
         )
         if (
             base_rec is not None
-            and not can_shift_or_stitch
+            and policy.is_mamba
             and base_rec.start_position != start_position
         ):
             base_rec = None
@@ -4244,9 +4258,22 @@ class DeltaBlockStore:
                     eta_max = eta_k
 
                 if (
-                    eta_max <= policy.tau_int4
+                    eta_max
+                    <= (
+                        policy.tau_zero_bit
+                        if (
+                            policy.layer_idx == 0
+                            and not self.enable_cross_turn_reuse
+                            and b_tok < 32
+                            and partial_stitch_offset == 0
+                        )
+                        else policy.tau_int4
+                    )
                     or is_dsv41_nvfp4
-                    or partial_stitch_offset != 0
+                    or (
+                        (not self.enable_cross_turn_reuse or is_dsv41_q)
+                        and partial_stitch_offset != 0
+                    )
                 ):
                     sparse_k = _gather_sparse_k_rows(k_cpu, idx_tensor)
                     sparse_v = v_cpu[idx_tensor].clone() if v_cpu is not None else None
@@ -4322,8 +4349,12 @@ class DeltaBlockStore:
         if (
             (self.enable_cross_turn_reuse and _is_dsv41_quant_kv(k_cpu))
             or (
-                full_block_hash not in self._dependent_blocks
+                (
+                    not self.enable_cross_turn_reuse
+                    or full_block_hash not in self._dependent_blocks
+                )
                 and base_rec is None
+                and partial_stitch_offset == 0
             )
         ):
             self._index_base_block(layer_name, base_record, max_exceptions)
@@ -4676,7 +4707,10 @@ class DeltaBlockStore:
             if policy.is_mamba:
                 self._known_mamba_blocks.add(blk_spec.full_block_hash)
 
-            can_shift_or_stitch = not policy.is_mamba
+            can_shift_or_stitch = not policy.is_mamba and (
+                not self.enable_cross_turn_reuse
+                or _is_dsv41_native_quant_kv(k_cpu)
+            )
             base_rec = self._find_exact_base_block(
                 layer_name,
                 token_hash,
@@ -4685,7 +4719,7 @@ class DeltaBlockStore:
             )
             if (
                 base_rec is not None
-                and not can_shift_or_stitch
+                and policy.is_mamba
                 and base_rec.start_position != blk_spec.start_position
             ):
                 base_rec = None
@@ -4715,16 +4749,30 @@ class DeltaBlockStore:
                         blk_spec.divergence_distance or 0,
                         prev_w_dist,
                     )
-                    if not _is_dsv41_quant_kv(k_cpu)
+                    if (
+                        not self.enable_cross_turn_reuse
+                        and not _is_dsv41_quant_kv(k_cpu)
+                    )
                     else (blk_spec.divergence_distance or 0)
                 )
-                if r_key:
+                if r_key and not self.enable_cross_turn_reuse:
                     worker_div_dist_by_root[r_key] = prev_w_dist + len(
                         token_tuple
                     )
                 if (policy.layer_idx == 0 and not policy.is_mamba) or (
                     policy.is_sliding_window
-                    and (eff_div_dist - abs(delta_pos))
+                    and (
+                        not self.enable_cross_turn_reuse
+                        or blk_spec.divergence_distance is not None
+                    )
+                    and (
+                        eff_div_dist
+                        - (
+                            0
+                            if self.enable_cross_turn_reuse
+                            else abs(delta_pos)
+                        )
+                    )
                     >= policy.sliding_window_dedup_threshold
                 ):
                     records[i] = CompressedKVBlockRecord(
@@ -5131,7 +5179,14 @@ class DeltaBlockStore:
                             )
                         )
                     )
-                    and 0 < num_outliers
+                    and (
+                        0 < num_outliers
+                        or (
+                            stitch_offset != 0
+                            and policy.layer_idx > 0
+                            and eta_max > policy.tau_int4
+                        )
+                    )
                     and (
                         num_outliers <= max_sparse_exact
                         or b_tok_exact >= 128
@@ -5154,7 +5209,7 @@ class DeltaBlockStore:
                     (eta_k <= policy.tau_int2 and eta_v <= policy.tau_int4)
                     if policy.is_mamba
                     else (
-                        delta_pos == 0
+                        (self.enable_cross_turn_reuse or delta_pos == 0)
                         and stitch_offset == 0
                         and (
                             eta_max <= policy.tau_int4
@@ -5165,7 +5220,9 @@ class DeltaBlockStore:
                 )
                 if tier1_eligible:
                     tier1_g_idxs.append(g_idx)
-                elif eta_max <= policy.tau_int4 or not policy.is_mamba:
+                elif eta_max <= policy.tau_int4 or (
+                    not self.enable_cross_turn_reuse and not policy.is_mamba
+                ):
                     tier2_g_idxs.append(g_idx)
 
             v_stack_work_dtype = (
@@ -5186,6 +5243,8 @@ class DeltaBlockStore:
                 )
                 for sub_i, g_idx in enumerate(tier3_outlier_g_idxs):
                     n_out = min(int(metrics_rows[g_idx][2]), k_lim)
+                    if n_out == 0 and exact_group[g_idx][3] != 0:
+                        n_out = min(2, k_lim)
                     o_idxs = sorted(top_o_rows[sub_i][:n_out])
                     o_indices_per_sub.append(o_idxs)
                     if o_idxs:
@@ -5202,7 +5261,9 @@ class DeltaBlockStore:
                     if (has_v and delta_v is not None)
                     else None
                 )
-                if all(
+                if (
+                    not self.enable_cross_turn_reuse or is_dsv41_q
+                ) and all(
                     exact_group[g_idx][3] != 0 for g_idx in tier3_outlier_g_idxs
                 ):
                     valid_o_subs = list(range(o_sub))
@@ -5255,13 +5316,43 @@ class DeltaBlockStore:
                         rem_max_list = rem_eta_k_o.tolist()
                     valid_o_subs = []
                     for sub_i, g_idx in enumerate(tier3_outlier_g_idxs):
-                        if (
-                            float(rem_max_list[sub_i]) <= policy.tau_int4
-                            or exact_group[g_idx][3] != 0
+                        if float(rem_max_list[sub_i]) <= policy.tau_int4 or (
+                            (not self.enable_cross_turn_reuse or is_dsv41_q)
+                            and exact_group[g_idx][3] != 0
                         ):
                             valid_o_subs.append(sub_i)
                         else:
-                            tier2_g_idxs.append(g_idx)
+                            eta_k_g = float(metrics_rows[g_idx][0])
+                            eta_v_g = float(metrics_rows[g_idx][1])
+                            eta_max_g = max(eta_k_g, eta_v_g)
+                            _, _, _, s_off_g, d_pos_g = exact_group[g_idx]
+                            t1_ok = (
+                                (
+                                    eta_k_g <= policy.tau_int2
+                                    and eta_v_g <= policy.tau_int4
+                                )
+                                if policy.is_mamba
+                                else (
+                                    (
+                                        self.enable_cross_turn_reuse
+                                        or d_pos_g == 0
+                                    )
+                                    and s_off_g == 0
+                                    and (
+                                        eta_max_g <= policy.tau_int4
+                                        if is_dsv41_nvfp4
+                                        else eta_max_g <= eff_tau_int2
+                                    )
+                                )
+                            )
+                            if t1_ok:
+                                tier1_g_idxs.append(g_idx)
+                            elif eta_max_g <= policy.tau_int4 or (
+                                not self.enable_cross_turn_reuse
+                                and not policy.is_mamba
+                                and s_off_g == 0
+                            ):
+                                tier2_g_idxs.append(g_idx)
 
                 if valid_o_subs:
                     q_dk_o_list = quantize_residual_packed_batch(
@@ -5740,8 +5831,21 @@ class DeltaBlockStore:
             valid_p_idxs = [
                 p_i
                 for p_i, row in enumerate(p_metrics)
-                if max(row[0], row[1]) <= policy.tau_int4
-                or attn_partial_group[p_i][3] != 0
+                if max(row[0], row[1])
+                <= (
+                    policy.tau_zero_bit
+                    if (
+                        policy.layer_idx == 0
+                        and not self.enable_cross_turn_reuse
+                        and b_tok < 32
+                        and attn_partial_group[p_i][3] == 0
+                    )
+                    else policy.tau_int4
+                )
+                or (
+                    (not self.enable_cross_turn_reuse or is_dsv41_q)
+                    and attn_partial_group[p_i][3] != 0
+                )
             ]
             if valid_p_idxs:
                 if policy.layer_idx > 0 and not is_dsv41_nvfp4:
@@ -5833,6 +5937,11 @@ class DeltaBlockStore:
             if policy.is_mamba
             else policy.max_sparse_exceptions
         )
+        shifted_partial_indices = {
+            item_i
+            for item_i, _, _, s_off, _, _ in attn_partial_group
+            if s_off != 0
+        }
         batch_hash_set = set(seen_in_batch.keys())
         out_records: list[CompressedKVBlockRecord] = []
         for i in range(n):
@@ -5870,8 +5979,12 @@ class DeltaBlockStore:
                 if (
                     (self.enable_cross_turn_reuse and _is_dsv41_quant_kv(k_c))
                     or (
-                        blk_spec.full_block_hash not in self._dependent_blocks
+                        (
+                            not self.enable_cross_turn_reuse
+                            or blk_spec.full_block_hash not in self._dependent_blocks
+                        )
                         and i not in exact_group_indices
+                        and i not in shifted_partial_indices
                     )
                 ):
                     self._index_base_block(layer_name, rec, max_exceptions)
