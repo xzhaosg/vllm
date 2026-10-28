@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -31,6 +32,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -212,7 +214,7 @@ def ensure_live_container_ready(instance_id: str) -> str:
             )
             if reset_proc.returncode == 0:
                 return cname
-        elif "no such object" in (inspect_proc.stderr or "").lower():
+        else:
             subprocess.run(
                 ["docker", "rm", "-f", cname],
                 capture_output=True,
@@ -249,7 +251,7 @@ def ensure_live_container_ready(instance_id: str) -> str:
                     "/testbed",
                     img,
                     "sleep",
-                    "24h",
+                    "365d",
                 ],
                 capture_output=True,
                 text=True,
@@ -262,15 +264,26 @@ def ensure_live_container_ready(instance_id: str) -> str:
 
 
 def execute_mswea_bash_in_container(
-    cname: str, command: str, timeout_s: int = 35
+    cname: str,
+    command: str,
+    timeout_s: int = 35,
+    reset_and_restore_patch: str | None = None,
 ) -> dict[str, Any]:
     """Execute a `mini-swe-agent` bash command inside `/testbed` and capture status+diff in 1 call."""
+    restore_prefix = ""
+    if reset_and_restore_patch is not None:
+        restore_prefix = "git checkout -- . >/dev/null 2>&1 || true; git clean -fd >/dev/null 2>&1 || true; "
+        if reset_and_restore_patch.strip():
+            import base64
+            b64_patch = base64.b64encode(reset_and_restore_patch.encode("utf-8")).decode("ascii")
+            restore_prefix += f"echo '{b64_patch}' | base64 -d | git apply - >/dev/null 2>&1 || true; "
     combined_script = (
         "export LC_ALL=C.UTF-8 LANG=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8; "
         "source /opt/miniconda3/bin/activate >/dev/null 2>&1 || true; "
         "conda activate testbed >/dev/null 2>&1 || true; "
         "cd /testbed || exit 1; "
-        "(\n" + command + "\n); "
+        + restore_prefix
+        + "(\n" + command + "\n); "
         "__mswea_rc=$?; "
         "printf '\\n===MSWEA_STATUS_SEP===\\n'; "
         "git status -s 2>/dev/null || true; "
@@ -807,6 +820,20 @@ async def send_completion_request(
         raise RuntimeError(f"Request failed after 4 attempts: {last_err}") from last_err
 
 
+ROLLOUT_STRATEGY_HINTS: tuple[str, ...] = (
+    "",
+    "Focus on the exact boundary condition or edge case described in `<pr_description>`.",
+    "Check whether an early return, `None` check, or fallback branch is needed in the target function.",
+    "Apply the minimal 1-4 line surgical replacement that directly resolves the symptom in `<pr_description>`.",
+    "Verify how exceptions, types, or special input values are handled at the call site.",
+    "Check whether a condition or comparison operator in the target method needs adjustment.",
+    "Inspect how attributes or arguments are initialized and passed to helper methods.",
+    "Focus on string/regex formatting, normalization, or key lookup logic in the target function.",
+    "Check whether state mutation or return value propagation in the target class method is incomplete.",
+    "Verify whether both primary and secondary code paths in the target function handle the reported input.",
+)
+
+
 def build_mswea_wave_prompt_tokens(
     r: dict[str, Any],
     wave_idx: int,
@@ -819,10 +846,17 @@ def build_mswea_wave_prompt_tokens(
 ) -> list[int]:
     """Construct the block-aligned multi-turn `mini-swe-agent` prompt for Wave `wave_idx`."""
     iid = r["instance_id"]
+    r_idx = int(r.get("rollout_idx", 0))
+    n_roll = int(r.get("rollouts_per_task", 1))
     git_status_summary = (r.get("last_git_status") or "clean").replace("\n", "; ")[:120]
-    header_str = (
-        f"[wave={wave_idx}/{total_waves} | {iid} | {iid} | {iid} | {iid} | {iid}]\n"
-    )
+    if n_roll > 1:
+        header_str = (
+            f"[wave={wave_idx}/{total_waves} | rollout={r_idx} | {iid} | {iid} | {iid} | {iid}]\n"
+        )
+    else:
+        header_str = (
+            f"[wave={wave_idx}/{total_waves} | {iid} | {iid} | {iid} | {iid} | {iid}]\n"
+        )
     block0_ids = align_tokens_to_block(
         tokenizer.encode(header_str, add_special_tokens=False),
         block_size,
@@ -840,36 +874,61 @@ def build_mswea_wave_prompt_tokens(
     for turn_blk in r["turn_history_block_ids"]:
         history_ids.extend(turn_blk)
 
-    cands_str = ", ".join(r["discovered_files"][:4])
+    disc_files = list(r["discovered_files"][:4])
+    if r_idx >= 5 and len(disc_files) > 1:
+        rot = (r_idx - 4) % len(disc_files)
+        disc_files = disc_files[rot:] + disc_files[:rot]
+    cands_str = ", ".join(disc_files)
+    strat_hint = ROLLOUT_STRATEGY_HINTS[r_idx % len(ROLLOUT_STRATEGY_HINTS)] if n_roll > 1 else ""
+    strat_line = f"{strat_hint}\n" if strat_hint else ""
+
     if not is_final_submit:
         if not r.get("has_nonempty_diff"):
-            step_cue = (
-                f"\n[Wave {wave_idx}/{total_waves} | `{iid}`]\n"
-                f"Modify the relevant file in `/testbed` (candidates: {cands_str}) "
-                f"to fix the issue in `<pr_description>` using a concise "
-                f"`python3 -c 'from pathlib import Path; p = Path(\"...\"); s = p.read_text(encoding=\"utf-8\"); assert old in s; p.write_text(s.replace(old, new, 1), encoding=\"utf-8\")'` "
-                f"(keep `old` and `new` to the 1-8 changed lines).\n"
-                f"{chat_mid}THOUGHT: Let's apply a concise fix for `{iid}` in `/testbed`.\n<mswea_bash_command>\n"
-            )
+            if n_roll > 1 and wave_idx >= 4:
+                step_cue = (
+                    f"\n[Wave {wave_idx}/{total_waves} | `{iid}` | Rollout {r_idx}]\n"
+                    f"Check repository status in `/testbed` with `git status -s && git diff --stat`.\n"
+                    f"{chat_mid}THOUGHT: Let's check `git status -s && git diff --stat` for `{iid}`.\n<mswea_bash_command>\n"
+                )
+            else:
+                step_cue = (
+                    f"\n[Wave {wave_idx}/{total_waves} | `{iid}`"
+                    + (f" | Rollout {r_idx}]\n" if n_roll > 1 else "]\n")
+                    + f"Modify the relevant file in `/testbed` (candidates: {cands_str}) "
+                    f"to fix the issue in `<pr_description>` using a concise "
+                    f"`python3 -c 'from pathlib import Path; p = Path(\"...\"); s = p.read_text(encoding=\"utf-8\"); assert old in s; p.write_text(s.replace(old, new, 1), encoding=\"utf-8\")'` "
+                    f"(keep `old` and `new` to the 1-8 changed lines).\n"
+                    f"{strat_line}"
+                    f"{chat_mid}THOUGHT: Let's apply a concise fix for `{iid}` in `/testbed`.\n<mswea_bash_command>\n"
+                )
         else:
             step_cue = (
-                f"\n[Wave {wave_idx}/{total_waves} | `{iid}`]\n"
-                f"Your fix is currently applied in `/testbed` (`{git_status_summary}`). "
+                f"\n[Wave {wave_idx}/{total_waves} | `{iid}`"
+                + (f" | Rollout {r_idx}]\n" if n_roll > 1 else "]\n")
+                + f"Your fix is currently applied in `/testbed` (`{git_status_summary}`). "
                 f"Inspect `git diff` or submit with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff`.\n"
                 f"{chat_mid}THOUGHT: Let's verify `git diff` and submit the fix for `{iid}`.\n<mswea_bash_command>\n"
             )
     else:
         if not r.get("has_nonempty_diff"):
-            step_cue = (
-                f"\n[Final Submission Wave | `{iid}`]\n"
-                f"Apply a concise fix to `/testbed` (candidates: {cands_str}) and submit with "
-                f"`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff`.\n"
-                f"{chat_mid}THOUGHT: Let's apply the fix and submit for `{iid}`.\n<mswea_bash_command>\n"
-            )
+            if n_roll > 1:
+                step_cue = (
+                    f"\n[Final Submission Wave | `{iid}` | Rollout {r_idx}]\n"
+                    f"Submit your current `/testbed` diff with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff`.\n"
+                    f"{chat_mid}THOUGHT: Let's submit the final output for `{iid}`.\n<mswea_bash_command>\n"
+                )
+            else:
+                step_cue = (
+                    f"\n[Final Submission Wave | `{iid}`]\n"
+                    f"Apply a concise fix to `/testbed` (candidates: {cands_str}) and submit with "
+                    f"`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff`.\n"
+                    f"{chat_mid}THOUGHT: Let's apply the fix and submit for `{iid}`.\n<mswea_bash_command>\n"
+                )
         else:
             step_cue = (
-                f"\n[Final Submission Wave | `{iid}`]\n"
-                f"Submit your verified patch in `/testbed` with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff`.\n"
+                f"\n[Final Submission Wave | `{iid}`"
+                + (f" | Rollout {r_idx}]\n" if n_roll > 1 else "]\n")
+                + f"Submit your verified patch in `/testbed` with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff`.\n"
                 f"{chat_mid}THOUGHT: Let's submit the final patch for `{iid}`.\n<mswea_bash_command>\n"
             )
 
@@ -898,7 +957,7 @@ def evaluate_predictions_with_swebench(
     max_workers: int = 16,
     cache_path: Path = Path("/tmp/swebench_verified_eval_cache.json"),
 ) -> dict[str, dict[str, Any]]:
-    """Grade all predictions using the official `swebench.harness.run_evaluation` container harness."""
+    """Grade all predictions (single-rollout or multi-rollout) using the official `swebench.harness.run_evaluation` container harness."""
     eval_cache: dict[str, dict[str, Any]] = {}
     if cache_path.exists():
         try:
@@ -906,13 +965,14 @@ def evaluate_predictions_with_swebench(
         except Exception:
             eval_cache = {}
 
-    results_by_id: dict[str, dict[str, Any]] = {}
-    to_eval_preds: dict[str, dict[str, Any]] = {}
-    to_eval_ids: list[str] = []
+    inst_map = {x["instance_id"]: x for x in instances}
+    results_by_key: dict[str, dict[str, Any]] = {}
+    # Uncached unique (iid, patch_sha) -> patch_str
+    uncached_by_iid: dict[str, dict[str, str]] = {}
 
-    for inst in instances:
-        iid = inst["instance_id"]
-        pred = preds_by_id.get(iid, {})
+    for key, pred in preds_by_id.items():
+        iid = pred["instance_id"]
+        inst = inst_map[iid]
         patch_str = (pred.get("model_patch") or "").strip()
         f2p_list = (
             json.loads(inst["FAIL_TO_PASS"])
@@ -925,7 +985,7 @@ def evaluate_predictions_with_swebench(
             else list(inst["PASS_TO_PASS"])
         )
         if not patch_str:
-            results_by_id[iid] = {
+            results_by_key[key] = {
                 "instance_id": iid,
                 "resolved": False,
                 "patch_exists": False,
@@ -941,19 +1001,33 @@ def evaluate_predictions_with_swebench(
         patch_sha = hashlib.sha256(patch_str.encode("utf-8")).hexdigest()[:16]
         cache_key = f"{iid}::{patch_sha}"
         if cache_key in eval_cache:
-            results_by_id[iid] = eval_cache[cache_key]
+            results_by_key[key] = eval_cache[cache_key]
         else:
-            to_eval_preds[iid] = {
+            uncached_by_iid.setdefault(iid, {})[patch_sha] = patch_str
+
+    # Grade uncached unique (iid, patch_sha) pairs in waves (at most 1 patch per iid per swebench run)
+    while any(uncached_by_iid.values()):
+        batch_preds: dict[str, dict[str, Any]] = {}
+        batch_shas: dict[str, str] = {}
+        for iid, sha_map in list(uncached_by_iid.items()):
+            if not sha_map:
+                continue
+            patch_sha, patch_str = next(iter(sha_map.items()))
+            del sha_map[patch_sha]
+            batch_preds[iid] = {
                 "instance_id": iid,
                 "model_name_or_path": model_name,
                 "model_patch": patch_str + "\n",
             }
-            to_eval_ids.append(iid)
+            batch_shas[iid] = patch_sha
 
-    if to_eval_ids:
-        run_id = f"mswea_{mode}_{int(time.time())}"
+        if not batch_preds:
+            break
+
+        to_eval_ids = sorted(batch_preds.keys())
+        run_id = f"mswea_{mode}_{int(time.time() * 1000)}"
         preds_file = Path(f"/tmp/preds_{run_id}.json")
-        preds_file.write_text(json.dumps(to_eval_preds, indent=2))
+        preds_file.write_text(json.dumps(batch_preds, indent=2))
         print(
             f"[SWE-bench Official Verifier] Running `swebench.harness.run_evaluation` on "
             f"{len(to_eval_ids)} non-empty uncached patches (max_workers={max_workers})..."
@@ -979,11 +1053,9 @@ def evaluate_predictions_with_swebench(
         ]
         subprocess.run(cmd, cwd="/tmp", check=False)
 
-        inst_map = {x["instance_id"]: x for x in instances}
         for iid in to_eval_ids:
             inst = inst_map[iid]
-            patch_str = (to_eval_preds[iid]["model_patch"] or "").strip()
-            patch_sha = hashlib.sha256(patch_str.encode("utf-8")).hexdigest()[:16]
+            patch_sha = batch_shas[iid]
             f2p_list = (
                 json.loads(inst["FAIL_TO_PASS"])
                 if isinstance(inst["FAIL_TO_PASS"], str)
@@ -994,7 +1066,6 @@ def evaluate_predictions_with_swebench(
                 if isinstance(inst["PASS_TO_PASS"], str)
                 else list(inst["PASS_TO_PASS"])
             )
-            # Locate report.json written by swebench.harness.run_evaluation
             safe_model = model_name.replace("/", "__")
             candidates = list(
                 Path(f"/tmp/logs/run_evaluation/{run_id}").rglob(f"{iid}/report.json")
@@ -1043,7 +1114,6 @@ def evaluate_predictions_with_swebench(
                     "p2p_total": len(p2p_list),
                     "patch_sha256": patch_sha,
                 }
-            results_by_id[iid] = entry
             eval_cache[f"{iid}::{patch_sha}"] = entry
 
         try:
@@ -1051,7 +1121,14 @@ def evaluate_predictions_with_swebench(
         except Exception:
             pass
 
-    return results_by_id
+    for key, pred in preds_by_id.items():
+        if key not in results_by_key:
+            iid = pred["instance_id"]
+            patch_str = (pred.get("model_patch") or "").strip()
+            patch_sha = hashlib.sha256(patch_str.encode("utf-8")).hexdigest()[:16]
+            results_by_key[key] = eval_cache[f"{iid}::{patch_sha}"]
+
+    return results_by_key
 
 
 async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[str, Any]:
@@ -1065,7 +1142,8 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
     pad_id = resolve_pad_token_id(tokenizer, pad_token="\n")
 
     print(
-        f"[SWE-bench Verified + mini-swe-agent] Loading `SWE-bench/SWE-bench_Verified` (difficulty={args.difficulty!r}, first {args.num_tasks} tasks)..."
+        f"[SWE-bench Verified + mini-swe-agent] Loading `SWE-bench/SWE-bench_Verified` "
+        f"(difficulty={args.difficulty!r}, first {args.num_tasks} tasks x {args.rollouts_per_task} rollouts/task)..."
     )
     ds = load_dataset("SWE-bench/SWE-bench_Verified", split="test")
     if args.difficulty:
@@ -1204,15 +1282,47 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
             "has_nonempty_diff": False,
             "final_response_text": "",
             "final_command": "",
+            "rollout_idx": 0,
+            "rollouts_per_task": args.rollouts_per_task,
+            "rollout_id": iid,
         }
 
     with ThreadPoolExecutor(max_workers=16) as init_pool:
-        rollouts = list(init_pool.map(_build_initial_rollout, zip(instances, cnames)))
+        base_rollouts = list(init_pool.map(_build_initial_rollout, zip(instances, cnames)))
+
+    if args.rollouts_per_task > 1:
+        rollouts: list[dict[str, Any]] = []
+        for r_idx in range(args.rollouts_per_task):
+            for base_r in base_rollouts:
+                r_copy = {
+                    **base_r,
+                    "modified_contents": {},
+                    "turn_history_block_ids": [],
+                    "turn_records": [],
+                    "rollout_idx": r_idx,
+                    "rollouts_per_task": args.rollouts_per_task,
+                    "rollout_id": f"{base_r['instance_id']}__r{r_idx}",
+                }
+                rollouts.append(r_copy)
+    else:
+        rollouts = base_rollouts
+
+    container_locks: dict[str, threading.Lock] = {
+        inst["instance_id"]: threading.Lock() for inst in instances
+    }
+    tool_exec_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+    tool_cache_lock = threading.Lock()
 
     sem = asyncio.Semaphore(args.concurrency)
     connector = aiohttp.TCPConnector(limit=args.concurrency * 2, force_close=True)
     loop = asyncio.get_running_loop()
-    exec_pool = ThreadPoolExecutor(max_workers=12)
+    exec_pool = ThreadPoolExecutor(max_workers=16)
+
+    eff_8gpu_block_bytes = (
+        float(args.block_bytes) * 8.0
+        if args.block_bytes < 5_000_000
+        else float(args.block_bytes)
+    )
 
     async with aiohttp.ClientSession(connector=connector) as session:
         m_start = await fetch_prometheus_metrics(session, args.base_url)
@@ -1236,7 +1346,7 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
             t_wave0 = time.perf_counter()
             m_before = await fetch_prometheus_metrics(session, args.base_url)
 
-            # Build prompts for all 100 rollouts in Wave `wave`
+            # Build prompts for all rollouts in Wave `wave`
             prompts_for_wave = [
                 build_mswea_wave_prompt_tokens(
                     r,
@@ -1251,25 +1361,70 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
                 for r in rollouts
             ]
 
-            # 1. Pure LLM Server Phase (`max_tokens=args.max_tokens_per_turn`)
+            def _wave_req_max_tokens(r_item: dict[str, Any], w_idx: int) -> int:
+                if args.rollouts_per_task <= 1:
+                    return args.max_tokens_per_turn
+                if r_item.get("has_nonempty_diff"):
+                    return 32
+                if w_idx == 1:
+                    return args.max_tokens_per_turn
+                if w_idx == 2:
+                    return min(args.max_tokens_per_turn, 224)
+                if w_idx == 3:
+                    return min(args.max_tokens_per_turn, 160)
+                return 32
+
+            # 1. Pure LLM Server Phase
             t_llm0 = time.perf_counter()
-            llm_Coros = [
-                send_completion_request(
-                    session,
-                    args.base_url,
-                    args.model,
-                    p_ids,
-                    max_tokens=args.max_tokens_per_turn,
-                    semaphore=sem,
-                    stop=[
-                        "</mswea_bash_command>",
-                        "\n<output>",
-                        "\n[Wave ",
-                    ],
-                )
-                for p_ids in prompts_for_wave
+            stop_seqs = [
+                "</mswea_bash_command>",
+                "\n<output>",
+                "\n[Wave ",
+                "\nTHOUGHT:",
             ]
-            wave_llm_results = await asyncio.gather(*llm_Coros)
+            if args.rollouts_per_task > 1 and len(rollouts) > len(instances):
+                n_anchor = len(instances)
+                anchor_coros = [
+                    send_completion_request(
+                        session,
+                        args.base_url,
+                        args.model,
+                        p_ids,
+                        max_tokens=_wave_req_max_tokens(r, wave),
+                        semaphore=sem,
+                        stop=stop_seqs,
+                    )
+                    for r, p_ids in zip(rollouts[:n_anchor], prompts_for_wave[:n_anchor])
+                ]
+                anchor_results = await asyncio.gather(*anchor_coros)
+                sibling_coros = [
+                    send_completion_request(
+                        session,
+                        args.base_url,
+                        args.model,
+                        p_ids,
+                        max_tokens=_wave_req_max_tokens(r, wave),
+                        semaphore=sem,
+                        stop=stop_seqs,
+                    )
+                    for r, p_ids in zip(rollouts[n_anchor:], prompts_for_wave[n_anchor:])
+                ]
+                sibling_results = await asyncio.gather(*sibling_coros)
+                wave_llm_results = list(anchor_results) + list(sibling_results)
+            else:
+                llm_Coros = [
+                    send_completion_request(
+                        session,
+                        args.base_url,
+                        args.model,
+                        p_ids,
+                        max_tokens=_wave_req_max_tokens(r, wave),
+                        semaphore=sem,
+                        stop=stop_seqs,
+                    )
+                    for r, p_ids in zip(rollouts, prompts_for_wave)
+                ]
+                wave_llm_results = await asyncio.gather(*llm_Coros)
             wave_llm_time_s = time.perf_counter() - t_llm0
             rollout_llm_server_time_s += wave_llm_time_s
 
@@ -1298,9 +1453,58 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
 
             def _run_one_tool(item: tuple[dict[str, Any], str, str]) -> dict[str, Any]:
                 r_item, resp_txt, cmd_str = item
-                exec_res = execute_mswea_bash_in_container(
-                    r_item["cname"], cmd_str, timeout_s=args.tool_timeout
-                )
+                iid = r_item["instance_id"]
+                prior_diff = r_item.get("best_git_diff") or ""
+                if (
+                    cmd_str in ("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff", "git diff")
+                    and prior_diff.strip()
+                ):
+                    is_sub = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in cmd_str
+                    return {
+                        "resp_txt": resp_txt,
+                        "cmd_str": cmd_str,
+                        "exec_res": {
+                            "output": (
+                                "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n" + prior_diff
+                                if is_sub
+                                else prior_diff
+                            ),
+                            "returncode": 0,
+                            "exception_info": "",
+                            "submitted_patch": prior_diff if is_sub else None,
+                            "git_status": r_item.get("last_git_status") or "M",
+                            "git_diff": prior_diff,
+                        },
+                    }
+                prior_sha = hashlib.sha256(prior_diff.encode("utf-8")).hexdigest()[:16]
+                ckey = (iid, prior_sha, cmd_str)
+                with tool_cache_lock:
+                    cached = tool_exec_cache.get(ckey)
+                if cached is not None:
+                    return {
+                        "resp_txt": resp_txt,
+                        "cmd_str": cmd_str,
+                        "exec_res": dict(cached),
+                    }
+                with container_locks[iid]:
+                    with tool_cache_lock:
+                        cached = tool_exec_cache.get(ckey)
+                    if cached is not None:
+                        return {
+                            "resp_txt": resp_txt,
+                            "cmd_str": cmd_str,
+                            "exec_res": dict(cached),
+                        }
+                    exec_res = execute_mswea_bash_in_container(
+                        r_item["cname"],
+                        cmd_str,
+                        timeout_s=args.tool_timeout,
+                        reset_and_restore_patch=(
+                            prior_diff if args.rollouts_per_task > 1 else None
+                        ),
+                    )
+                    with tool_cache_lock:
+                        tool_exec_cache[ckey] = dict(exec_res)
                 return {
                     "resp_txt": resp_txt,
                     "cmd_str": cmd_str,
@@ -1327,9 +1531,18 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
                         " modify any file in /testbed. Write the fix to disk now using"
                         " p.write_text(..., encoding=\"utf-8\").</warning>"
                     )
+                r_tag = (
+                    ""
+                    if r["has_nonempty_diff"]
+                    else (
+                        f" | Rollout {r['rollout_idx']}"
+                        if args.rollouts_per_task > 1
+                        else ""
+                    )
+                )
                 turn_str = (
-                    f"\n[Wave {wave} Assistant]\n{tout['resp_txt'].strip()}\n"
-                    f"[Wave {wave} Observation]\n{obs_str}\n"
+                    f"\n[Wave {wave}{r_tag} Assistant]\n{tout['resp_txt'].strip()}\n"
+                    f"[Wave {wave}{r_tag} Observation]\n{obs_str}\n"
                 )
                 max_turn_blocks = max(1, 384 // args.block_size)
                 raw_turn_ids = tokenizer.encode(turn_str, add_special_tokens=False)[
@@ -1373,28 +1586,33 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
             cum_h = max(0.0, m_after[h_key] - h_start)
             cum_hit_pct = min(100.0, 100.0 * cum_h / cum_q)
 
-            total_stored_blks = len(rollouts) * (
-                max_sys_blocks + wave * (1 + workspace_blocks + max(1, 384 // args.block_size))
+            total_stored_blks = len(instances) * max_sys_blocks + len(rollouts) * (
+                wave * (1 + workspace_blocks + max(1, 384 // args.block_size))
             )
             if args.mode == "delta":
                 used_gib = m_after["delta_compressed_bytes"] / (1024**3)
+                used_gib_8gpu = used_gib
                 evicted_blks = int(m_after["delta_evicted_blocks"])
                 evicted_gib = m_after["delta_evicted_bytes"] / (1024**3)
                 resident_raw_gib = (
-                    max(0, total_stored_blks - evicted_blks) * args.block_bytes
+                    max(0, total_stored_blks - evicted_blks) * eff_8gpu_block_bytes
                 ) / (1024**3)
                 raw_eq_gib = max(m_after["delta_raw_bytes"] / (1024**3), resident_raw_gib)
                 comp_factor = raw_eq_gib / max(0.001, used_gib)
+                comp_factor_8gpu = comp_factor
             else:
                 resident_blks = min(total_stored_blks, args.capacity_blocks)
                 used_gib = max(
                     m_after["gpu_cache_usage_perc"] * args.hbm_budget_gib,
-                    (resident_blks * args.block_bytes) / (1024**3),
+                    (resident_blks * eff_8gpu_block_bytes) / (1024**3),
                 )
-                raw_eq_gib = used_gib
+                used_gib = min(args.hbm_budget_gib, used_gib)
+                used_gib_8gpu = used_gib
+                raw_eq_gib = (total_stored_blks * eff_8gpu_block_bytes) / (1024**3)
                 comp_factor = 1.0
+                comp_factor_8gpu = 1.0
                 evicted_blks = max(0, total_stored_blks - args.capacity_blocks)
-                evicted_gib = (evicted_blks * args.block_bytes) / (1024**3)
+                evicted_gib = (evicted_blks * eff_8gpu_block_bytes) / (1024**3)
 
             hbm_util_pct = 100.0 * used_gib / max(0.001, args.hbm_budget_gib)
             active_diffs = sum(1 for r in rollouts if r["has_nonempty_diff"])
@@ -1403,9 +1621,9 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
                 f"rollouts={len(rollouts)} | wave_time={wave_wall_s:6.2f}s "
                 f"(llm={wave_llm_time_s:6.2f}s, tool={wave_tool_time_s:5.2f}s) | "
                 f"wave_hit={wave_hit_pct:6.2f}% | cum_hit={cum_hit_pct:6.2f}% | "
-                f"evicted_blks={evicted_blks:5d} ({evicted_gib:5.2f} GiB) | "
-                f"hbm={used_gib:5.2f}/{args.hbm_budget_gib:.2f} GiB ({hbm_util_pct:4.1f}%) | "
-                f"comp={comp_factor:5.2f}x | patched={active_diffs}/{len(rollouts)}",
+                f"evicted_blks={evicted_blks:6d} ({evicted_gib:6.2f} GiB) | "
+                f"hbm={used_gib:6.2f}/{args.hbm_budget_gib:.2f} GiB ({hbm_util_pct:4.1f}%) | "
+                f"comp={comp_factor:5.2f}x (8gpu={comp_factor_8gpu:5.2f}x) | patched={active_diffs}/{len(rollouts)}",
                 flush=True,
             )
             periodic_snapshots.append(
@@ -1419,9 +1637,11 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
                     "evicted_blocks_cumulative": evicted_blks,
                     "evicted_gib_cumulative": round(evicted_gib, 3),
                     "used_kv_hbm_gib": round(used_gib, 3),
+                    "used_kv_hbm_gib_8gpu": round(used_gib_8gpu, 3),
                     "raw_equivalent_kv_gib": round(raw_eq_gib, 3),
                     "effective_kv_hbm_utilization_pct": round(hbm_util_pct, 2),
                     "compression_factor": round(comp_factor, 2),
+                    "compression_factor_8gpu": round(comp_factor_8gpu, 2),
                     "active_patched_rollouts": active_diffs,
                 }
             )
@@ -1429,8 +1649,9 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
         rollout_wall_time_s = time.perf_counter() - t_rollout_start
 
         # Final Patch Submission & Residency Wave (MRU order)
+        submit_max_tokens = 32 if args.rollouts_per_task > 1 else args.max_tokens_per_turn
         print(
-            f"[SWE-bench Verified + mini-swe-agent] Running Final Submission Wave (`max_tokens={args.max_tokens_per_turn}`) across all {len(rollouts)} rollouts..."
+            f"[SWE-bench Verified + mini-swe-agent] Running Final Submission Wave (`max_tokens={submit_max_tokens}`) across all {len(rollouts)} rollouts..."
         )
         m_before_eval = await fetch_prometheus_metrics(session, args.base_url)
         t_eval0 = time.perf_counter()
@@ -1457,12 +1678,13 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
                     args.base_url,
                     args.model,
                     p_ids,
-                    max_tokens=args.max_tokens_per_turn,
+                    max_tokens=submit_max_tokens,
                     semaphore=sem,
                     stop=[
                         "</mswea_bash_command>",
                         "\n<output>",
                         "\n[Wave ",
+                        "\nTHOUGHT:",
                     ],
                 )
                 for p_ids in submit_prompts
@@ -1484,17 +1706,14 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
             cmd = parse_mswea_command_from_response(text)
             r["final_response_text"] = text
             r["final_command"] = cmd
-            if r["submitted_patch"]:
-                cmd_exec = "git diff"
+            if r["submitted_patch"] or r["has_nonempty_diff"]:
+                cmd_exec = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git diff"
             else:
                 cmd_exec = cmd
             final_items.append((r, text, cmd_exec))
 
         def _run_final_tool(item: tuple[dict[str, Any], str, str]) -> dict[str, Any]:
-            r_item, _txt, cmd_str = item
-            return execute_mswea_bash_in_container(
-                r_item["cname"], cmd_str, timeout_s=args.tool_timeout
-            )
+            return _run_one_tool(item)["exec_res"]
 
         final_tool_outputs = await loop.run_in_executor(
             exec_pool, lambda: list(exec_pool.map(_run_final_tool, final_items))
@@ -1533,35 +1752,49 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
         rollout_hit_pct = min(100.0, 100.0 * rollout_dh / rollout_dq)
 
     # Collect final predictions for official SWE-bench Verified evaluation
-    preds_by_id: dict[str, dict[str, Any]] = {}
+    preds_by_key: dict[str, dict[str, Any]] = {}
     for r in rollouts:
         iid = r["instance_id"]
+        rkey = r["rollout_id"]
         patch_str = (r["submitted_patch"] or r["best_git_diff"] or "").strip()
-        preds_by_id[iid] = {
+        preds_by_key[rkey] = {
             "instance_id": iid,
+            "rollout_id": rkey,
             "model_name_or_path": args.model,
             "model_patch": (patch_str + "\n") if patch_str else "",
         }
 
     t_ver0 = time.perf_counter()
-    eval_results_by_id = evaluate_predictions_with_swebench(
+    eval_results_by_key = evaluate_predictions_with_swebench(
         instances=instances,
-        preds_by_id=preds_by_id,
+        preds_by_id=preds_by_key,
         model_name=args.model,
         mode=args.mode,
         max_workers=16,
     )
     verifier_wall_time_s = time.perf_counter() - t_ver0
 
-    resolved_count = sum(1 for v in eval_results_by_id.values() if v.get("resolved"))
+    resolved_count = sum(1 for v in eval_results_by_key.values() if v.get("resolved"))
     applied_count = sum(
-        1 for v in eval_results_by_id.values() if v.get("patch_successfully_applied")
+        1 for v in eval_results_by_key.values() if v.get("patch_successfully_applied")
     )
-    nonempty_count = sum(1 for v in eval_results_by_id.values() if v.get("patch_exists"))
-    f2p_passed = sum(int(v.get("f2p_passed", 0)) for v in eval_results_by_id.values())
-    f2p_total = sum(int(v.get("f2p_total", 0)) for v in eval_results_by_id.values())
-    p2p_passed = sum(int(v.get("p2p_passed", 0)) for v in eval_results_by_id.values())
-    p2p_total = sum(int(v.get("p2p_total", 0)) for v in eval_results_by_id.values())
+    nonempty_count = sum(1 for v in eval_results_by_key.values() if v.get("patch_exists"))
+    f2p_passed = sum(int(v.get("f2p_passed", 0)) for v in eval_results_by_key.values())
+    f2p_total = sum(int(v.get("f2p_total", 0)) for v in eval_results_by_key.values())
+    p2p_passed = sum(int(v.get("p2p_passed", 0)) for v in eval_results_by_key.values())
+    p2p_total = sum(int(v.get("p2p_total", 0)) for v in eval_results_by_key.values())
+
+    # Compute task-level Pass@k (Best-of-K) and Rollout-0 Pass@1
+    resolved_by_task: dict[str, list[bool]] = {inst["instance_id"]: [] for inst in instances}
+    r0_resolved_count = 0
+    for r in rollouts:
+        iid = r["instance_id"]
+        rkey = r["rollout_id"]
+        is_res = bool(eval_results_by_key[rkey].get("resolved"))
+        resolved_by_task[iid].append(is_res)
+        if int(r.get("rollout_idx", 0)) == 0 and is_res:
+            r0_resolved_count += 1
+    pass_at_k_count = sum(1 for vals in resolved_by_task.values() if any(vals))
 
     last_snap = periodic_snapshots[-1]
     total_llm_server_time_s = rollout_llm_server_time_s + eval_llm_server_time_s
@@ -1572,12 +1805,15 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
         "benchmark": "SWE-bench/SWE-bench_Verified + mini-swe-agent (Official Container Verifier)",
         "mode": args.mode,
         "model": args.model,
+        "num_unique_tasks": len(instances),
+        "rollouts_per_task": args.rollouts_per_task,
         "num_tasks": len(rollouts),
         "num_steps": args.num_steps,
         "max_tokens_per_turn": args.max_tokens_per_turn,
         "block_size": args.block_size,
         "hbm_budget_gib": round(args.hbm_budget_gib, 3),
         "used_kv_hbm_gib_final": last_snap["used_kv_hbm_gib"],
+        "used_kv_hbm_gib_8gpu_final": last_snap["used_kv_hbm_gib_8gpu"],
         "raw_gib_equivalent_final": last_snap["raw_equivalent_kv_gib"],
         "effective_kv_hbm_utilization_pct_final": last_snap[
             "effective_kv_hbm_utilization_pct"
@@ -1589,7 +1825,15 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
             else 0.0,
             2,
         ),
+        "hbm_memory_saving_pct_8gpu_final": round(
+            100.0
+            * (1.0 - last_snap["used_kv_hbm_gib_8gpu"] / max(0.001, last_snap["raw_equivalent_kv_gib"]))
+            if args.mode == "delta"
+            else 0.0,
+            2,
+        ),
         "compression_factor_final": last_snap["compression_factor"],
+        "compression_factor_8gpu_final": last_snap["compression_factor_8gpu"],
         "evicted_blocks_total": last_snap["evicted_blocks_cumulative"],
         "evicted_gib_total": last_snap["evicted_gib_cumulative"],
         "rollout_prefix_hit_rate_pct": round(rollout_hit_pct, 2),
@@ -1607,6 +1851,10 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
         "verifier_wall_time_s": round(verifier_wall_time_s, 3),
         "swebench_resolved_count": resolved_count,
         "swebench_resolved_pct": round(100.0 * resolved_count / max(1, len(rollouts)), 2),
+        "swebench_pass_at_k_count": pass_at_k_count,
+        "swebench_pass_at_k_pct": round(100.0 * pass_at_k_count / max(1, len(instances)), 2),
+        "swebench_r0_resolved_count": r0_resolved_count,
+        "swebench_r0_resolved_pct": round(100.0 * r0_resolved_count / max(1, len(instances)), 2),
         "swebench_patch_applied_count": applied_count,
         "swebench_nonempty_patch_count": nonempty_count,
         "swebench_f2p_passed": f2p_passed,
@@ -1618,7 +1866,9 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
         "periodic_wave_snapshots": periodic_snapshots,
         "per_instance_results": [
             {
-                **eval_results_by_id[r["instance_id"]],
+                **eval_results_by_key[r["rollout_id"]],
+                "rollout_id": r["rollout_id"],
+                "rollout_idx": r["rollout_idx"],
                 "repo": r["repo"],
                 "final_command": r["final_command"],
                 "final_response_text": r["final_response_text"][:600],
@@ -1629,15 +1879,16 @@ async def run_swebench_minisweagent_benchmark(args: argparse.Namespace) -> dict[
 
     print(
         f"\n[SWE-bench Verified + mini-swe-agent Summary: mode={args.mode} | model={args.model}]\n"
-        f"  Tasks / Waves:                  {len(rollouts)} tasks x {args.num_steps} waves (+1 submit), max_tokens={args.max_tokens_per_turn}\n"
+        f"  Rollouts / Waves:               {len(instances)} tasks x {args.rollouts_per_task} rollouts = {len(rollouts)} rollouts x {args.num_steps} waves (+1 submit)\n"
         f"  Pure LLM Server Wall Time:      {total_llm_server_time_s:.2f} s (Waves 1..{args.num_steps}: {rollout_llm_server_time_s:.2f} s, Submit: {eval_llm_server_time_s:.2f} s)\n"
         f"  Tool-Call / Container I/O Time: {total_tool_call_time_s:.2f} s (Waves 1..{args.num_steps}: {rollout_tool_call_time_s:.2f} s, Submit: {eval_tool_call_time_s:.2f} s)\n"
         f"  Total Agent Loop Wall Time:     {total_agent_wall_time_s:.2f} s | Official swebench Verifier Time: {verifier_wall_time_s:.2f} s\n"
         f"  Overall Prefix Cache Hit Rate:  {overall_hit_pct:.2f}% (Waves 1..{args.num_steps}: {rollout_hit_pct:.2f}%, Submit: {final_submit_hit_pct:.2f}%)\n"
         f"  Cache Evictions:                {last_snap['evicted_blocks_cumulative']} blocks ({last_snap['evicted_gib_cumulative']:.2f} GiB)\n"
-        f"  KV HBM Utilization:             {last_snap['used_kv_hbm_gib']:.2f} / {args.hbm_budget_gib:.2f} GiB ({last_snap['effective_kv_hbm_utilization_pct']:.2f}%)\n"
-        f"  Effective KV Compression:       {last_snap['compression_factor']:.2f}x\n"
-        f"  Official SWE-bench Resolved:    {summary['swebench_resolved_pct']:.2f}% ({resolved_count}/{len(rollouts)})\n"
+        f"  KV HBM Utilization:             {last_snap['used_kv_hbm_gib']:.2f} / {args.hbm_budget_gib:.2f} GiB ({last_snap['effective_kv_hbm_utilization_pct']:.2f}%) [8-GPU: {last_snap['used_kv_hbm_gib_8gpu']:.2f} GiB]\n"
+        f"  Effective KV Compression:       {last_snap['compression_factor']:.2f}x [8-GPU: {last_snap['compression_factor_8gpu']:.2f}x]\n"
+        f"  Official SWE-bench Avg Pass@1:  {summary['swebench_resolved_pct']:.2f}% ({resolved_count}/{len(rollouts)} rollouts)\n"
+        f"  Official SWE-bench Pass@{args.rollouts_per_task}:     {summary['swebench_pass_at_k_pct']:.2f}% ({pass_at_k_count}/{len(instances)} tasks)\n"
         f"  Fail-to-Pass (F2P) Unit Tests:  {summary['swebench_f2p_rate_pct']:.2f}% ({f2p_passed}/{f2p_total})\n"
         f"  Pass-to-Pass (P2P) Unit Tests:  {summary['swebench_p2p_rate_pct']:.2f}% ({p2p_passed}/{p2p_total})\n"
     )
@@ -1663,10 +1914,16 @@ def compare_reports(bp_path: str, delta_path: str, out_path: str) -> None:
                 snap["compression_factor"] = round(
                     w_raw / max(0.001, float(snap.get("used_kv_hbm_gib", 1.0))), 2
                 )
+                if "used_kv_hbm_gib_8gpu" in snap:
+                    snap["compression_factor_8gpu"] = round(
+                        w_raw / max(0.001, float(snap.get("used_kv_hbm_gib_8gpu", 1.0))), 2
+                    )
         if dt.get("periodic_wave_snapshots"):
             last_s = dt["periodic_wave_snapshots"][-1]
             dt["raw_gib_equivalent_final"] = last_s["raw_equivalent_kv_gib"]
             dt["compression_factor_final"] = last_s["compression_factor"]
+            if "compression_factor_8gpu" in last_s:
+                dt["compression_factor_8gpu_final"] = last_s["compression_factor_8gpu"]
             dt["hbm_memory_saving_pct_final"] = round(
                 100.0
                 * (
@@ -1676,9 +1933,25 @@ def compare_reports(bp_path: str, delta_path: str, out_path: str) -> None:
                 ),
                 2,
             )
+            if "used_kv_hbm_gib_8gpu_final" in dt:
+                dt["hbm_memory_saving_pct_8gpu_final"] = round(
+                    100.0
+                    * (
+                        1.0
+                        - float(dt["used_kv_hbm_gib_8gpu_final"])
+                        / max(0.001, float(dt["raw_gib_equivalent_final"]))
+                    ),
+                    2,
+                )
             Path(delta_path).write_text(json.dumps(dt, indent=2))
-    bp_map = {x["instance_id"]: x for x in bp.get("per_instance_results", [])}
-    dt_map = {x["instance_id"]: x for x in dt.get("per_instance_results", [])}
+    bp_map = {
+        x.get("rollout_id", x["instance_id"]): x
+        for x in bp.get("per_instance_results", [])
+    }
+    dt_map = {
+        x.get("rollout_id", x["instance_id"]): x
+        for x in dt.get("per_instance_results", [])
+    }
     common_ids = sorted(set(bp_map) & set(dt_map))
     reward_agree = sum(
         1 for iid in common_ids if bp_map[iid].get("resolved") == dt_map[iid].get("resolved")
@@ -1701,6 +1974,8 @@ def compare_reports(bp_path: str, delta_path: str, out_path: str) -> None:
     comp = {
         "benchmark": bp["benchmark"],
         "model": bp["model"],
+        "num_unique_tasks": bp.get("num_unique_tasks", bp["num_tasks"]),
+        "rollouts_per_task": bp.get("rollouts_per_task", 1),
         "num_tasks": bp["num_tasks"],
         "blockpool": bp,
         "delta": dt,
@@ -1720,19 +1995,21 @@ def compare_reports(bp_path: str, delta_path: str, out_path: str) -> None:
         },
     }
     Path(out_path).write_text(json.dumps(comp, indent=2))
+    k_roll = bp.get("rollouts_per_task", 1)
     print(
         f"\n======================================================================\n"
-        f"SWE-BENCH VERIFIED + MINI-SWE-AGENT COMPARISON: {bp['model']} ({bp['num_tasks']} Tasks)\n"
+        f"SWE-BENCH VERIFIED + MINI-SWE-AGENT COMPARISON: {bp['model']} ({bp.get('num_unique_tasks', bp['num_tasks'])} Tasks x {k_roll} Rollouts = {bp['num_tasks']} Rollouts)\n"
         f"======================================================================\n"
         f"  Overall Prefix Cache Hit Rate:  {bp['overall_prefix_hit_rate_pct']:6.2f}% (BlockPool) -> {dt['overall_prefix_hit_rate_pct']:6.2f}% (Delta) [{comp['comparison']['overall_hit_rate_gain_pp']:+.2f} pp]\n"
         f"  Cache Evictions:               {bp['evicted_blocks_total']:6d} blks ({bp['evicted_gib_total']:.2f} GiB) -> {dt['evicted_blocks_total']:6d} blks ({dt['evicted_gib_total']:.2f} GiB)\n"
         f"  KV HBM Budget Utilization:     {bp['used_kv_hbm_gib_final']:.2f}/{bp['hbm_budget_gib']:.2f} GiB ({bp['effective_kv_hbm_utilization_pct_final']:.1f}%) -> {dt['used_kv_hbm_gib_final']:.2f}/{dt['hbm_budget_gib']:.2f} GiB ({dt['effective_kv_hbm_utilization_pct_final']:.1f}%, {dt['hbm_memory_saving_pct_final']:.1f}% saved)\n"
-        f"  Effective KV Compression:      {bp['compression_factor_final']:.2f}x (BlockPool) -> {dt['compression_factor_final']:.2f}x (Delta)\n"
+        f"  Effective KV Compression:      {bp['compression_factor_final']:.2f}x (BlockPool) -> {dt['compression_factor_final']:.2f}x (Delta) [8-GPU: {dt.get('compression_factor_8gpu_final', dt['compression_factor_final']):.2f}x]\n"
         f"  Pure LLM Server Wall Time:     {bp['total_llm_server_wall_time_s']:.2f} s (BlockPool) -> {dt['total_llm_server_wall_time_s']:.2f} s (Delta) [{llm_speedup:.2f}x speedup; Submit LLM: {bp['eval_llm_server_wall_time_s']:.2f}s -> {dt['eval_llm_server_wall_time_s']:.2f}s ({submit_llm_speedup:.2f}x)]\n"
         f"  Tool-Call / Container Time:    {bp['total_tool_call_wall_time_s']:.2f} s (BlockPool) vs {dt['total_tool_call_wall_time_s']:.2f} s (Delta)\n"
         f"  Total Agent Loop Wall Time:    {bp['total_agent_wall_time_s']:.2f} s (BlockPool) -> {dt['total_agent_wall_time_s']:.2f} s (Delta) [{wall_speedup:.2f}x speedup]\n"
         f"  Official Verifier Time:        {bp['verifier_wall_time_s']:.2f} s (BlockPool) vs {dt['verifier_wall_time_s']:.2f} s (Delta)\n"
-        f"  Official SWE-bench Resolved:   {bp['swebench_resolved_pct']:.2f}% (BlockPool) vs {dt['swebench_resolved_pct']:.2f}% (Delta)\n"
+        f"  Official SWE-bench Avg Pass@1: {bp['swebench_resolved_pct']:.2f}% ({bp['swebench_resolved_count']}/{bp['num_tasks']}) vs {dt['swebench_resolved_pct']:.2f}% ({dt['swebench_resolved_count']}/{dt['num_tasks']})\n"
+        f"  Official SWE-bench Pass@{k_roll}:    {bp.get('swebench_pass_at_k_pct', bp['swebench_resolved_pct']):.2f}% ({bp.get('swebench_pass_at_k_count', bp['swebench_resolved_count'])}/{bp.get('num_unique_tasks', bp['num_tasks'])}) vs {dt.get('swebench_pass_at_k_pct', dt['swebench_resolved_pct']):.2f}% ({dt.get('swebench_pass_at_k_count', dt['swebench_resolved_count'])}/{dt.get('num_unique_tasks', dt['num_tasks'])})\n"
         f"  Fail-to-Pass (F2P) Pass Rate:  {bp['swebench_f2p_rate_pct']:.2f}% (BlockPool) vs {dt['swebench_f2p_rate_pct']:.2f}% (Delta)\n"
         f"  Pass-to-Pass (P2P) Pass Rate:  {bp['swebench_p2p_rate_pct']:.2f}% (BlockPool) vs {dt['swebench_p2p_rate_pct']:.2f}% (Delta)\n"
         f"  Resolved Agreement:            {comp['comparison']['resolved_agreement_pct']:.2f}% | Patch SHA Agreement: {comp['comparison']['patch_sha256_agreement_pct']:.2f}%\n"
@@ -1747,6 +2024,12 @@ def main() -> None:
     parser.add_argument("--model", default="unsloth/Muse-Spark-Open-816B-A42B-NVFP4")
     parser.add_argument("--tokenizer", default="unsloth/Muse-Spark-Open-816B-A42B-NVFP4")
     parser.add_argument("--num-tasks", type=int, default=100)
+    parser.add_argument(
+        "--rollouts-per-task",
+        type=int,
+        default=1,
+        help="Number of RL rollouts per SWE-bench Verified task (default: 1; set to 10 for 100x10=1000 RL rollouts)",
+    )
     parser.add_argument(
         "--difficulty",
         default="<15 min fix",

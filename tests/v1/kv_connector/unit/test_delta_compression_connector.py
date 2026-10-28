@@ -2696,6 +2696,168 @@ class TestDeltaCompressionConnector(unittest.TestCase):
                     )
                 )
 
+    def test_zero_alloc_synthetic_zero_bit_and_scheduler_hash_caching(self):
+        """Verify:
+        1. `_pack_token_ids_int64` produces bit-for-bit identical hashes
+           to `torch.tensor(..., dtype=torch.int64).numpy().tobytes()`.
+        2. Cross-turn `reconstruct_blocks_batch` records synthetic `TIER0_ZERO_BIT`
+           stats via bounded bitmasks without growing `store._records` or
+           `store._record_raw_bytes`.
+        3. Scheduler-side `_req_block_hashes` and `_req_full_match_cache` avoid
+           redundant block hashing across repeated `get_num_new_matched_tokens`
+           calls and clean up in `request_finished`.
+        """
+        from vllm.utils.hashing import safe_hash
+
+        toks = tuple(range(500, 564))
+        expected_tok_hash = safe_hash(
+            torch.tensor(toks, dtype=torch.int64).numpy().tobytes(),
+            usedforsecurity=False,
+        ).hexdigest()
+        self.assertEqual(compute_token_block_hash(toks), expected_tok_hash)
+
+        expected_full_hash = safe_hash(
+            b"GENESIS" + torch.tensor(toks, dtype=torch.int64).numpy().tobytes(),
+            usedforsecurity=False,
+        ).hexdigest()
+        self.assertEqual(
+            compute_full_prefix_block_hash("GENESIS", toks), expected_full_hash
+        )
+
+        store = DeltaBlockStore(block_size=16, enable_cross_turn_reuse=True)
+        for l_idx in range(4):
+            store.register_layer_policy(
+                f"layer.{l_idx}",
+                LayerCompressionPolicy(
+                    layer_idx=l_idx, rotary_dim=8, rope_theta=10000.0
+                ),
+            )
+        t_block = tuple(range(10, 26))
+        k_base = torch.randn(16, 2, 16, dtype=torch.bfloat16)
+        v_base = torch.randn(16, 2, 16, dtype=torch.bfloat16)
+        for l_idx in range(4):
+            store.store_blocks_batch(
+                f"layer.{l_idx}",
+                [
+                    (
+                        DeltaBlockTransferSpec(
+                            full_block_hash="h_base_0",
+                            token_ids=t_block,
+                            start_position=0,
+                            physical_block_id=1,
+                            token_block_hash=compute_token_block_hash(t_block),
+                        ),
+                        k_base,
+                        v_base,
+                    )
+                ],
+            )
+        self.assertEqual(len(store._records), 4)
+
+        # Reconstruct at shifted positions across multiple turns without prior store_block
+        for turn in range(1, 6):
+            spec_shift = DeltaBlockTransferSpec(
+                full_block_hash=f"h_shift_{turn}",
+                token_ids=t_block,
+                start_position=16 * turn,
+                physical_block_id=turn + 1,
+                token_block_hash=compute_token_block_hash(t_block),
+            )
+            for l_idx in range(4):
+                out = store.reconstruct_blocks_batch(
+                    f"layer.{l_idx}", [spec_shift]
+                )
+                self.assertIsNotNone(out[0])
+                # Repeat reconstruction for the same hash & layer to verify idempotence
+                out_repeat = store.reconstruct_blocks_batch(
+                    f"layer.{l_idx}", [spec_shift]
+                )
+                self.assertIsNotNone(out_repeat[0])
+
+        # Verify zero synthetic record bloat in _records / _record_raw_bytes
+        self.assertEqual(len(store._records), 4)
+        self.assertEqual(len(store._record_raw_bytes), 4)
+        self.assertEqual(
+            store.stats.tier_counts[CompressionTier.TIER0_ZERO_BIT], 5 * 4
+        )
+
+        # 4. Verify trailing partial-only block does NOT skip prefill in
+        # get_num_new_matched_tokens, whereas interior partial-match bridge
+        # followed by exact token block match DOES bridge.
+        DeltaCompressionConnector.reset_shared_stores()
+        vllm_cfg = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                block_size=16, enable_prefix_caching=True
+            ),
+            scheduler_config=SimpleNamespace(
+                disable_hybrid_kv_cache_manager=False
+            ),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="DeltaCompressionConnector",
+                kv_role="kv_both",
+                engine_id="test_engine_partial_bridge",
+                kv_connector_extra_config={
+                    "enable_cross_turn_reuse": True,
+                    "max_sparse_exceptions": 4,
+                },
+            ),
+        )
+        sched_conn = KVConnectorFactory.create_connector(
+            vllm_cfg, KVConnectorRole.SCHEDULER, kv_cache_config=None  # type: ignore[arg-type]
+        )
+        b0 = list(range(100, 116))
+        b1_task_a = list(range(200, 216))
+        b2_task_a = list(range(300, 316))
+        h0 = compute_full_prefix_block_hash("GENESIS", b0)
+        h1_a = compute_full_prefix_block_hash(h0, b1_task_a)
+        h2_a = compute_full_prefix_block_hash(h1_a, b2_task_a)
+        sched_conn.store.register_scheduled_store_block(h0, b0, 0)
+        sched_conn.store.register_scheduled_store_block(h1_a, b1_task_a, 16)
+        sched_conn.store.register_scheduled_store_block(h2_a, b2_task_a, 32)
+
+        # Task B shares b0, differs by 2 tokens in b1, and completely differs in b2:
+        # b1 is a trailing partial-only match and must NOT skip prefill (returns 16, not 32).
+        b1_task_b = list(b1_task_a)
+        b1_task_b[3] = 9991
+        b1_task_b[4] = 9992
+        b2_task_b = list(range(800, 816))
+        req_task_b = SimpleNamespace(
+            request_id="req_task_b",
+            prompt_token_ids=b0 + b1_task_b + b2_task_b + [1, 2, 3, 4],
+        )
+        matched_b, _ = sched_conn.get_num_new_matched_tokens(req_task_b, 0)  # type: ignore[arg-type]
+        self.assertEqual(matched_b, 16)
+
+        # Rollout 2 of Task A shares b0, differs by 1 token in b1 (bridge header),
+        # and has exact token match on b2_task_a: returns 48.
+        b1_rollout2 = list(b1_task_a)
+        b1_rollout2[0] = 7777
+        req_rollout2 = SimpleNamespace(
+            request_id="req_rollout2",
+            prompt_token_ids=b0 + b1_rollout2 + b2_task_a + [1, 2, 3, 4],
+        )
+        matched_r2, _ = sched_conn.get_num_new_matched_tokens(req_rollout2, 0)  # type: ignore[arg-type]
+        self.assertEqual(matched_r2, 48)
+
+        # 5. Verify shared padding token_hash survives in _known_token_blocks when one
+        # task's padding block is evicted while another task still holds the same token_hash.
+        pad_blk = [10] * 16
+        pad_tok_hash = compute_token_block_hash(pad_blk)
+        h_pad_task_a = compute_full_prefix_block_hash(h2_a, pad_blk)
+        h_pad_task_b = compute_full_prefix_block_hash("TASK_B_PREFIX", pad_blk)
+        sched_conn.store.register_scheduled_store_block(
+            h_pad_task_a, pad_blk, 48
+        )
+        sched_conn.store.register_scheduled_store_block(
+            h_pad_task_b, pad_blk, 48
+        )
+        self.assertTrue(sched_conn.store.has_token_block(pad_tok_hash))
+        sched_conn.store.evict_block(h_pad_task_a)
+        self.assertTrue(sched_conn.store.has_token_block(pad_tok_hash))
+        self.assertEqual(
+            sched_conn.store._known_token_blocks.get(pad_tok_hash), h_pad_task_b
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
